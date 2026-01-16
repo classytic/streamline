@@ -1,0 +1,25 @@
+node_modules/
+/.claude
+.env
+.env.*
+*.log
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+coverage/
+.nyc_output/
+
+# Build output
+dist/
+
+# Old generated types (now built by tsup)
+types/
+
+# Package manager files (keep package-lock.json for npm packages)
+# package-lock.json  <- Keep this for reproducible builds
+yarn.lock
+pnpm-lock.yaml
