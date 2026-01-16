@@ -1,0 +1,95 @@
+{
+  "name": "@classytic/streamline",
+  "version": "0.1.0",
+  "description": "MongoDB-native durable workflow orchestration engine. Like Temporal but simpler - supports sleep, wait, retry, parallel execution, human-in-the-loop, and crash recovery. Perfect for payment gateways, approval flows, and scheduled tasks.",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./fastify": {
+      "import": "./dist/integrations/fastify.js",
+      "types": "./dist/integrations/fastify.d.ts"
+    },
+    "./telemetry": {
+      "import": "./dist/telemetry/index.js",
+      "types": "./dist/telemetry/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "workflow",
+    "temporal",
+    "durable",
+    "orchestration",
+    "mongodb",
+    "mongoose",
+    "sleep",
+    "wait",
+    "resume",
+    "human-in-the-loop"
+  ],
+  "author": "Classytic <classytic.dev@gmail.com> (https://github.com/classytic)",
+  "contributors": [
+    "Sadman Chowdhury (https://github.com/siam923)"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/classytic/streamline.git"
+  },
+  "homepage": "https://github.com/classytic/streamline#readme",
+  "bugs": {
+    "url": "https://github.com/classytic/streamline/issues"
+  },
+  "peerDependencies": {
+    "@classytic/mongokit": ">=3.0.0",
+    "@opentelemetry/api": ">=1.0.0",
+    "mongoose": ">=8.0.0 || >=9.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@classytic/mongokit": {
+      "optional": false
+    },
+    "mongoose": {
+      "optional": false
+    },
+    "@opentelemetry/api": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@classytic/mongokit": "^3.0.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^22.0.0",
+    "@types/semver": "^7.7.1",
+    "@vitest/coverage-v8": "^3.0.0",
+    "mongodb-memory-server": "^11.0.1",
+    "mongoose": "^9.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  },
+  "dependencies": {
+    "luxon": "^3.7.2",
+    "semver": "^7.7.3"
+  }
+}

@@ -1,0 +1,6 @@
+# NOTE: This file is not used because package.json uses the "files" field.
+# The "files" field is a whitelist that only includes: dist, README.md, LICENSE
+# Everything else is automatically excluded.
+#
+# Kept for reference only.
+
