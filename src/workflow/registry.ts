@@ -99,8 +99,10 @@ export class WorkflowRegistry<TContext = Record<string, unknown>> {
     run.currentStepId = targetStepId;
     run.status = 'running';
     run.updatedAt = new Date();
-    // Clear workflow-level output (will be set by last step when completed)
+    // Clear workflow-level completion data (will be set again when workflow finishes)
     run.output = undefined;
+    run.endedAt = undefined;
+    run.error = undefined;
 
     return run;
   }

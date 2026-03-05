@@ -33,12 +33,14 @@ class HookRegistry {
   private engines = new Map<string, WeakRef<WorkflowEngine<unknown>>>();
   private cleanupInterval: NodeJS.Timeout | null = null;
 
-  constructor() {
-    this.cleanupInterval = setInterval(() => this.cleanup(), TIMING.HOOK_CLEANUP_INTERVAL_MS);
-  }
-
   register(runId: string, engine: WorkflowEngine<unknown>): void {
     this.engines.set(runId, new WeakRef(engine));
+
+    // Lazily start cleanup interval on first registration
+    if (!this.cleanupInterval) {
+      this.cleanupInterval = setInterval(() => this.cleanup(), TIMING.HOOK_CLEANUP_INTERVAL_MS);
+      this.cleanupInterval.unref();
+    }
   }
 
   unregister(runId: string): void {

@@ -79,6 +79,26 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     throw new WaitSignal('timer', `Sleep ${ms}ms`, { resumeAt });
   }
 
+  async heartbeat(): Promise<void> {
+    // Guard: Don't send heartbeat if workflow is cancelled
+    if (this.signal.aborted) {
+      return;
+    }
+
+    try {
+      await this.repository.updateOne(
+        {
+          _id: this.runId,
+          status: { $ne: 'cancelled' },
+        },
+        { lastHeartbeat: new Date() },
+        { bypassTenant: true }
+      );
+    } catch {
+      // Ignore heartbeat failures - step continues execution
+    }
+  }
+
   emit(eventName: string, data: unknown): void {
     // Use type assertion for custom event names
     this.eventBus.emit(eventName as Parameters<typeof this.eventBus.emit>[0], { runId: this.runId, stepId: this.stepId, data });

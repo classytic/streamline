@@ -32,8 +32,10 @@
 
 import { WorkflowEngine } from '../execution/engine.js';
 import { createContainer, type StreamlineContainer } from '../core/container.js';
+import { isTerminalState } from '../core/status.js';
 import type { WorkflowDefinition, StepHandler, WorkflowRun, StepContext } from '../core/types.js';
 import { validateId, validateRetryConfig } from '../utils/validation.js';
+import { WorkflowNotFoundError } from '../utils/errors.js';
 
 // camelCase/kebab-case -> Title Case
 const toName = (id: string) =>
@@ -52,6 +54,14 @@ interface WorkflowConfig<TContext, TInput = unknown> {
   container?: StreamlineContainer;
 }
 
+/** Options for waitFor method */
+interface WaitForOptions {
+  /** Poll interval in ms (default: 1000) */
+  pollInterval?: number;
+  /** Maximum time to wait in ms (default: no timeout) */
+  timeout?: number;
+}
+
 interface Workflow<TContext, TInput = unknown> {
   start: (input: TInput, meta?: Record<string, unknown>) => Promise<WorkflowRun<TContext>>;
   get: (runId: string) => Promise<WorkflowRun<TContext> | null>;
@@ -60,6 +70,23 @@ interface Workflow<TContext, TInput = unknown> {
   cancel: (runId: string) => Promise<WorkflowRun<TContext>>;
   pause: (runId: string) => Promise<WorkflowRun<TContext>>;
   rewindTo: (runId: string, stepId: string) => Promise<WorkflowRun<TContext>>;
+  /**
+   * Wait for a workflow to complete (reach a terminal state).
+   * Polls the workflow status until it's done, failed, or cancelled.
+   *
+   * @param runId - Workflow run ID to wait for
+   * @param options - Poll interval and timeout settings
+   * @returns The completed workflow run
+   * @throws {Error} If timeout is exceeded or workflow not found
+   *
+   * @example
+   * ```typescript
+   * const run = await workflow.start({ data: 'test' });
+   * const completed = await workflow.waitFor(run._id);
+   * console.log(completed.status); // 'done' | 'failed' | 'cancelled'
+   * ```
+   */
+  waitFor: (runId: string, options?: WaitForOptions) => Promise<WorkflowRun<TContext>>;
   shutdown: () => void;
   definition: WorkflowDefinition<TContext>;
   engine: WorkflowEngine<TContext>;
@@ -128,6 +155,36 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     ...(config.autoExecute !== undefined && { autoExecute: config.autoExecute }),
   });
 
+  const waitFor = async (
+    runId: string,
+    options: WaitForOptions = {}
+  ): Promise<WorkflowRun<TContext>> => {
+    const { pollInterval = 1000, timeout } = options;
+    const startTime = Date.now();
+
+    while (true) {
+      const run = await engine.get(runId);
+
+      if (!run) {
+        throw new WorkflowNotFoundError(runId);
+      }
+
+      if (isTerminalState(run.status)) {
+        return run;
+      }
+
+      // Check timeout
+      if (timeout && Date.now() - startTime >= timeout) {
+        throw new Error(
+          `Timeout waiting for workflow "${runId}" to complete after ${timeout}ms. Current status: ${run.status}`
+        );
+      }
+
+      // Wait before next poll
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    }
+  };
+
   return {
     start: (input, meta) => engine.start(input, meta),
     get: (runId) => engine.get(runId),
@@ -136,6 +193,7 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     cancel: (runId) => engine.cancel(runId),
     pause: (runId) => engine.pause(runId),
     rewindTo: (runId, stepId) => engine.rewindTo(runId, stepId),
+    waitFor,
     shutdown: () => engine.shutdown(),
     definition,
     engine,

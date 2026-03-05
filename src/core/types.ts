@@ -223,6 +223,25 @@ export interface StepContext<TContext = Record<string, unknown>> {
   waitFor: (eventName: string, reason?: string) => Promise<unknown>;
   sleep: (ms: number) => Promise<void>;
 
+  /**
+   * Send a heartbeat to prevent the workflow from being marked as stale.
+   * Use this in long-running steps (5+ minutes) to signal the step is still active.
+   *
+   * Heartbeats are automatically sent every 30 seconds during step execution,
+   * but you can call this manually for extra control.
+   *
+   * @example
+   * ```typescript
+   * async function processLargeDataset(ctx) {
+   *   for (const batch of batches) {
+   *     await processBatch(batch);
+   *     await ctx.heartbeat(); // Signal we're still alive
+   *   }
+   * }
+   * ```
+   */
+  heartbeat: () => Promise<void>;
+
   emit: (eventName: string, data: unknown) => void;
   log: (message: string, data?: unknown) => void;
 }

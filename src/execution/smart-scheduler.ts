@@ -288,6 +288,7 @@ export class SmartScheduler {
       this.timers.delete(runId);
       this.resumeWorkflow(runId);
     }, delay);
+    timer.unref();
 
     this.timers.set(runId, timer);
   }
@@ -373,6 +374,7 @@ export class SmartScheduler {
         await this.checkForStaleWorkflows();
         scheduleNext(); // Schedule next check
       }, this.config.staleCheckInterval);
+      this.staleCheckTimer.unref();
     };
 
     scheduleNext();
@@ -421,6 +423,7 @@ export class SmartScheduler {
       await this.poll();
       this.schedulePoll(); // Schedule next poll
     }, this.currentInterval);
+    this.pollInterval.unref();
   }
 
   private async poll(): Promise<void> {
@@ -662,5 +665,6 @@ export class SmartScheduler {
         this.stopPolling();
       }
     }, this.config.idleTimeout);
+    this.idleTimer.unref();
   }
 }
