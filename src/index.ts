@@ -204,12 +204,29 @@ export { hookRegistry } from './execution/engine.js';
 
 /**
  * Custom error classes with rich context for debugging.
+ * Includes standardized error codes for programmatic error handling.
+ *
+ * @example
+ * ```typescript
+ * import { ErrorCode, WorkflowNotFoundError } from '@classytic/streamline';
+ *
+ * try {
+ *   await workflow.resume(runId);
+ * } catch (err) {
+ *   if (err.code === ErrorCode.WORKFLOW_NOT_FOUND) {
+ *     console.log('Workflow not found');
+ *   }
+ * }
+ * ```
  */
 export {
+  ErrorCode,
   WorkflowError,
   StepNotFoundError,
   WorkflowNotFoundError,
   InvalidStateError,
   StepTimeoutError,
   DataCorruptionError,
+  MaxRetriesExceededError,
 } from './utils/errors.js';
+export type { ErrorCode as ErrorCodeType } from './utils/errors.js';

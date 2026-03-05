@@ -280,5 +280,5 @@ describe('Scheduler Pagination - Large Scale', () => {
     // With 500ms interval and slow processing, should see controlled batching
     expect(pollCount).toBeGreaterThanOrEqual(3);
     expect(processedCount).toBeLessThanOrEqual(500);
-  }, { timeout: 10000 });
+  }, 10000);
 });

@@ -39,7 +39,7 @@ export interface WorkflowDefinitionDoc {
   updatedAt: Date;
   isActive: boolean;
   tags?: string[];
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
 }
 
 const WorkflowDefinitionSchema = new Schema<WorkflowDefinitionDoc>(
@@ -248,7 +248,7 @@ export const workflowDefinitionRepository = {
     }
 
     return await WorkflowDefinitionModel.findOneAndUpdate({ workflowId, version }, updates, {
-      new: true,
+      returnDocument: 'after',
     }).lean() as WorkflowDefinitionDoc | null;
   },
 

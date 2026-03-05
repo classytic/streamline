@@ -2,6 +2,42 @@
 
 > MongoDB-native workflow orchestration for developers. Like Temporal, but simpler.
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Your Application                          │
+│         createWorkflow() / WorkflowEngine                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                   Execution Layer                            │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐  │
+│  │  StepExecutor   │  │ SmartScheduler  │  │  EventBus   │  │
+│  │  • Retry logic  │  │ • Adaptive poll │  │ • Lifecycle │  │
+│  │  • Timeouts     │  │ • Circuit break │  │   events    │  │
+│  │  • Atomic claim │  │ • Stale recovery│  │             │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────┘  │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                   Storage Layer                              │
+│  ┌─────────────────────────────┐  ┌───────────────────────┐ │
+│  │  MongoDB (via Mongoose)     │  │  LRU Cache (10K max)  │ │
+│  │  • WorkflowRun persistence  │  │  • Active workflows   │ │
+│  │  • Atomic updates           │  │  • O(1) operations    │ │
+│  │  • Multi-tenant support     │  │  • Auto-eviction      │ │
+│  └─────────────────────────────┘  └───────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**State Machine:**
+```
+draft → running → waiting ↔ running → done
+                     ↓           ↓
+                  failed     cancelled
+```
+
 ## Installation
 
 ```bash
@@ -129,12 +165,61 @@ const workflow = createWorkflow('conditional-flow', {
       return { shipping: 'standard' };
     }
   },
-  context: (input: any) => ({ 
+  context: (input: any) => ({
     tier: input.tier,
-    priority: input.priority 
+    priority: input.priority
   })
 });
 ```
+
+### 5. Wait for Completion
+
+Use `waitFor` to synchronously wait for a workflow to finish:
+
+```typescript
+const workflow = createWorkflow('data-pipeline', {
+  steps: {
+    fetch: async (ctx) => fetchData(ctx.input.url),
+    process: async (ctx) => processData(ctx.getOutput('fetch')),
+    save: async (ctx) => saveResults(ctx.getOutput('process')),
+  },
+  context: () => ({})
+});
+
+// Start and wait for completion
+const run = await workflow.start({ url: 'https://api.example.com/data' });
+const completed = await workflow.waitFor(run._id, {
+  timeout: 60000,      // Optional: fail after 60s
+  pollInterval: 500    // Optional: check every 500ms (default: 1000ms)
+});
+
+console.log(completed.status);  // 'done' | 'failed' | 'cancelled'
+console.log(completed.output);  // Final step output
+```
+
+### 6. Long-Running Steps (Heartbeat)
+
+For steps that run longer than 5 minutes, use `ctx.heartbeat()` to prevent stale detection:
+
+```typescript
+const workflow = createWorkflow('large-dataset', {
+  steps: {
+    process: async (ctx) => {
+      const batches = splitIntoBatches(ctx.input.data, 1000);
+
+      for (const batch of batches) {
+        await processBatch(batch);
+        await ctx.heartbeat();  // Signal we're still alive
+      }
+
+      return { processed: batches.length };
+    }
+  },
+  context: () => ({})
+});
+```
+
+> Note: Heartbeats are sent automatically every 30s during step execution. Use `ctx.heartbeat()` for extra control in very long-running loops.
 
 ## Multi-Tenant & Indexing
 
@@ -522,14 +607,16 @@ globalEventBus.on('step:started', ({ runId, stepId }) => {
 
 ## API Reference
 
-### WorkflowEngine
+### Workflow (from createWorkflow)
 
 - `start(input, meta?)` - Start new workflow
 - `execute(runId)` - Execute steps
 - `resume(runId, payload?)` - Resume from wait
 - `get(runId)` - Get workflow state
 - `cancel(runId)` - Cancel workflow
+- `pause(runId)` - Pause workflow (scheduler skips)
 - `rewindTo(runId, stepId)` - Rewind to step
+- `waitFor(runId, options?)` - Wait for completion
 - `shutdown()` - Graceful shutdown
 
 ### StepContext (in handlers)
@@ -537,9 +624,47 @@ globalEventBus.on('step:started', ({ runId, stepId }) => {
 - `ctx.set(key, value)` - Update context
 - `ctx.getOutput(stepId)` - Get previous step output
 - `ctx.wait(reason, data?)` - Wait for human input
+- `ctx.waitFor(eventName)` - Wait for event
 - `ctx.sleep(ms)` - Sleep for duration
+- `ctx.heartbeat()` - Send heartbeat (long-running steps)
 - `ctx.emit(event, data)` - Emit custom event
 - `ctx.log(message, data?)` - Log message
+- `ctx.signal` - AbortSignal for cancellation
+
+### Error Handling
+
+All errors include standardized codes for programmatic handling:
+
+```typescript
+import { ErrorCode, WorkflowNotFoundError } from '@classytic/streamline';
+
+try {
+  await workflow.resume(runId, payload);
+} catch (err) {
+  switch (err.code) {
+    case ErrorCode.WORKFLOW_NOT_FOUND:
+      return res.status(404).json({ error: 'Workflow not found' });
+    case ErrorCode.INVALID_STATE:
+      return res.status(400).json({ error: 'Cannot resume - workflow not waiting' });
+    case ErrorCode.STEP_TIMEOUT:
+      return res.status(408).json({ error: 'Step timed out' });
+    default:
+      throw err;
+  }
+}
+```
+
+**Available error codes:**
+
+| Code | Description |
+|------|-------------|
+| `WORKFLOW_NOT_FOUND` | Workflow run doesn't exist |
+| `WORKFLOW_CANCELLED` | Workflow was cancelled |
+| `STEP_NOT_FOUND` | Step ID not in workflow definition |
+| `STEP_TIMEOUT` | Step exceeded timeout |
+| `INVALID_STATE` | Invalid state transition |
+| `DATA_CORRUPTION` | Internal data inconsistency |
+| `MAX_RETRIES_EXCEEDED` | Step failed after all retries |
 
 ### WorkflowRunModel (Mongoose)
 
@@ -575,14 +700,15 @@ npm run test:watch       # Watch mode
 
 See [TESTING.md](./TESTING.md) for testing guide.
 
-## Architecture
+## Architecture Details
 
-- **Core**: ~2,000 lines of TypeScript
+- **Core**: ~7,000 lines of TypeScript (34 modules)
 - **Storage**: MongoDB via MongoKit Repository
-- **Cache**: In-memory for active workflows
-- **Events**: EventEmitter-based pub/sub
-- **Concurrency**: CPU-aware throttling
-- **Memory**: Auto garbage collection
+- **Cache**: LRU cache for active workflows (10K max, O(1) operations)
+- **Events**: Typed EventEmitter-based pub/sub
+- **Scheduler**: Adaptive polling (10s-5min based on load)
+- **Concurrency**: Atomic claiming prevents duplicate execution
+- **Memory**: Auto garbage collection via WeakRef
 
 ## Advanced: Dependency Injection
 

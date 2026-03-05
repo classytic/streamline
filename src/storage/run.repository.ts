@@ -154,10 +154,13 @@ class WorkflowRepository implements WorkflowRunRepository {
     // Uses same approach as MongoKit: findByIdAndUpdate without $set wrapper
     if (options?.bypassTenant) {
       const result = await WorkflowRunModel.findByIdAndUpdate(id, data, {
-        new: true,
+        returnDocument: 'after',
         runValidators: true,
         lean: true,
       });
+      if (!result) {
+        throw new Error(`Workflow run "${id}" not found`);
+      }
       return result as WorkflowRun<TContext>;
     }
 
