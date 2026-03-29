@@ -74,27 +74,27 @@ export type WorkflowEventName = keyof EventPayloadMap;
  * Type-safe event bus with explicit payload types
  */
 export class WorkflowEventBus extends EventEmitter {
-  emit<K extends WorkflowEventName>(event: K, payload: EventPayloadMap[K]): boolean;
-  emit(event: string, payload: unknown): boolean;
-  emit(event: string, payload: unknown): boolean {
+  override emit<K extends WorkflowEventName>(event: K, payload: EventPayloadMap[K]): boolean;
+  override emit(event: string, payload: unknown): boolean;
+  override emit(event: string, payload: unknown): boolean {
     return super.emit(event, payload);
   }
 
-  on<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
-  on(event: string, listener: (payload: unknown) => void): this;
-  on(event: string, listener: (payload: unknown) => void): this {
+  override on<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
+  override on(event: string, listener: (payload: unknown) => void): this;
+  override on(event: string, listener: (payload: unknown) => void): this {
     return super.on(event, listener);
   }
 
-  once<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
-  once(event: string, listener: (payload: unknown) => void): this;
-  once(event: string, listener: (payload: unknown) => void): this {
+  override once<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
+  override once(event: string, listener: (payload: unknown) => void): this;
+  override once(event: string, listener: (payload: unknown) => void): this {
     return super.once(event, listener);
   }
 
-  off<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
-  off(event: string, listener: (payload: unknown) => void): this;
-  off(event: string, listener: (payload: unknown) => void): this {
+  override off<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
+  override off(event: string, listener: (payload: unknown) => void): this;
+  override off(event: string, listener: (payload: unknown) => void): this {
     return super.off(event, listener);
   }
 }

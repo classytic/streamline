@@ -7,7 +7,7 @@ import {
 import { WorkflowRegistry } from '../workflow/registry.js';
 import { isTerminalState } from '../core/status.js';
 import { TIMING } from '../config/constants.js';
-import { WorkflowNotFoundError, InvalidStateError } from '../utils/errors.js';
+import { WorkflowNotFoundError, InvalidStateError, StepNotFoundError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import type {
   WorkflowDefinition,
@@ -81,6 +81,36 @@ class HookRegistry {
 export const hookRegistry = new HookRegistry();
 
 // ============================================================================
+// Workflow Registry (for child workflow lookup by workflowId)
+// ============================================================================
+
+/**
+ * Global registry mapping workflowId → engine.
+ * Populated by createWorkflow(). Enables ctx.startChildWorkflow() to find
+ * and start child workflows by ID without the caller needing a reference.
+ */
+class WorkflowRegistryGlobal {
+  private engines = new Map<string, WeakRef<WorkflowEngine<unknown>>>();
+
+  register(workflowId: string, engine: WorkflowEngine<unknown>): void {
+    this.engines.set(workflowId, new WeakRef(engine));
+  }
+
+  getEngine(workflowId: string): WorkflowEngine<unknown> | undefined {
+    const ref = this.engines.get(workflowId);
+    if (!ref) return undefined;
+    const engine = ref.deref();
+    if (!engine) {
+      this.engines.delete(workflowId);
+      return undefined;
+    }
+    return engine;
+  }
+}
+
+export const workflowRegistry = new WorkflowRegistryGlobal();
+
+// ============================================================================
 // Inline Utilities
 // ============================================================================
 
@@ -93,12 +123,21 @@ function cleanupEventListeners(
   eventBus: WorkflowEventBus
 ): void {
   const prefix = `${runId}:`;
-  const keysToRemove = Array.from(listeners.keys()).filter(key => key.startsWith(prefix));
+  const signalPrefix = `signal:${runId}:`;
+  const keysToRemove = Array.from(listeners.keys()).filter(
+    key => key.startsWith(prefix) || key.startsWith(signalPrefix)
+  );
 
   for (const key of keysToRemove) {
     const entry = listeners.get(key);
     if (entry) {
-      eventBus.off(entry.eventName, entry.listener);
+      if (key.startsWith('signal:')) {
+        // Signal store unsub: the listener IS the unsub closure — call it
+        entry.listener();
+      } else {
+        // Event bus listener: remove from EventEmitter
+        eventBus.off(entry.eventName, entry.listener);
+      }
       listeners.delete(key);
     }
   }
@@ -153,6 +192,11 @@ export interface WorkflowEngineOptions {
   autoExecute?: boolean;
   /** Custom scheduler configuration */
   scheduler?: Partial<SmartSchedulerConfig>;
+  /**
+   * Compensation handlers for saga pattern rollback.
+   * Keyed by stepId. Called in reverse order when a later step fails.
+   */
+  compensationHandlers?: WorkflowHandlers<unknown>;
 }
 
 /**
@@ -191,7 +235,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       this.registry,
       container.repository,
       container.eventBus,
-      container.cache
+      container.cache,
+      container.signalStore
     );
     this.eventListeners = new Map();
 
@@ -208,6 +253,9 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       schedulerConfig,
       container.eventBus
     );
+
+    // Register in global workflow registry for child workflow lookup
+    workflowRegistry.register(definition.id, this as unknown as WorkflowEngine<unknown>);
 
     // Set stale recovery callback for crashed workflows
     this.scheduler.setStaleRecoveryCallback(async (runId, thresholdMs) => {
@@ -323,16 +371,50 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         }
       }
     } catch (error) {
-      // Handle cancellation gracefully - workflow was cancelled during execution
       if (error instanceof InvalidStateError) {
-        // Refresh from DB to get the cancelled state
+        // Workflow was cancelled during execution — refresh from DB
         const cancelled = await this.get(runId);
-        if (cancelled) {
-          run = cancelled;
-        }
-        // Fall through to cleanup below
+        if (cancelled) run = cancelled;
+      } else if (error instanceof StepNotFoundError) {
+        // Version mismatch: the run has a step that doesn't exist in this code version.
+        // This happens when deploying v2 while v1 workflows are still in-flight.
+        const stepId = run.currentStepId;
+        this.container.eventBus.emit('engine:error', {
+          runId,
+          error: new Error(
+            `Version mismatch: workflow "${run.workflowId}" run has currentStepId="${stepId}" ` +
+            `but this engine (v${this.definition.version}) doesn't define it. ` +
+            `Register the old version with workflowRegistry or migrate in-flight runs.`
+          ),
+          context: 'version-mismatch',
+        });
+
+        // Mark as failed with version mismatch error
+        const now = new Date();
+        await this.container.repository.updateOne(
+          { _id: runId },
+          {
+            $set: {
+              status: 'failed',
+              updatedAt: now,
+              endedAt: now,
+              error: {
+                message: `Step "${stepId}" not found — code version changed while workflow was in-flight`,
+                code: 'VERSION_MISMATCH',
+              },
+            },
+          },
+          { bypassTenant: true }
+        );
+
+        run.status = 'failed';
+        run.endedAt = now;
+        run.error = {
+          message: `Step "${stepId}" not found — code version changed while workflow was in-flight`,
+          code: 'VERSION_MISMATCH',
+        };
       } else {
-        throw error; // Re-throw non-cancellation errors
+        throw error;
       }
     }
 
@@ -340,6 +422,67 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     if (isTerminalState(run.status)) {
       cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
       hookRegistry.unregister(runId);
+
+      // Saga compensation: if workflow failed and compensation handlers exist,
+      // run them in reverse order for all completed steps.
+      if (run.status === 'failed' && this.options.compensationHandlers) {
+        run = await this.runCompensation(run);
+      }
+    }
+
+    return run;
+  }
+
+  /**
+   * Run saga compensation handlers for completed steps in reverse order.
+   * Called automatically when a workflow fails and compensation handlers are registered.
+   */
+  private async runCompensation(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
+    const compensationHandlers = this.options.compensationHandlers;
+    if (!compensationHandlers) return run;
+
+    // Get completed steps in reverse order
+    const completedSteps = run.steps
+      .filter((s) => s.status === 'done' && compensationHandlers[s.stepId])
+      .reverse();
+
+    if (completedSteps.length === 0) return run;
+
+    this.container.eventBus.emit('workflow:compensating' as Parameters<typeof this.container.eventBus.emit>[0], {
+      runId: run._id,
+      data: { steps: completedSteps.map((s) => s.stepId) },
+    });
+
+    for (const stepState of completedSteps) {
+      const handler = compensationHandlers[stepState.stepId];
+      if (!handler) continue;
+
+      try {
+        const ctx = new (await import('./context.js')).StepContextImpl(
+          run._id,
+          stepState.stepId,
+          run.context,
+          run.input,
+          stepState.attempts,
+          run,
+          this.container.repository,
+          this.container.eventBus
+        );
+
+        await (handler as (ctx: unknown) => Promise<unknown>)(ctx);
+
+        this.container.eventBus.emit('step:compensated' as Parameters<typeof this.container.eventBus.emit>[0], {
+          runId: run._id,
+          stepId: stepState.stepId,
+        });
+      } catch (err) {
+        // Compensation failures are logged but don't block other compensations
+        this.container.eventBus.emit('engine:error', {
+          runId: run._id,
+          error: err instanceof Error ? err : new Error(String(err)),
+          context: `compensation-${stepState.stepId}`,
+        });
+      }
     }
 
     return run;
@@ -379,6 +522,14 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   ): boolean {
     const currentStep = run.steps.find((s) => s.stepId === run.currentStepId);
     const isRetryPending = currentStep?.status === 'pending' && currentStep?.retryAfter;
+
+    // After ctx.goto(), the target step is reset to 'pending' and currentStepId
+    // may be the same as before (goto-to-self for loop patterns). Detect this by
+    // checking if the from-step was marked 'skipped' — that means goto happened.
+    if (prevStepId) {
+      const prevStep = run.steps.find((s) => s.stepId === prevStepId);
+      if (prevStep?.status === 'skipped') return false; // goto = progress
+    }
 
     return (
       run.currentStepId === prevStepId &&
@@ -425,6 +576,87 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         this.container.cache.set(updatedRun);
         return true;
       }
+      return false;
+    }
+
+    // Child workflow wait — auto-start the child and listen for completion
+    if (stepState.waitingFor?.type === 'childWorkflow') {
+      const data = stepState.waitingFor.data as {
+        childWorkflowId: string;
+        childInput: unknown;
+        parentRunId: string;
+        parentStepId: string;
+        childRunId?: string;
+      } | undefined;
+
+      if (data?.childWorkflowId && !data.childRunId) {
+        // Look up the child workflow engine by workflowId
+        const childEngine = workflowRegistry.getEngine(data.childWorkflowId);
+
+        if (childEngine) {
+          // Auto-start the child workflow
+          const childRun = await childEngine.start(data.childInput);
+
+          // Store the childRunId in the parent's waitingFor data
+          const stepIndex = run.steps.findIndex((s) => s.stepId === run.currentStepId);
+          if (stepIndex !== -1) {
+            await this.container.repository.updateOne(
+              { _id: runId },
+              { $set: { [`steps.${stepIndex}.waitingFor.data.childRunId`]: childRun._id } },
+              { bypassTenant: true }
+            );
+          }
+
+          // Listen for child completion and auto-resume parent
+          const childCompletionHandler = async (payload: { runId?: string; data?: unknown }) => {
+            if (!payload.runId || payload.runId !== childRun._id) return;
+
+            // Child completed — resume parent with child's output
+            try {
+              const completedChild = await childEngine.get(childRun._id);
+              const output = completedChild?.output ?? completedChild?.context;
+              await this.resume(runId, output);
+            } catch {
+              // Parent may have been cancelled or already resumed
+            }
+
+            // Clean up listener
+            this.container.eventBus.off('workflow:completed', childCompletionHandler);
+            this.container.eventBus.off('workflow:failed', childFailHandler);
+          };
+
+          const childFailHandler = async (payload: { runId?: string; data?: unknown }) => {
+            if (!payload.runId || payload.runId !== childRun._id) return;
+
+            try {
+              const failedChild = await childEngine.get(childRun._id);
+              await this.resume(runId, { __childFailed: true, error: failedChild?.error });
+            } catch {
+              // Parent may have been cancelled
+            }
+
+            this.container.eventBus.off('workflow:completed', childCompletionHandler);
+            this.container.eventBus.off('workflow:failed', childFailHandler);
+          };
+
+          // Use global event bus if child uses a different container
+          this.container.eventBus.on('workflow:completed', childCompletionHandler);
+          this.container.eventBus.on('workflow:failed', childFailHandler);
+        } else {
+          // Child engine not found — emit guidance
+          this.container.eventBus.emit('engine:error', {
+            runId,
+            error: new Error(
+              `Child workflow '${data.childWorkflowId}' not registered. ` +
+              `Ensure the child workflow is created with createWorkflow() before the parent starts. ` +
+              `Or resume the parent manually when the child completes.`
+            ),
+            context: 'child-workflow-not-found',
+          });
+        }
+      }
+
+      // Break — child execution handles completion asynchronously
       return false;
     }
 
@@ -519,6 +751,41 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
     this.container.eventBus.on(eventName, listener);
     this.eventListeners.set(listenerKey, { listener, eventName });
+
+    // Also subscribe via SignalStore for cross-process event delivery.
+    // If the user configured a Redis/Kafka signal store, this enables
+    // events emitted on one worker to resume workflows on another.
+    const signalUnsub = this.container.signalStore.subscribe(
+      `streamline:event:${eventName}`,
+      (data) => {
+        const signalPayload = data as WorkflowEventPayload | undefined;
+        if (!signalPayload || signalPayload.runId === runId || signalPayload.broadcast) {
+          listener(signalPayload);
+        }
+      }
+    );
+
+    // Store unsub for cleanup
+    const signalKey = `signal:${listenerKey}`;
+    const currentEntry = this.eventListeners.get(listenerKey);
+    if (currentEntry) {
+      const origListener = currentEntry.listener;
+      // Wrap cleanup to also unsubscribe from signal store
+      this.eventListeners.set(listenerKey, {
+        ...currentEntry,
+        listener: ((...args: unknown[]) => {
+          origListener(...args);
+        }) as typeof origListener,
+      });
+      // Store signal unsub separately so cleanupEventListeners can call it
+      this.eventListeners.set(signalKey, {
+        listener: (() => {
+          if (typeof signalUnsub === 'function') signalUnsub();
+          else if (signalUnsub instanceof Promise) signalUnsub.then((fn) => fn());
+        }) as unknown as typeof origListener,
+        eventName: signalKey,
+      });
+    }
   }
 
   /**
@@ -568,11 +835,23 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   async resume(runId: string, payload?: unknown): Promise<WorkflowRun<TContext>> {
     const run = await this.getOrThrow(runId);
 
-    // Clear paused flag
+    // Atomic claim: clear paused flag with guard to prevent concurrent resume race.
+    // Two workers calling resume() simultaneously — only one wins the atomic claim.
     if (run.paused) {
+      const claimResult = await this.container.repository.updateOne(
+        { _id: runId, paused: true },
+        { $set: { paused: false, updatedAt: new Date() } },
+        { bypassTenant: true }
+      );
+
+      if (claimResult.modifiedCount === 0) {
+        // Another worker already resumed — refresh and return current state
+        const current = await this.getOrThrow(runId);
+        return current;
+      }
+
       run.paused = false;
       run.updatedAt = new Date();
-      await this.container.repository.update(runId, run, { bypassTenant: true });
       this.container.cache.set(run);
     }
 
@@ -641,7 +920,28 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       return null;
     }
 
-    // We successfully claimed the stale workflow, now re-execute it
+    // We successfully claimed the stale workflow.
+    // Reset the current step from 'running' → 'pending' so the executor can re-claim it.
+    // Without this, executeStep() sees status='running' and treats it as "another worker
+    // owns this", causing the no-progress detector to exit the loop → workflow wedged forever.
+    this.container.cache.delete(runId);
+    const run = await this.get(runId);
+    if (run?.currentStepId) {
+      const stepIndex = run.steps.findIndex((s) => s.stepId === run.currentStepId);
+      if (stepIndex !== -1 && run.steps[stepIndex]?.status === 'running') {
+        await this.container.repository.updateOne(
+          { _id: runId },
+          {
+            $set: {
+              [`steps.${stepIndex}.status`]: 'pending',
+              [`steps.${stepIndex}.startedAt`]: undefined,
+            },
+          },
+          { bypassTenant: true }
+        );
+      }
+    }
+
     this.container.cache.delete(runId);
     this.container.eventBus.emit('workflow:recovered', { runId });
 

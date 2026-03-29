@@ -81,6 +81,16 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
   {
     collection: 'workflow_runs',
     timestamps: false,
+    /**
+     * Majority write concern ensures data survives replica set failovers.
+     * Without this, acknowledged writes can vanish on primary crash.
+     *
+     * - w: 'majority' — acknowledged by a majority of replica set members
+     * - j: true — written to the on-disk journal before acknowledging
+     *
+     * For standalone dev instances, Mongoose/MongoDB gracefully degrades.
+     */
+    writeConcern: { w: 'majority', j: true },
   }
 );
 
@@ -121,6 +131,11 @@ WorkflowRunSchema.index({
   'scheduling.executionTime': 1,
   paused: 1,
 });
+
+// Compound indexes for keyset pagination used by repository getAll/scheduler queries.
+// Without these, MongoKit emits warnings and MongoDB does full collection scans.
+WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: -1, _id: -1 });
+WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: 1, _id: 1 });
 
 /**
  * MULTI-TENANCY & SCHEDULED WORKFLOWS - COMPOSITE INDEXES

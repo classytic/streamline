@@ -7,6 +7,7 @@
 
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { configureLogger } from '@classytic/mongokit';
 
 let mongoServer: MongoMemoryServer | null = null;
 
@@ -25,11 +26,20 @@ export async function setupTestDB(): Promise<void> {
   const uri = mongoServer.getUri();
   await mongoose.connect(uri);
 
-  // Create indexes for better performance in tests
+  // Suppress MongoKit keyset pagination index hint warnings in tests.
+  // These are heuristic dev hints, not errors — indexes are defined on the schema.
+  configureLogger(false);
+
+  // Create indexes for better performance in tests.
+  // Includes the keyset pagination compound indexes that MongoKit expects.
   await mongoose.connection.db?.collection('workflow_runs').createIndexes([
     { key: { workflowId: 1, status: 1 } },
     { key: { status: 1, updatedAt: -1 } },
     { key: { status: 1, 'steps.status': 1, 'steps.waitingFor.resumeAt': 1 } },
+    { key: { status: 1, paused: 1, updatedAt: -1, _id: -1 } },
+    { key: { status: 1, paused: 1, updatedAt: 1, _id: 1 } },
+    { key: { status: 1, lastHeartbeat: 1 } },
+    { key: { status: 1, 'scheduling.executionTime': 1, paused: 1 } },
   ]);
 }
 

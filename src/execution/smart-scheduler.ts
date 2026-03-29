@@ -149,6 +149,12 @@ export interface SmartSchedulerConfig {
   staleCheckInterval: number;
   /** Threshold for stale workflow detection */
   staleThreshold: number;
+  /**
+   * Max workflows executing simultaneously.
+   * When the limit is reached, the scheduler skips processing new workflows until slots free up.
+   * @default Infinity (no limit — current behavior)
+   */
+  maxConcurrentExecutions: number;
 }
 
 export const DEFAULT_SCHEDULER_CONFIG: SmartSchedulerConfig = {
@@ -161,6 +167,7 @@ export const DEFAULT_SCHEDULER_CONFIG: SmartSchedulerConfig = {
   maxConsecutiveFailures: SCHEDULER.MAX_CONSECUTIVE_FAILURES,
   staleCheckInterval: SCHEDULER.STALE_CHECK_INTERVAL_MS,
   staleThreshold: TIMING.STALE_WORKFLOW_THRESHOLD_MS,
+  maxConcurrentExecutions: Infinity,
 };
 
 export class SmartScheduler {
@@ -431,7 +438,21 @@ export class SmartScheduler {
 
     try {
       const now = new Date();
-      const limit = this.config.maxWorkflowsPerPoll;
+      let limit = this.config.maxWorkflowsPerPoll;
+
+      // Concurrency gating: check how many slots are available
+      if (this.config.maxConcurrentExecutions !== Infinity) {
+        const running = await this.repository.getRunningRuns();
+        const activeCount = running.length;
+        if (activeCount >= this.config.maxConcurrentExecutions) {
+          // All slots full — skip this poll cycle
+          const duration = Date.now() - startTime;
+          this.metrics.recordPoll(duration, true, 0);
+          return;
+        }
+        const availableSlots = this.config.maxConcurrentExecutions - activeCount;
+        limit = Math.min(limit, availableSlots);
+      }
 
       // Query workflows ready to resume (timer-based) - PAGINATED
       const waiting = await this.repository.getReadyToResume(now, limit);
@@ -476,30 +497,10 @@ export class SmartScheduler {
       for (const run of scheduled) {
         if (this.retryCallback) {
           try {
-            // Atomic claim: Only execute if we successfully claim the workflow
-            // This prevents race conditions when multiple schedulers run in parallel
-            const claimResult = await this.repository.updateOne(
-              {
-                _id: run._id,
-                status: 'draft', // Only claim if still in draft state
-                'scheduling.executionTime': { $lte: now }, // Double-check execution time
-                paused: { $ne: true },
-              },
-              {
-                status: 'running',
-                startedAt: now,
-                updatedAt: now,
-                lastHeartbeat: now, // Set heartbeat for stale recovery
-              },
-              { bypassTenant: true } // Internal operation - already scoped by _id
-            );
-
-            // Skip if another scheduler already claimed this workflow
-            if (claimResult.modifiedCount === 0) {
-              continue;
-            }
-
-            // Successfully claimed - execute the workflow
+            // Delegate atomic claim to executeRetry() — it handles both
+            // draft→running (scheduled) and waiting→running (retry) transitions.
+            // The scheduler must NOT pre-claim here, otherwise executeRetry()
+            // sees status='running' and its own claim filters don't match.
             await this.retryCallback(run._id);
             resumedCount++;
           } catch (err) {

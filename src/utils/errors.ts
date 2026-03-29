@@ -61,7 +61,7 @@ export class WorkflowError extends Error {
     this.code = code;
   }
 
-  toString(): string {
+  override toString(): string {
     const contextStr = Object.entries(this.context)
       .map(([key, value]) => `${key}=${value}`)
       .join(', ');

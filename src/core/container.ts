@@ -10,6 +10,64 @@ import { WorkflowEventBus, globalEventBus } from './events.js';
 import { workflowRunRepository, createWorkflowRepository, type WorkflowRunRepository, type WorkflowRepositoryConfig } from '../storage/run.repository.js';
 
 /**
+ * Pluggable signal store for durable cross-process event delivery.
+ *
+ * Default: in-memory (process-local). For durable signals across workers,
+ * plug in Redis, Kafka, BullMQ, or any pub/sub backend.
+ *
+ * Streamline never depends on these — users bring their own adapter.
+ *
+ * @example Redis adapter (user-provided)
+ * ```typescript
+ * import Redis from 'ioredis';
+ *
+ * const redis = new Redis();
+ * const signalStore: SignalStore = {
+ *   publish: (channel, data) => redis.publish(channel, JSON.stringify(data)),
+ *   subscribe: (channel, handler) => {
+ *     const sub = redis.duplicate();
+ *     sub.subscribe(channel);
+ *     sub.on('message', (ch, msg) => handler(JSON.parse(msg)));
+ *     return () => { sub.unsubscribe(channel); sub.disconnect(); };
+ *   },
+ * };
+ *
+ * const container = createContainer({ signalStore });
+ * ```
+ */
+export interface SignalStore {
+  /** Publish a signal to a named channel */
+  publish(channel: string, data: unknown): Promise<void> | void;
+  /** Subscribe to a channel. Returns an unsubscribe function. */
+  subscribe(channel: string, handler: (data: unknown) => void): (() => void) | Promise<() => void>;
+}
+
+/**
+ * Default in-memory signal store (process-local).
+ * Sufficient for single-worker deployments and testing.
+ */
+class InMemorySignalStore implements SignalStore {
+  private listeners = new Map<string, Set<(data: unknown) => void>>();
+
+  publish(channel: string, data: unknown): void {
+    const handlers = this.listeners.get(channel);
+    if (handlers) {
+      for (const handler of handlers) handler(data);
+    }
+  }
+
+  subscribe(channel: string, handler: (data: unknown) => void): () => void {
+    if (!this.listeners.has(channel)) {
+      this.listeners.set(channel, new Set());
+    }
+    this.listeners.get(channel)!.add(handler);
+    return () => {
+      this.listeners.get(channel)?.delete(handler);
+    };
+  }
+}
+
+/**
  * Container holding all shared dependencies for a workflow engine instance.
  *
  * @example
@@ -31,6 +89,8 @@ export interface StreamlineContainer {
   eventBus: WorkflowEventBus;
   /** In-memory cache for active workflows */
   cache: WorkflowCache;
+  /** Pluggable signal store for durable cross-process event delivery */
+  signalStore: SignalStore;
 }
 
 /**
@@ -58,6 +118,13 @@ export interface ContainerOptions {
    * If undefined: creates a new isolated cache
    */
   cache?: WorkflowCache;
+
+  /**
+   * Custom signal store for durable cross-process event delivery.
+   * - If SignalStore: uses the provided instance (e.g., Redis, Kafka, BullMQ adapter)
+   * - If undefined: uses default in-memory store (process-local)
+   */
+  signalStore?: SignalStore;
 }
 
 /**
@@ -118,7 +185,10 @@ export function createContainer(options: ContainerOptions = {}): StreamlineConta
   // Resolve cache
   const cache = options.cache ?? new WorkflowCache();
 
-  return { repository, eventBus, cache };
+  // Resolve signal store
+  const signalStore = options.signalStore ?? new InMemorySignalStore();
+
+  return { repository, eventBus, cache, signalStore };
 }
 
 /**

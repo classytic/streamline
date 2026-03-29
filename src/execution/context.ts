@@ -1,16 +1,28 @@
 import type { StepContext, WorkflowRun } from '../core/types.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
 import type { WorkflowEventBus } from '../core/events.js';
+import type { SignalStore } from '../core/container.js';
 import { logger } from '../utils/logger.js';
 
 export class WaitSignal extends Error {
   constructor(
-    public type: 'human' | 'webhook' | 'timer' | 'event',
+    public type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow',
     public reason: string,
     public data?: unknown
   ) {
     super(reason);
     this.name = 'WaitSignal';
+  }
+}
+
+/**
+ * Signal thrown by ctx.goto() to jump execution to a different step.
+ * Caught by the engine to update currentStepId.
+ */
+export class GotoSignal extends Error {
+  constructor(public targetStepId: string) {
+    super(`goto:${targetStepId}`);
+    this.name = 'GotoSignal';
   }
 }
 
@@ -26,7 +38,8 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     private run: WorkflowRun<TContext>,
     private repository: WorkflowRunRepository,
     private eventBus: WorkflowEventBus,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    private signalStore?: SignalStore
   ) {
     this.signal = signal ?? new AbortController().signal;
   }
@@ -100,8 +113,11 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
   }
 
   emit(eventName: string, data: unknown): void {
-    // Use type assertion for custom event names
-    this.eventBus.emit(eventName as Parameters<typeof this.eventBus.emit>[0], { runId: this.runId, stepId: this.stepId, data });
+    const payload = { runId: this.runId, stepId: this.stepId, data };
+    // Local event bus (same process)
+    this.eventBus.emit(eventName as Parameters<typeof this.eventBus.emit>[0], payload);
+    // Cross-process signal store (Redis/Kafka if configured)
+    this.signalStore?.publish(`streamline:event:${eventName}`, payload);
   }
 
   log(message: string, data?: unknown): void {
@@ -112,5 +128,119 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
       attempt: this.attempt,
       ...(data !== undefined && { data }),
     });
+  }
+
+  async startChildWorkflow(workflowId: string, input: unknown): Promise<never> {
+    throw new WaitSignal('childWorkflow', `Waiting for child workflow: ${workflowId}`, {
+      childWorkflowId: workflowId,
+      childInput: input,
+      parentRunId: this.runId,
+      parentStepId: this.stepId,
+    });
+  }
+
+  async goto(targetStepId: string): Promise<never> {
+    throw new GotoSignal(targetStepId);
+  }
+
+  async scatter<T extends Record<string, () => Promise<unknown>>>(
+    tasks: T,
+    options?: { concurrency?: number }
+  ): Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }> {
+    const taskIds = Object.keys(tasks);
+    const concurrency = options?.concurrency ?? Infinity;
+
+    // Recover already-completed tasks from checkpoint
+    const checkpoint = this.getCheckpoint<Record<string, { done: boolean; value?: unknown; error?: string }>>() ?? {};
+    const results: Record<string, unknown> = {};
+
+    // Restore completed results
+    for (const id of taskIds) {
+      const saved = checkpoint[id];
+      if (saved?.done) {
+        results[id] = saved.value;
+      }
+    }
+
+    // Find incomplete tasks
+    const pending = taskIds.filter((id) => !checkpoint[id]?.done);
+
+    if (pending.length === 0) {
+      return results as { [K in keyof T]: Awaited<ReturnType<T[K]>> };
+    }
+
+    // Execute pending tasks with concurrency limit
+    const executing = new Set<Promise<void>>();
+
+    for (const id of pending) {
+      if (this.signal.aborted) break;
+
+      const taskFn = tasks[id]!;
+      let promise!: Promise<void>;
+      promise = (async () => {
+        try {
+          const value = await taskFn();
+          results[id] = value;
+          checkpoint[id] = { done: true, value };
+        } catch (err) {
+          // Don't mark failed tasks as done — they should re-run on retry
+          throw err;
+        } finally {
+          executing.delete(promise);
+          // Persist after each task completes — crash recovery resumes from here
+          await this.checkpoint(checkpoint);
+        }
+      })();
+
+      executing.add(promise);
+
+      if (executing.size >= concurrency) {
+        // Wait for at least one to finish before starting next
+        await Promise.race(executing).catch(() => {});
+      }
+    }
+
+    // Wait for all remaining tasks
+    const settled = await Promise.allSettled(executing);
+
+    // Check for failures
+    const failures = settled.filter((r) => r.status === 'rejected');
+    if (failures.length > 0) {
+      const first = failures[0] as PromiseRejectedResult;
+      throw first.reason;
+    }
+
+    return results as { [K in keyof T]: Awaited<ReturnType<T[K]>> };
+  }
+
+  async checkpoint(value: unknown): Promise<void> {
+    if (this.signal.aborted) return;
+
+    const stepIndex = this.run.steps.findIndex((s) => s.stepId === this.stepId);
+    if (stepIndex === -1) return;
+
+    await this.repository.updateOne(
+      { _id: this.runId, status: { $ne: 'cancelled' } },
+      {
+        $set: {
+          [`steps.${stepIndex}.output`]: { __checkpoint: value },
+          updatedAt: new Date(),
+          lastHeartbeat: new Date(),
+        },
+      },
+      { bypassTenant: true }
+    );
+
+    // Update in-memory state
+    const step = this.run.steps[stepIndex];
+    if (step) {
+      step.output = { __checkpoint: value };
+    }
+  }
+
+  getCheckpoint<T = unknown>(): T | undefined {
+    const step = this.run.steps.find((s) => s.stepId === this.stepId);
+    const output = step?.output as { __checkpoint?: T } | undefined;
+    return output?.__checkpoint;
   }
 }

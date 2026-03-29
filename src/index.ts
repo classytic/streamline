@@ -7,6 +7,7 @@
  * Use this for 90% of use cases.
  */
 export { createWorkflow } from './workflow/define.js';
+export type { Workflow, WorkflowConfig, StepConfig, WaitForOptions } from './workflow/define.js';
 
 /**
  * Direct engine access for advanced use cases.
@@ -40,7 +41,8 @@ export * from './core/status.js';
  * ```
  */
 export { createHook, resumeHook, hookToken } from './features/hooks.js';
-export { WaitSignal } from './execution/context.js';
+export type { HookResult, HookOptions } from './features/hooks.js';
+export { WaitSignal, GotoSignal } from './execution/context.js';
 
 // ============================================================================
 // Storage & Database - MongoDB Models & Repositories
@@ -83,7 +85,19 @@ export type { WorkflowDefinitionDoc } from './storage/definition.model.js';
  * Subscribe to workflow:started, step:completed, etc.
  */
 export { WorkflowEventBus, globalEventBus } from './core/events.js';
-export type { WorkflowEventName } from './core/events.js';
+export type {
+  WorkflowEventName,
+  EventPayloadMap,
+  BaseEventPayload,
+  StepEventPayload,
+  StepCompletedPayload,
+  StepFailedPayload,
+  StepRetryPayload,
+  WorkflowCompletedPayload,
+  WorkflowFailedPayload,
+  WorkflowResumedPayload,
+  EngineErrorPayload,
+} from './core/events.js';
 
 /**
  * Visualization helpers for building UIs.
@@ -108,7 +122,7 @@ export type { StepTimeline, WorkflowProgress, StepUIState } from './utils/visual
  * createWorkflow() handles this automatically for normal use.
  */
 export { createContainer, isStreamlineContainer } from './core/container.js';
-export type { StreamlineContainer, ContainerOptions } from './core/container.js';
+export type { StreamlineContainer, ContainerOptions, SignalStore } from './core/container.js';
 
 /**
  * Cache health monitoring for operational dashboards.
@@ -196,7 +210,7 @@ export type { SmartSchedulerConfig, SchedulerStats } from './execution/smart-sch
  * Hook registry for resuming workflows by token.
  * Used internally by resumeHook() - exposed for advanced use cases.
  */
-export { hookRegistry } from './execution/engine.js';
+export { hookRegistry, workflowRegistry } from './execution/engine.js';
 
 // ============================================================================
 // Error Classes - For Error Handling

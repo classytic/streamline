@@ -82,7 +82,7 @@ export interface WorkflowError {
 }
 
 export interface WaitingFor {
-  type: 'human' | 'webhook' | 'timer' | 'event';
+  type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow';
   reason: string;
   resumeAt?: Date;
   eventName?: string;
@@ -244,6 +244,122 @@ export interface StepContext<TContext = Record<string, unknown>> {
 
   emit: (eventName: string, data: unknown) => void;
   log: (message: string, data?: unknown) => void;
+
+  /**
+   * Save a checkpoint for crash-safe batch processing (durable loop).
+   *
+   * On crash recovery, `getCheckpoint()` returns the last saved value,
+   * so the step resumes from where it left off instead of restarting.
+   *
+   * @example
+   * ```typescript
+   * async function processBatches(ctx) {
+   *   const batches = splitIntoBatches(ctx.input.data, 100);
+   *   const lastProcessed = ctx.getCheckpoint<number>() ?? -1;
+   *
+   *   for (let i = lastProcessed + 1; i < batches.length; i++) {
+   *     await processBatch(batches[i]);
+   *     await ctx.checkpoint(i);   // Survives crashes
+   *     await ctx.heartbeat();
+   *   }
+   *   return { processed: batches.length };
+   * }
+   * ```
+   */
+  checkpoint: (value: unknown) => Promise<void>;
+
+  /**
+   * Read the last checkpoint value saved by `checkpoint()`.
+   * Returns `undefined` on first execution (no prior crash).
+   */
+  getCheckpoint: <T = unknown>() => T | undefined;
+
+  /**
+   * Start a child workflow and durably wait for it to complete.
+   *
+   * The parent step enters a waiting state. When the child reaches a terminal
+   * state (done/failed/cancelled), the parent automatically resumes with the
+   * child's output as this step's output.
+   *
+   * Durable: survives process restarts. The scheduler picks up the parent
+   * when the child completes via the `childRunId` stored in waitingFor.
+   *
+   * @param workflowId - The child workflow's registered ID
+   * @param input - Input data for the child workflow
+   * @returns The child workflow's output (after it completes)
+   *
+   * @example
+   * ```typescript
+   * const pipeline = createWorkflow('pipeline', {
+   *   steps: {
+   *     validate: async (ctx) => { ... },
+   *     runSubPipeline: async (ctx) => {
+   *       return ctx.startChildWorkflow('sub-pipeline', { data: ctx.context.data });
+   *       // Parent waits here. Resumes when child completes.
+   *     },
+   *     finalize: async (ctx) => {
+   *       const childResult = ctx.getOutput('runSubPipeline');
+   *       return { done: true, childResult };
+   *     },
+   *   },
+   * });
+   * ```
+   */
+  startChildWorkflow: (workflowId: string, input: unknown) => Promise<never>;
+
+  /**
+   * Jump to a different step, breaking out of the linear sequence.
+   *
+   * Use for conditional branching, error recovery paths, or skip-ahead logic.
+   * The target step must exist in the workflow definition.
+   *
+   * @param stepId - The step ID to jump to
+   *
+   * @example
+   * ```typescript
+   * const workflow = createWorkflow('order', {
+   *   steps: {
+   *     validate: async (ctx) => {
+   *       if (!ctx.context.paymentValid) {
+   *         return ctx.goto('handleFailure'); // Skip to failure handler
+   *       }
+   *       return { valid: true };
+   *     },
+   *     process: async (ctx) => { ... },
+   *     handleFailure: async (ctx) => { ... },
+   *   },
+   * });
+   * ```
+   */
+  goto: (stepId: string) => Promise<never>;
+
+  /**
+   * Durable scatter/gather — execute tasks in parallel with crash recovery.
+   *
+   * Unlike `executeParallel()` (in-memory only), `scatter()` persists each
+   * task's completion to MongoDB via checkpoints. If the process crashes
+   * mid-scatter, only incomplete tasks re-execute on recovery.
+   *
+   * @param tasks - Named tasks to execute. Keys become result keys.
+   * @param options - Concurrency limit (default: Infinity)
+   * @returns Record of results keyed by task name
+   *
+   * @example
+   * ```typescript
+   * const results = await ctx.scatter({
+   *   user: () => fetchUser(ctx.context.userId),
+   *   orders: () => fetchOrders(ctx.context.userId),
+   *   recommendations: () => getRecommendations(ctx.context.userId),
+   * });
+   *
+   * // results.user, results.orders, results.recommendations
+   * // If crash after 'user' completes, only 'orders' and 'recommendations' re-run.
+   * ```
+   */
+  scatter: <T extends Record<string, () => Promise<unknown>>>(
+    tasks: T,
+    options?: { concurrency?: number }
+  ) => Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }>;
 }
 
 export type StepHandler<TOutput = unknown, TContext = Record<string, unknown>> = (
