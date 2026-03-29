@@ -41,7 +41,7 @@ draft → running → waiting ↔ running → done
 ## Installation
 
 ```bash
-npm install @classytic/streamline mongoose
+npm install @classytic/streamline @classytic/mongokit mongoose
 ```
 
 ## Quick Start
@@ -140,35 +140,40 @@ const workflow = createWorkflow('parallel-fetch', {
 });
 ```
 
-### 4. Conditional Steps
+### 4. Per-Step Timeout, Retries & Conditions
 
-Use conditional execution in your handlers:
+Mix plain handlers with `StepConfig` objects for fine-grained control. `TContext` infers everywhere — zero annotations needed:
 
 ```typescript
-const workflow = createWorkflow('conditional-flow', {
+import { createWorkflow } from '@classytic/streamline';
+
+const pipeline = createWorkflow<{ shouldDeploy: boolean }>('ci-pipeline', {
   steps: {
-    check: async (ctx) => {
-      return { tier: ctx.context.tier };
+    // Plain handler — zero ceremony
+    clone: async (ctx) => {
+      return { repo: 'cloned' };
     },
-    premiumFeature: async (ctx) => {
-      // Only runs for premium users
-      if (ctx.context.tier !== 'premium') {
-        return { skipped: true };
-      }
-      return { premium: true };
+
+    // StepConfig — per-step timeout and retries
+    build: {
+      handler: async (ctx) => {
+        return { artifact: 'build.tar.gz' };
+      },
+      timeout: 120_000,   // 2 min timeout (this step only)
+      retries: 5,         // 5 attempts (this step only)
     },
-    expressShipping: async (ctx) => {
-      // Conditional logic
-      if (ctx.context.priority === 'express') {
-        return { shipping: 'express' };
-      }
-      return { shipping: 'standard' };
-    }
+
+    // StepConfig — conditional execution
+    deploy: {
+      handler: async (ctx) => {
+        return { deployed: true };
+      },
+      timeout: 300_000,
+      skipIf: (ctx) => !ctx.shouldDeploy, // ctx is typed as your TContext
+    },
   },
-  context: (input: any) => ({
-    tier: input.tier,
-    priority: input.priority
-  })
+  context: (input: any) => ({ shouldDeploy: input.deploy }),
+  defaults: { retries: 3, timeout: 30_000 }, // Fallback for plain handlers
 });
 ```
 
@@ -709,6 +714,44 @@ See [TESTING.md](./TESTING.md) for testing guide.
 - **Scheduler**: Adaptive polling (10s-5min based on load)
 - **Concurrency**: Atomic claiming prevents duplicate execution
 - **Memory**: Auto garbage collection via WeakRef
+
+## Advanced: Scheduler Concurrency Limit
+
+Prevent overwhelming API rate limits or memory when each step runs a long-running agent:
+
+```typescript
+const workflow = createWorkflow('agent-pipeline', {
+  steps: { ... },
+});
+
+// Limit to 10 workflows executing simultaneously
+workflow.engine.configure({
+  scheduler: { maxConcurrentExecutions: 10 },
+});
+```
+
+When all slots are full, the scheduler skips the poll cycle — workflows wait in `running` queue until a slot frees up. Default is `Infinity` (no limit).
+
+## Advanced: Type Exports
+
+All public types are exported — no `ReturnType<>` workarounds needed:
+
+```typescript
+import {
+  createWorkflow,
+  type Workflow,        // The workflow instance type
+  type WorkflowConfig,  // The config object type
+  type StepConfig,       // Per-step config type
+  type WaitForOptions,   // waitFor() options
+  type WorkflowRun,      // The run document type
+} from '@classytic/streamline';
+
+// Export your workflows without TS4023
+export const myWorkflow: Workflow<MyCtx, MyInput> = createWorkflow('my', { ... });
+
+// Type config objects separately
+const config: WorkflowConfig<MyCtx> = { steps: { ... } };
+```
 
 ## Advanced: Dependency Injection
 

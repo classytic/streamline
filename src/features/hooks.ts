@@ -1,15 +1,18 @@
 /**
- * Hooks & Webhooks
+ * Hooks & Webhooks — Durable external resume
  *
- * Inspired by Vercel's workflow hooks - pause execution and wait for external input.
+ * Pause execution and wait for external input (webhooks, approvals, etc.).
+ * Durable across process restarts and multi-worker deployments:
+ * - Fast path: in-memory hookRegistry (same-process)
+ * - Fallback: MongoDB lookup + repository-based resume (cross-process)
  *
  * @example
  * ```typescript
  * const approval = createWorkflow('doc-approval', {
  *   steps: {
  *     request: async (ctx) => {
- *       await sendApprovalEmail(ctx.input.docId);
- *       return createHook(ctx, 'approval');
+ *       const hook = createHook(ctx, 'approval');
+ *       return ctx.wait(hook.token, { hookToken: hook.token });
  *     },
  *     process: async (ctx) => {
  *       const { approved } = ctx.getOutput<{ approved: boolean }>('request');
@@ -18,22 +21,23 @@
  *   },
  * });
  *
- * // Resume hook from API route
+ * // Resume from API route — works across workers/restarts
  * const result = await resumeHook(token, { approved: true });
- * console.log(result.run); // The resumed workflow run
  * ```
  */
 
 import { randomBytes } from 'node:crypto';
-import { hookRegistry } from '../execution/engine.js';
+import { hookRegistry, workflowRegistry } from '../execution/engine.js';
+import { workflowRunRepository } from '../storage/run.repository.js';
+import { WorkflowRunModel } from '../storage/run.model.js';
 import type { StepContext, WorkflowRun } from '../core/types.js';
 
-interface HookOptions {
+export interface HookOptions {
   /** Custom token (default: auto-generated with crypto-random suffix) */
   token?: string;
 }
 
-interface HookResult {
+export interface HookResult {
   /** Token to use for resuming (includes secure random component) */
   token: string;
   /** URL path for webhook (if using webhook manager) */
@@ -44,27 +48,13 @@ interface HookResult {
  * Create a hook that pauses workflow until external input.
  * The token includes a crypto-random suffix for security.
  *
- * IMPORTANT: Pass the returned token to ctx.wait() to enable token validation:
- * ```typescript
- * const hook = createHook(ctx, 'approval');
- * return ctx.wait(hook.token, { hookToken: hook.token }); // Token stored for validation
- * ```
- *
  * @example
  * ```typescript
- * // In step handler
- * async function waitForApproval(ctx) {
- *   const hook = createHook(ctx, 'waiting-for-approval');
- *   console.log('Resume with token:', hook.token);
- *   return ctx.wait(hook.token, { hookToken: hook.token }); // Token validated on resume
- * }
- *
- * // From API route
- * await resumeHook('token-123', { approved: true });
+ * const hook = createHook(ctx, 'waiting-for-approval');
+ * return ctx.wait(hook.token, { hookToken: hook.token });
  * ```
  */
 export function createHook(ctx: StepContext, reason: string, options?: HookOptions): HookResult {
-  // Generate secure token with crypto-random suffix to prevent guessing
   const randomSuffix = randomBytes(16).toString('hex');
   const token = options?.token ?? `${ctx.runId}:${ctx.stepId}:${randomSuffix}`;
   const path = `/hooks/${token}`;
@@ -75,14 +65,14 @@ export function createHook(ctx: StepContext, reason: string, options?: HookOptio
 /**
  * Resume a paused workflow by hook token.
  *
- * Security: If the workflow was paused with a hookToken in waitingFor.data,
- * this function validates the token before resuming.
+ * **Durable**: Works across process restarts and multi-worker deployments.
+ * - Fast path: Uses in-memory hookRegistry if the engine is in this process.
+ * - Fallback: Looks up the workflow in MongoDB and resumes via atomic DB operations.
  *
- * Multi-worker support: Falls back to DB lookup if engine not in local registry.
+ * Security: Validates the token against the stored hookToken if present.
  *
  * @example
  * ```typescript
- * // API route handler
  * app.post('/hooks/:token', async (req, res) => {
  *   const result = await resumeHook(req.params.token, req.body);
  *   res.json({ success: true, runId: result.runId, status: result.run.status });
@@ -93,25 +83,30 @@ export async function resumeHook(
   token: string,
   payload: unknown
 ): Promise<{ runId: string; run: WorkflowRun }> {
-  // Token format: runId:stepId:randomSuffix or custom
   const [runId] = token.split(':');
 
   if (!runId) {
     throw new Error(`Invalid hook token: ${token}`);
   }
 
-  // Try in-memory registry first (fast path for single-worker)
+  // Fast path: in-memory registry (same process)
   const engine = hookRegistry.getEngine(runId);
 
-  if (!engine) {
-    throw new Error(
-      `No engine registered for workflow ${runId}. ` +
-        `Ensure the workflow was started with createWorkflow() and the engine is still running. ` +
-        `For multi-worker deployments, ensure all workers use shared state or implement a custom resume endpoint.`
-    );
+  if (engine) {
+    return resumeViaEngine(engine, runId, token, payload);
   }
 
-  // Use engine's repository to respect tenant filtering
+  // Fallback: DB-based resume (cross-process / post-restart)
+  return resumeViaDb(runId, token, payload);
+}
+
+/** Resume using the in-memory engine reference (fast path) */
+async function resumeViaEngine(
+  engine: ReturnType<typeof hookRegistry.getEngine> & {},
+  runId: string,
+  token: string,
+  payload: unknown
+): Promise<{ runId: string; run: WorkflowRun }> {
   const run = await engine.container.repository.getById(runId);
 
   if (!run) {
@@ -122,20 +117,140 @@ export async function resumeHook(
     throw new Error(`Workflow ${runId} is not waiting (status: ${run.status})`);
   }
 
-  // Find the waiting step
-  const waitingStep = run.steps.find((s) => s.status === 'waiting');
+  validateHookToken(run as WorkflowRun, token);
 
-  // SECURITY: Validate hook token if one was stored during ctx.wait()
-  const waitingData = waitingStep?.waitingFor?.data as { hookToken?: string } | undefined;
-  const storedToken = waitingData?.hookToken;
-  if (storedToken && storedToken !== token) {
-    throw new Error(`Invalid hook token for workflow ${runId}`);
+  const resumedRun = await engine.resume(runId, payload);
+  return { runId: run._id, run: resumedRun as WorkflowRun };
+}
+
+/**
+ * Resume using direct MongoDB operations (durable fallback).
+ * Works when the engine that started the workflow is gone (restart, different worker).
+ */
+async function resumeViaDb(
+  runId: string,
+  token: string,
+  payload: unknown
+): Promise<{ runId: string; run: WorkflowRun }> {
+  const run = await workflowRunRepository.getById(runId);
+
+  if (!run) {
+    throw new Error(`Workflow not found for token: ${token}`);
   }
 
-  // Resume the workflow
-  const resumedRun = await engine.resume(runId, payload);
+  if (run.status !== 'waiting') {
+    throw new Error(`Workflow ${runId} is not waiting (status: ${run.status})`);
+  }
 
-  return { runId: run._id, run: resumedRun as WorkflowRun };
+  validateHookToken(run as WorkflowRun, token);
+
+  // Find the waiting step and mark it done with the payload
+  const stepIndex = run.steps.findIndex((s) => s.status === 'waiting');
+  if (stepIndex === -1) {
+    throw new Error(`No waiting step found in workflow ${runId}`);
+  }
+
+  const now = new Date();
+  const stepId = run.steps[stepIndex]!.stepId;
+
+  // Atomic claim: only resume if still waiting (prevents concurrent double-resume)
+  const result = await workflowRunRepository.updateOne(
+    {
+      _id: runId,
+      status: 'waiting',
+      [`steps.${stepIndex}.status`]: 'waiting',
+    },
+    {
+      $set: {
+        status: 'running',
+        updatedAt: now,
+        lastHeartbeat: now,
+        [`steps.${stepIndex}.status`]: 'done',
+        [`steps.${stepIndex}.endedAt`]: now,
+        [`steps.${stepIndex}.output`]: payload,
+      },
+      $unset: {
+        [`steps.${stepIndex}.waitingFor`]: '',
+      },
+    },
+    { bypassTenant: true }
+  );
+
+  if (result.modifiedCount === 0) {
+    throw new Error(`Failed to resume workflow ${runId} — already resumed or cancelled`);
+  }
+
+  // Advance currentStepId to the next step in the sequence.
+  // Without this, the workflow is running but stuck at the completed step.
+  const allStepIds = run.steps.map((s) => s.stepId);
+  const currentIndex = allStepIds.indexOf(stepId);
+  const nextStepId = currentIndex < allStepIds.length - 1 ? allStepIds[currentIndex + 1] : null;
+
+  if (nextStepId) {
+    await workflowRunRepository.updateOne(
+      { _id: runId },
+      { $set: { currentStepId: nextStepId, updatedAt: new Date() } },
+      { bypassTenant: true }
+    );
+  } else {
+    // No next step — workflow is complete
+    await workflowRunRepository.updateOne(
+      { _id: runId },
+      {
+        $set: {
+          status: 'done',
+          currentStepId: null,
+          endedAt: new Date(),
+          updatedAt: new Date(),
+          output: payload,
+        },
+      },
+      { bypassTenant: true }
+    );
+  }
+
+  // Try to find an engine to continue execution (best-effort)
+  const engine = workflowRegistry.getEngine(run.workflowId);
+  if (engine) {
+    // Invalidate cache so the engine reads fresh state from DB
+    engine.container.cache.delete(runId);
+
+    if (nextStepId) {
+      // Engine available — continue execution asynchronously
+      setImmediate(() => {
+        engine.execute(runId).catch(() => {
+          // Execution failed — scheduler will pick it up via stale detection
+        });
+      });
+    }
+  } else if (nextStepId) {
+    // No engine in this process (true cross-process restart).
+    // Set lastHeartbeat to the past so stale recovery picks it up immediately
+    // on the next poll cycle instead of waiting for the full stale threshold.
+    await workflowRunRepository.updateOne(
+      { _id: runId },
+      { $set: { lastHeartbeat: new Date(0) } },
+      { bypassTenant: true }
+    );
+  }
+
+  const updated = await workflowRunRepository.getById(runId);
+  if (!updated) {
+    throw new Error(`Workflow ${runId} disappeared after resume`);
+  }
+
+  return { runId, run: updated as WorkflowRun };
+}
+
+/** Validate hook token against stored token (security) */
+function validateHookToken(run: WorkflowRun, token: string): void {
+  const waitingStep = run.steps.find((s) => s.status === 'waiting');
+  const waitingData = waitingStep?.waitingFor?.data as { hookToken?: string } | undefined;
+  const storedToken = waitingData?.hookToken;
+
+  if (storedToken && storedToken !== token) {
+    throw new Error(`Invalid hook token for workflow ${run._id}`);
+  }
 }
 
 /**
@@ -143,7 +258,6 @@ export async function resumeHook(
  *
  * @example
  * ```typescript
- * // Slack bot - same channel always gets same token
  * const token = hookToken('slack', channelId);
  * const hook = createHook(ctx, 'slack-message', { token });
  * ```

@@ -33,7 +33,7 @@
 import { WorkflowEngine } from '../execution/engine.js';
 import { createContainer, type StreamlineContainer } from '../core/container.js';
 import { isTerminalState } from '../core/status.js';
-import type { WorkflowDefinition, StepHandler, WorkflowRun, StepContext } from '../core/types.js';
+import type { WorkflowDefinition, StepHandler, WorkflowRun, StepContext, Step } from '../core/types.js';
 import { validateId, validateRetryConfig } from '../utils/validation.js';
 import { WorkflowNotFoundError } from '../utils/errors.js';
 
@@ -44,8 +44,114 @@ const toName = (id: string) =>
     .replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/\b\w/g, (c) => c.toUpperCase());
 
-interface WorkflowConfig<TContext, TInput = unknown> {
-  steps: Record<string, StepHandler<unknown, TContext>>;
+// ============================================================================
+// Step Configuration
+// ============================================================================
+
+/**
+ * Per-step configuration for overriding timeout, retries, and conditions.
+ *
+ * `TContext` flows from `WorkflowConfig` — no manual annotation needed.
+ *
+ * @example
+ * ```typescript
+ * const workflow = createWorkflow('pipeline', {
+ *   steps: {
+ *     clone: {
+ *       handler: async (ctx) => { ... },
+ *       timeout: 120_000,
+ *       retries: 5,
+ *     },
+ *     review: {
+ *       handler: async (ctx) => { ... },
+ *       timeout: 300_000,
+ *       skipIf: (ctx) => ctx.autoApproved, // ctx is your TContext
+ *     },
+ *   },
+ * });
+ * ```
+ */
+export interface StepConfig<TOutput = unknown, TContext = Record<string, unknown>> {
+  handler: StepHandler<TOutput, TContext>;
+  timeout?: number;
+  retries?: number;
+  condition?: (context: TContext, run: WorkflowRun) => boolean | Promise<boolean>;
+  skipIf?: (context: TContext) => boolean | Promise<boolean>;
+  runIf?: (context: TContext) => boolean | Promise<boolean>;
+
+  /**
+   * Compensation handler (saga pattern rollback).
+   *
+   * Called in reverse order when a later step fails permanently.
+   * Only runs for steps that completed successfully (status: 'done').
+   *
+   * @example
+   * ```typescript
+   * charge: {
+   *   handler: async (ctx) => stripe.charges.create({ amount: 100 }),
+   *   onCompensate: async (ctx) => {
+   *     const chargeId = ctx.getOutput<{ id: string }>('charge')?.id;
+   *     await stripe.refunds.create({ charge: chargeId });
+   *   },
+   * },
+   * ```
+   */
+  onCompensate?: StepHandler<unknown, TContext>;
+}
+
+/** Type guard: is the step entry a StepConfig object (vs a plain handler fn)? */
+function isStepConfig<TOutput, TContext>(
+  step: StepHandler<TOutput, TContext> | StepConfig<TOutput, TContext>
+): step is StepConfig<TOutput, TContext> {
+  return typeof step === 'object' && step !== null && 'handler' in step;
+}
+
+/**
+ * Convert a StepConfig entry into a Step definition.
+ *
+ * The Step interface uses `(context: unknown)` for conditions because steps are
+ * stored in WorkflowDefinition (untyped at runtime). This is the one boundary
+ * where typed `TContext` callbacks widen to `unknown` — safe because the executor
+ * always passes the correct TContext at call sites.
+ */
+function toStepDef<TContext>(stepId: string, entry: StepConfig<unknown, TContext>): Step {
+  const step: Step = { id: stepId, name: toName(stepId) };
+
+  if (entry.timeout !== undefined) step.timeout = entry.timeout;
+  if (entry.retries !== undefined) step.retries = entry.retries;
+
+  // TContext → unknown widening: safe at this boundary.
+  // The executor calls these with the real TContext value.
+  if (entry.condition) step.condition = entry.condition as Step['condition'];
+  if (entry.skipIf) step.skipIf = entry.skipIf as Step['skipIf'];
+  if (entry.runIf) step.runIf = entry.runIf as Step['runIf'];
+
+  return step;
+}
+
+// ============================================================================
+// Workflow Configuration
+// ============================================================================
+
+/**
+ * Configuration for `createWorkflow()`.
+ *
+ * Steps can be plain async handlers or `StepConfig` objects with per-step
+ * timeout, retries, and conditions. Mix freely — `TContext` infers everywhere.
+ *
+ * @example
+ * ```typescript
+ * const config: WorkflowConfig<MyContext> = {
+ *   steps: {
+ *     fast: async (ctx) => ctx.context.value * 2,
+ *     slow: { handler: async (ctx) => heavyWork(), timeout: 120_000 },
+ *   },
+ *   context: (input) => ({ value: input.n }),
+ * };
+ * ```
+ */
+export interface WorkflowConfig<TContext, TInput = unknown> {
+  steps: Record<string, StepHandler<unknown, TContext> | StepConfig<unknown, TContext>>;
   context?: (input: TInput) => TContext;
   version?: string;
   defaults?: { retries?: number; timeout?: number };
@@ -54,15 +160,27 @@ interface WorkflowConfig<TContext, TInput = unknown> {
   container?: StreamlineContainer;
 }
 
-/** Options for waitFor method */
-interface WaitForOptions {
-  /** Poll interval in ms (default: 1000) */
+/** Options for `Workflow.waitFor()` */
+export interface WaitForOptions {
+  /** Poll interval in ms @default 1000 */
   pollInterval?: number;
-  /** Maximum time to wait in ms (default: no timeout) */
+  /** Maximum time to wait in ms @default undefined (no timeout) */
   timeout?: number;
 }
 
-interface Workflow<TContext, TInput = unknown> {
+/**
+ * A running workflow instance returned by `createWorkflow()`.
+ *
+ * Exported so consumers can type variables without the `ReturnType<>` workaround.
+ *
+ * @example
+ * ```typescript
+ * import { createWorkflow, type Workflow } from '@classytic/streamline';
+ *
+ * export const myWorkflow: Workflow<MyCtx, MyInput> = createWorkflow('my', { ... });
+ * ```
+ */
+export interface Workflow<TContext, TInput = unknown> {
   start: (input: TInput, meta?: Record<string, unknown>) => Promise<WorkflowRun<TContext>>;
   get: (runId: string) => Promise<WorkflowRun<TContext> | null>;
   execute: (runId: string) => Promise<WorkflowRun<TContext>>;
@@ -70,22 +188,6 @@ interface Workflow<TContext, TInput = unknown> {
   cancel: (runId: string) => Promise<WorkflowRun<TContext>>;
   pause: (runId: string) => Promise<WorkflowRun<TContext>>;
   rewindTo: (runId: string, stepId: string) => Promise<WorkflowRun<TContext>>;
-  /**
-   * Wait for a workflow to complete (reach a terminal state).
-   * Polls the workflow status until it's done, failed, or cancelled.
-   *
-   * @param runId - Workflow run ID to wait for
-   * @param options - Poll interval and timeout settings
-   * @returns The completed workflow run
-   * @throws {Error} If timeout is exceeded or workflow not found
-   *
-   * @example
-   * ```typescript
-   * const run = await workflow.start({ data: 'test' });
-   * const completed = await workflow.waitFor(run._id);
-   * console.log(completed.status); // 'done' | 'failed' | 'cancelled'
-   * ```
-   */
   waitFor: (runId: string, options?: WaitForOptions) => Promise<WorkflowRun<TContext>>;
   shutdown: () => void;
   definition: WorkflowDefinition<TContext>;
@@ -93,6 +195,10 @@ interface Workflow<TContext, TInput = unknown> {
   /** The container used by this workflow (for testing or custom integrations) */
   container: StreamlineContainer;
 }
+
+// ============================================================================
+// createWorkflow()
+// ============================================================================
 
 /**
  * Create a workflow with inline step handlers
@@ -112,12 +218,17 @@ interface Workflow<TContext, TInput = unknown> {
  * await orderProcess.start({ id: '123', email: 'user@example.com' });
  * ```
  *
- * @example Custom container for testing
+ * @example Per-step configuration
  * ```typescript
- * const container = createContainer();
- * const workflow = createWorkflow('test-workflow', {
- *   steps: { ... },
- *   container
+ * const pipeline = createWorkflow('ci-pipeline', {
+ *   steps: {
+ *     clone: { handler: async (ctx) => { ... }, timeout: 120_000 },
+ *     build: { handler: async (ctx) => { ... }, retries: 5 },
+ *     deploy: {
+ *       handler: async (ctx) => { ... },
+ *       skipIf: (ctx) => !ctx.shouldDeploy,
+ *     },
+ *   },
  * });
  * ```
  */
@@ -125,7 +236,6 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
   id: string,
   config: WorkflowConfig<TContext, TInput>
 ): Workflow<TContext, TInput> {
-  // Basic validation (full validation happens in WorkflowRegistry)
   validateId(id, 'workflow');
 
   const stepIds = Object.keys(config.steps);
@@ -133,26 +243,45 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     throw new Error('Workflow must have at least one step');
   }
 
-  // Validate defaults early for better error messages
   if (config.defaults) {
     validateRetryConfig(config.defaults.retries, config.defaults.timeout);
   }
+
+  // Normalize: separate handlers, compensation handlers, and step definitions
+  const handlers: Record<string, StepHandler<unknown, TContext>> = {};
+  const compensationHandlers: Record<string, StepHandler<unknown, TContext>> = {};
+  const steps: Step[] = stepIds.map((stepId) => {
+    // stepId comes from Object.keys(config.steps) — always defined
+    const entry = config.steps[stepId]!;
+
+    if (isStepConfig(entry)) {
+      handlers[stepId] = entry.handler;
+      if (entry.onCompensate) {
+        compensationHandlers[stepId] = entry.onCompensate;
+      }
+      return toStepDef(stepId, entry);
+    }
+
+    handlers[stepId] = entry;
+    return { id: stepId, name: toName(stepId) };
+  });
 
   const definition: WorkflowDefinition<TContext> = {
     id,
     name: toName(id),
     version: config.version ?? '1.0.0',
-    steps: stepIds.map((stepId) => ({ id: stepId, name: toName(stepId) })),
+    steps,
     createContext: (config.context ?? ((input) => input)) as (input: unknown) => TContext,
     defaults: config.defaults,
   };
 
-  // Use provided container or create a new one
   const container = config.container ?? createContainer();
 
-  // WorkflowEngine -> WorkflowRegistry will do full validation
-  const engine = new WorkflowEngine(definition, config.steps, container, {
+  const engine = new WorkflowEngine(definition, handlers, container, {
     ...(config.autoExecute !== undefined && { autoExecute: config.autoExecute }),
+    compensationHandlers: Object.keys(compensationHandlers).length > 0
+      ? compensationHandlers as unknown as Record<string, import('../core/types.js').StepHandler<unknown, unknown>>
+      : undefined,
   });
 
   const waitFor = async (
@@ -173,14 +302,12 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
         return run;
       }
 
-      // Check timeout
       if (timeout && Date.now() - startTime >= timeout) {
         throw new Error(
           `Timeout waiting for workflow "${runId}" to complete after ${timeout}ms. Current status: ${run.status}`
         );
       }
 
-      // Wait before next poll
       await new Promise((resolve) => setTimeout(resolve, pollInterval));
     }
   };

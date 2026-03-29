@@ -12,13 +12,6 @@ export default defineConfig({
   },
   sourcemap: false,
   minify: false,
-  // Externalize ALL dependencies — streamline should never bundle any package
-  external: [
-    'mongoose',
-    'fastify',
-    '@classytic/mongokit',
-    '@opentelemetry/api',
-    'luxon',
-    'semver',
-  ],
+  // tsdown 0.21+ auto-externalizes all deps/peerDeps from package.json.
+  // No manual `external` list needed — can't miss a dep, can't bundle by accident.
 });
