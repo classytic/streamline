@@ -49,25 +49,32 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { WorkflowEngine, hookRegistry } from '../execution/engine.js';
-import { createContainer, type StreamlineContainer, type ContainerOptions } from '../core/container.js';
-import { TimezoneHandler, type TimezoneCalculationResult } from './timezone-handler.js';
-import { logger } from '../utils/logger.js';
+import type { SortOrder } from 'mongoose';
 import { SCHEDULING } from '../config/constants.js';
+import {
+  type ContainerOptions,
+  createContainer,
+  type StreamlineContainer,
+} from '../core/container.js';
 import type {
+  RecurrencePattern,
+  StepState,
   WorkflowDefinition,
   WorkflowHandlers,
   WorkflowRun,
-  RecurrencePattern,
-  StepState,
 } from '../core/types.js';
+import { hookRegistry, WorkflowEngine } from '../execution/engine.js';
 import type { TenantFilterOptions } from '../plugins/tenant-filter.plugin.js';
-import type { SortOrder } from 'mongoose';
+import { logger } from '../utils/logger.js';
+import { TimezoneHandler } from './timezone-handler.js';
 
 /**
  * Type for scheduled workflow data before creation
  */
-type ScheduledWorkflowInput<TContext> = Omit<WorkflowRun<TContext>, 'startedAt' | 'endedAt' | 'output' | 'error' | 'lastHeartbeat' | 'paused'> & {
+type ScheduledWorkflowInput<TContext> = Omit<
+  WorkflowRun<TContext>,
+  'startedAt' | 'endedAt' | 'output' | 'error' | 'lastHeartbeat' | 'paused'
+> & {
   tenantId?: string;
 };
 
@@ -92,16 +99,16 @@ export interface ScheduledWorkflowsResult<TContext = unknown> {
  * Options for scheduling a workflow
  */
 export interface ScheduleWorkflowOptions {
-  /** 
+  /**
    * Local date/time to execute (in user's timezone, NOT UTC)
-   * 
+   *
    * Format: ISO string without timezone - "YYYY-MM-DDTHH:mm:ss"
-   * 
+   *
    * @example
    * ```typescript
    * scheduledFor: '2024-03-10T09:00:00' // 9:00 AM local time
    * ```
-   * 
+   *
    * This represents the LOCAL time in the target timezone.
    * The timezone parameter determines which timezone this represents.
    * Accepts both string and Date (Date will be converted to ISO string using local components).
@@ -194,7 +201,7 @@ export class SchedulingService<TContext = Record<string, unknown>> {
   constructor(
     workflow: WorkflowDefinition<TContext>,
     handlers: WorkflowHandlers<TContext>,
-    config: SchedulingServiceConfig = {}
+    config: SchedulingServiceConfig = {},
   ) {
     this.workflow = workflow;
     this.timezoneHandler = new TimezoneHandler();
@@ -203,7 +210,11 @@ export class SchedulingService<TContext = Record<string, unknown>> {
     // Priority: explicit container > multiTenant config > default
     if (config.container) {
       // Check if it's already a StreamlineContainer or ContainerOptions
-      if ('repository' in config.container && 'eventBus' in config.container && 'cache' in config.container) {
+      if (
+        'repository' in config.container &&
+        'eventBus' in config.container &&
+        'cache' in config.container
+      ) {
         this.container = config.container as StreamlineContainer;
       } else {
         this.container = createContainer(config.container as ContainerOptions);
@@ -273,13 +284,18 @@ export class SchedulingService<TContext = Record<string, unknown>> {
     // Calculate execution time with timezone awareness
     const timezoneResult = this.timezoneHandler.calculateExecutionTime(
       scheduledForString,
-      options.timezone
+      options.timezone,
     );
 
     // Validate not scheduling too far in the past (allow small grace period for clock skew)
     const now = new Date();
-    if (timezoneResult.executionTime.getTime() < now.getTime() - SCHEDULING.PAST_SCHEDULE_GRACE_MS) {
-      const minutesInPast = Math.round((now.getTime() - timezoneResult.executionTime.getTime()) / 60000);
+    if (
+      timezoneResult.executionTime.getTime() <
+      now.getTime() - SCHEDULING.PAST_SCHEDULE_GRACE_MS
+    ) {
+      const minutesInPast = Math.round(
+        (now.getTime() - timezoneResult.executionTime.getTime()) / 60000,
+      );
       logger.warn('Scheduling workflow in the past - will execute immediately', {
         workflowId: this.workflow.id,
         minutesInPast,
@@ -362,7 +378,7 @@ export class SchedulingService<TContext = Record<string, unknown>> {
   async reschedule(
     runId: string,
     newScheduledFor: string | Date,
-    newTimezone?: string
+    newTimezone?: string,
   ): Promise<WorkflowRun<TContext>> {
     const run = await this.repository.getById(runId);
 
@@ -372,7 +388,7 @@ export class SchedulingService<TContext = Record<string, unknown>> {
 
     if (run.status !== 'draft') {
       throw new Error(
-        `Cannot reschedule workflow ${runId} with status ${run.status}. Only draft workflows can be rescheduled.`
+        `Cannot reschedule workflow ${runId} with status ${run.status}. Only draft workflows can be rescheduled.`,
       );
     }
 
@@ -384,10 +400,7 @@ export class SchedulingService<TContext = Record<string, unknown>> {
     const timezone = newTimezone || run.scheduling.timezone;
 
     // Recalculate execution time (TimezoneHandler accepts both Date and string)
-    const timezoneResult = this.timezoneHandler.calculateExecutionTime(
-      newScheduledFor,
-      timezone
-    );
+    const timezoneResult = this.timezoneHandler.calculateExecutionTime(newScheduledFor, timezone);
 
     // Convert Date to ISO string for storage
     const scheduledForString =
@@ -435,7 +448,7 @@ export class SchedulingService<TContext = Record<string, unknown>> {
 
     if (run.status !== 'draft') {
       throw new Error(
-        `Cannot cancel workflow ${runId} with status ${run.status}. Only draft workflows can be cancelled.`
+        `Cannot cancel workflow ${runId} with status ${run.status}. Only draft workflows can be cancelled.`,
       );
     }
 
@@ -498,7 +511,9 @@ export class SchedulingService<TContext = Record<string, unknown>> {
    * });
    * ```
    */
-  async getScheduled(options: GetScheduledWorkflowsOptions = {}): Promise<ScheduledWorkflowsResult<TContext>> {
+  async getScheduled(
+    options: GetScheduledWorkflowsOptions = {},
+  ): Promise<ScheduledWorkflowsResult<TContext>> {
     const { page = 1, limit = 100, cursor, tenantId, executionTimeRange, recurring } = options;
 
     // Build filters for listing scheduled workflows
@@ -581,7 +596,7 @@ export class SchedulingService<TContext = Record<string, unknown>> {
 
     if (run.status !== 'draft') {
       throw new Error(
-        `Cannot execute workflow ${runId} with status ${run.status}. Only draft workflows can be executed.`
+        `Cannot execute workflow ${runId} with status ${run.status}. Only draft workflows can be executed.`,
       );
     }
 

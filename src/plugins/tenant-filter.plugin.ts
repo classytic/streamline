@@ -145,9 +145,7 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
         // Check if bypass is requested
         if (context.bypassTenant) {
           if (!allowBypass) {
-            throw new Error(
-              '[tenantFilterPlugin] Tenant bypass not allowed (allowBypass: false)'
-            );
+            throw new Error('[tenantFilterPlugin] Tenant bypass not allowed (allowBypass: false)');
           }
           // Bypass - no filter injected
           return;
@@ -160,7 +158,7 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
         if (!tenantId && strict) {
           throw new Error(
             `[tenantFilterPlugin] Missing tenantId in ${context.operation} operation. ` +
-              `Pass 'tenantId' in query options or set 'staticTenantId' in plugin config.`
+              `Pass 'tenantId' in query options or set 'staticTenantId' in plugin config.`,
           );
         }
 
@@ -227,7 +225,7 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
         if (!tenantId && strict) {
           throw new Error(
             `[tenantFilterPlugin] Missing tenantId in create operation. ` +
-              `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`
+              `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`,
           );
         }
 
@@ -267,7 +265,7 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
         if (!tenantId && strict) {
           throw new Error(
             `[tenantFilterPlugin] Missing tenantId in createMany operation. ` +
-              `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`
+              `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`,
           );
         }
 
@@ -318,7 +316,7 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
  */
 export function singleTenantPlugin(
   tenantId: string,
-  tenantField: string = 'context.tenantId'
+  tenantField: string = 'context.tenantId',
 ): Plugin {
   return tenantFilterPlugin({
     tenantField,

@@ -73,7 +73,7 @@ const WorkflowDefinitionSchema = new Schema<WorkflowDefinitionDoc>(
   {
     collection: 'workflow_definitions',
     timestamps: true,
-  }
+  },
 );
 
 // Pre-save hook to parse version and populate numeric fields
@@ -132,7 +132,7 @@ WorkflowDefinitionSchema.index({
 
 /**
  * Export WorkflowDefinitionModel with hot-reload safety
- * 
+ *
  * The pattern checks if the model already exists before creating a new one.
  * This prevents "OverwriteModelError" in development with hot module replacement.
  */
@@ -140,10 +140,14 @@ let WorkflowDefinitionModel: mongoose.Model<WorkflowDefinitionDoc>;
 
 if (mongoose.models.WorkflowDefinition) {
   // Model already exists - reuse it (for hot reload scenarios)
-  WorkflowDefinitionModel = mongoose.models.WorkflowDefinition as mongoose.Model<WorkflowDefinitionDoc>;
+  WorkflowDefinitionModel = mongoose.models
+    .WorkflowDefinition as mongoose.Model<WorkflowDefinitionDoc>;
 } else {
   // Create new model
-  WorkflowDefinitionModel = mongoose.model<WorkflowDefinitionDoc>('WorkflowDefinition', WorkflowDefinitionSchema);
+  WorkflowDefinitionModel = mongoose.model<WorkflowDefinitionDoc>(
+    'WorkflowDefinition',
+    WorkflowDefinitionSchema,
+  );
 }
 
 export { WorkflowDefinitionModel };
@@ -183,19 +187,22 @@ export const workflowDefinitionRepository = {
    * Get latest active version of a workflow
    */
   async getLatestVersion(workflowId: string): Promise<WorkflowDefinitionDoc | null> {
-    return await WorkflowDefinitionModel.findOne({
+    return (await WorkflowDefinitionModel.findOne({
       workflowId,
       isActive: true,
     })
       .sort({ versionMajor: -1, versionMinor: -1, versionPatch: -1 })
-      .lean() as WorkflowDefinitionDoc | null;
+      .lean()) as WorkflowDefinitionDoc | null;
   },
 
   /**
    * Get specific version of a workflow
    */
   async getByVersion(workflowId: string, version: string): Promise<WorkflowDefinitionDoc | null> {
-    return await WorkflowDefinitionModel.findOne({ workflowId, version }).lean() as WorkflowDefinitionDoc | null;
+    return (await WorkflowDefinitionModel.findOne({
+      workflowId,
+      version,
+    }).lean()) as WorkflowDefinitionDoc | null;
   },
 
   /**
@@ -234,7 +241,7 @@ export const workflowDefinitionRepository = {
   async update(
     workflowId: string,
     version: string,
-    updates: Partial<WorkflowDefinitionDoc>
+    updates: Partial<WorkflowDefinitionDoc>,
   ): Promise<WorkflowDefinitionDoc | null> {
     // If version is being changed, recompute numeric fields
     if (updates.version) {
@@ -247,9 +254,9 @@ export const workflowDefinitionRepository = {
       updates.versionPatch = parsed.patch;
     }
 
-    return await WorkflowDefinitionModel.findOneAndUpdate({ workflowId, version }, updates, {
+    return (await WorkflowDefinitionModel.findOneAndUpdate({ workflowId, version }, updates, {
       returnDocument: 'after',
-    }).lean() as WorkflowDefinitionDoc | null;
+    }).lean()) as WorkflowDefinitionDoc | null;
   },
 
   /**
@@ -267,7 +274,7 @@ export const workflowDefinitionRepository = {
   async deactivateOldVersions(workflowId: string, keepVersion: string): Promise<void> {
     await WorkflowDefinitionModel.updateMany(
       { workflowId, version: { $ne: keepVersion } },
-      { isActive: false }
+      { isActive: false },
     );
   },
 };

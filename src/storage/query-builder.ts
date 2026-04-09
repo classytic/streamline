@@ -105,10 +105,7 @@ export class WorkflowQueryBuilder {
   // Heartbeat/stale detection
   withStaleHeartbeat(thresholdMs: number) {
     const staleTime = new Date(Date.now() - thresholdMs);
-    this.query.$or = [
-      { lastHeartbeat: { $lt: staleTime } },
-      { lastHeartbeat: { $exists: false } },
-    ];
+    this.query.$or = [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }];
     return this;
   }
 

@@ -98,7 +98,7 @@ describe('TenantFilterPlugin', () => {
       expect(tenantBResults.docs[0].context.tenantId).toBe('tenant-b');
     });
 
-    it('should prevent cross-tenant access in getById', async () => {
+    it('should prevent cross-tenant access in getByQuery for string IDs', async () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
@@ -119,23 +119,24 @@ describe('TenantFilterPlugin', () => {
         updatedAt: new Date(),
       });
 
-      // Note: MongoKit's getById uses id directly, so tenant filtering happens at application level
-      // Use throwOnNotFound: false to get null instead of error
-      const result = await repo.getById('run-cross-tenant-test', {
+      const result = await repo.getByQuery(
+        { _id: 'run-cross-tenant-test' },
+        {
         tenantId: 'tenant-b',
         throwOnNotFound: false,
-      } as any);
+      } as any,
+      );
 
-      // Note: Due to MongoKit's design, getById doesn't use query filters from plugins
-      // The document is found by ID regardless of tenant filter
-      // This is expected - for strict tenant isolation, use getByQuery instead
-      expect(result).toBeDefined();
+      expect(result).toBeNull();
 
       // Tenant A should be able to access their own workflow
-      const resultA = await repo.getById('run-cross-tenant-test', {
+      const resultA = await repo.getByQuery(
+        { _id: 'run-cross-tenant-test' },
+        {
         tenantId: 'tenant-a',
         throwOnNotFound: false,
-      } as any);
+      } as any,
+      );
 
       expect(resultA).toBeDefined();
       expect(resultA?._id).toBe('run-cross-tenant-test');

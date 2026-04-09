@@ -1,59 +1,39 @@
-import os from 'os';
+import os from 'node:os';
 
-/**
- * Sample-based CPU usage tracking
- * Measures CPU load over a sampling interval (not cumulative since boot)
- */
-let lastCPUSample: { idle: number; total: number; timestamp: number } | null = null;
+interface CpuSample {
+  processMicros: number;
+  wallMs: number;
+}
 
-function getCPUTimes() {
-  const cpus = os.cpus();
-  let idle = 0;
-  let total = 0;
+let lastSample: CpuSample | null = null;
+const STALE_SAMPLE_MS = 5000;
 
-  for (const cpu of cpus) {
-    for (const type in cpu.times) {
-      total += cpu.times[type as keyof typeof cpu.times];
-    }
-    idle += cpu.times.idle;
-  }
-
-  return { idle, total };
+function getLoadAverageFallback(): number {
+  const cpuCount = Math.max(os.cpus().length, 1);
+  const load = os.loadavg()[0] ?? 0;
+  return Math.min(Math.max(load / cpuCount, 0), 1);
 }
 
 export function getCPUUsage(): number {
   const now = Date.now();
-  const current = getCPUTimes();
+  const usage = process.cpuUsage();
+  const current: CpuSample = {
+    processMicros: usage.user + usage.system,
+    wallMs: now,
+  };
 
-  // First call or stale sample (> 5 seconds old) - return load average fallback
-  if (!lastCPUSample || now - lastCPUSample.timestamp > 5000) {
-    lastCPUSample = { ...current, timestamp: now };
-
-    // Use system load average as fallback (1-minute average)
-    const cpuCount = os.cpus().length;
-    const loadAvg = os.loadavg()[0];
-    return Math.min(loadAvg / cpuCount, 1.0);
+  if (!lastSample || now - lastSample.wallMs > STALE_SAMPLE_MS) {
+    lastSample = current;
+    return getLoadAverageFallback();
   }
 
-  // Calculate usage since last sample
-  const idleDiff = current.idle - lastCPUSample.idle;
-  const totalDiff = current.total - lastCPUSample.total;
+  const wallDeltaMicros = (current.wallMs - lastSample.wallMs) * 1000;
+  const cpuDeltaMicros = current.processMicros - lastSample.processMicros;
+  lastSample = current;
 
-  // Update sample for next call
-  lastCPUSample = { ...current, timestamp: now };
+  if (wallDeltaMicros <= 0) {
+    return getLoadAverageFallback();
+  }
 
-  if (totalDiff === 0) return 0;
-
-  return 1 - idleDiff / totalDiff;
-}
-
-export function getMemoryUsage(): { usedMB: number; percentUsed: number } {
-  const totalMem = os.totalmem();
-  const freeMem = os.freemem();
-  const usedMem = totalMem - freeMem;
-
-  return {
-    usedMB: Math.round(usedMem / 1024 / 1024),
-    percentUsed: usedMem / totalMem,
-  };
+  return Math.min(Math.max(cpuDeltaMicros / wallDeltaMicros, 0), 1);
 }

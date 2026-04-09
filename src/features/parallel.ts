@@ -46,7 +46,7 @@ export interface ExecuteParallelOptions {
 
 async function executeWithConcurrency<T>(
   tasks: Array<() => Promise<T>>,
-  concurrency: number
+  concurrency: number,
 ): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
   const errors: Array<{ index: number; error: unknown }> = [];
@@ -87,7 +87,7 @@ async function executeWithConcurrency<T>(
 
 async function executeWithConcurrencySettled<T>(
   tasks: Array<() => Promise<T>>,
-  concurrency: number
+  concurrency: number,
 ): Promise<Array<{ success: boolean; value?: T; reason?: unknown }>> {
   const results: Array<{ success: boolean; value?: T; reason?: unknown }> = new Array(tasks.length);
   const executing: Set<Promise<void>> = new Set();
@@ -153,19 +153,20 @@ async function executeWithConcurrencySettled<T>(
  */
 export async function executeParallel<T>(
   tasks: Array<() => Promise<T>>,
-  options: ExecuteParallelOptions = {}
+  options: ExecuteParallelOptions = {},
 ): Promise<T[] | Array<{ success: boolean; value?: T; reason?: unknown }>> {
   const { mode = 'all', concurrency = Infinity, timeout } = options;
 
   // Wrap tasks with timeout if specified
   const wrappedTasks = timeout
-    ? tasks.map((task) => () =>
-        Promise.race([
-          task(),
-          new Promise<T>((_, reject) =>
-            setTimeout(() => reject(new Error(`Task timeout after ${timeout}ms`)), timeout)
-          ),
-        ])
+    ? tasks.map(
+        (task) => () =>
+          Promise.race([
+            task(),
+            new Promise<T>((_, reject) =>
+              setTimeout(() => reject(new Error(`Task timeout after ${timeout}ms`)), timeout),
+            ),
+          ]),
       )
     : tasks;
 
@@ -177,8 +178,8 @@ export async function executeParallel<T>(
   if (concurrency !== Infinity && (mode === 'race' || mode === 'any')) {
     throw new Error(
       `executeParallel: mode '${mode}' cannot be combined with concurrency limiting. ` +
-      `The '${mode}' mode requires all tasks to start simultaneously to determine the winner. ` +
-      `Either remove the concurrency limit or use mode 'all' or 'allSettled'.`
+        `The '${mode}' mode requires all tasks to start simultaneously to determine the winner. ` +
+        `Either remove the concurrency limit or use mode 'all' or 'allSettled'.`,
     );
   }
 
@@ -187,7 +188,6 @@ export async function executeParallel<T>(
     switch (mode) {
       case 'allSettled':
         return executeWithConcurrencySettled(wrappedTasks, concurrency);
-      case 'all':
       default:
         return executeWithConcurrency(wrappedTasks, concurrency);
     }
@@ -201,13 +201,14 @@ export async function executeParallel<T>(
       return [await Promise.race(wrappedTasks.map((t) => t()))];
     case 'any':
       return Promise.any(wrappedTasks.map((t) => t())).then((result) => [result]);
-    case 'allSettled':
+    case 'allSettled': {
       const settled = await Promise.allSettled(wrappedTasks.map((t) => t()));
       return settled.map((result) =>
         result.status === 'fulfilled'
           ? { success: true, value: result.value }
-          : { success: false, reason: result.reason }
+          : { success: false, reason: result.reason },
       );
+    }
     default:
       return Promise.all(wrappedTasks.map((t) => t()));
   }

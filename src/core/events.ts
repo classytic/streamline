@@ -1,4 +1,4 @@
-import { EventEmitter } from 'events';
+import { EventEmitter } from 'node:events';
 
 /**
  * Typed event payloads for type-safe event handling
@@ -63,6 +63,8 @@ export interface EventPayloadMap {
   'workflow:cancelled': BaseEventPayload;
   'workflow:recovered': BaseEventPayload;
   'workflow:retry': BaseEventPayload;
+  'workflow:compensating': BaseEventPayload & { data?: { steps: string[] } };
+  'step:compensated': StepEventPayload;
   'engine:error': EngineErrorPayload;
   'scheduler:error': EngineErrorPayload;
   'scheduler:circuit-open': { error: Error; context: string };
@@ -80,19 +82,28 @@ export class WorkflowEventBus extends EventEmitter {
     return super.emit(event, payload);
   }
 
-  override on<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
+  override on<K extends WorkflowEventName>(
+    event: K,
+    listener: (payload: EventPayloadMap[K]) => void,
+  ): this;
   override on(event: string, listener: (payload: unknown) => void): this;
   override on(event: string, listener: (payload: unknown) => void): this {
     return super.on(event, listener);
   }
 
-  override once<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
+  override once<K extends WorkflowEventName>(
+    event: K,
+    listener: (payload: EventPayloadMap[K]) => void,
+  ): this;
   override once(event: string, listener: (payload: unknown) => void): this;
   override once(event: string, listener: (payload: unknown) => void): this {
     return super.once(event, listener);
   }
 
-  override off<K extends WorkflowEventName>(event: K, listener: (payload: EventPayloadMap[K]) => void): this;
+  override off<K extends WorkflowEventName>(
+    event: K,
+    listener: (payload: EventPayloadMap[K]) => void,
+  ): this;
   override off(event: string, listener: (payload: unknown) => void): this;
   override off(event: string, listener: (payload: unknown) => void): this {
     return super.off(event, listener);
@@ -104,3 +115,93 @@ export class WorkflowEventBus extends EventEmitter {
  * Use with createContainer({ eventBus: 'global' }) for telemetry integration.
  */
 export const globalEventBus = new WorkflowEventBus();
+
+// ============================================================================
+// Event Sink — External event subscription (webhooks, queues, etc.)
+// ============================================================================
+
+/**
+ * Callback for external event consumers.
+ */
+export type EventSinkHandler<K extends WorkflowEventName = WorkflowEventName> = (
+  event: K,
+  payload: EventPayloadMap[K],
+) => void | Promise<void>;
+
+/**
+ * Options for creating an event sink.
+ */
+export interface EventSinkOptions {
+  /** Only forward events matching these names */
+  events?: WorkflowEventName[];
+  /** Only forward events for this specific runId */
+  runId?: string;
+}
+
+/**
+ * Subscribe to workflow lifecycle events from outside the workflow.
+ * Returns an unsubscribe function.
+ *
+ * @example
+ * ```typescript
+ * const unsub = createEventSink(engine.container.eventBus, {
+ *   events: ['workflow:completed', 'workflow:failed'],
+ * }, async (event, payload) => {
+ *   await fetch(webhookUrl, {
+ *     method: 'POST',
+ *     body: JSON.stringify({ event, ...payload }),
+ *   });
+ * });
+ *
+ * // Later: stop listening
+ * unsub();
+ * ```
+ */
+export function createEventSink(
+  eventBus: WorkflowEventBus,
+  options: EventSinkOptions,
+  handler: EventSinkHandler,
+): () => void {
+  const allEvents: WorkflowEventName[] = options.events ?? [
+    'step:started',
+    'step:completed',
+    'step:failed',
+    'step:waiting',
+    'step:skipped',
+    'step:retry-scheduled',
+    'workflow:started',
+    'workflow:completed',
+    'workflow:failed',
+    'workflow:waiting',
+    'workflow:resumed',
+    'workflow:cancelled',
+    'workflow:recovered',
+  ];
+
+  const listeners: Array<{ event: WorkflowEventName; fn: (payload: any) => void }> = [];
+
+  for (const event of allEvents) {
+    const fn = (payload: any) => {
+      // Filter by runId if specified
+      if (options.runId && payload?.runId !== options.runId) return;
+      // Fire-and-forget: don't let sink errors crash the engine
+      try {
+        const result = handler(event, payload);
+        if (result && typeof (result as Promise<void>).catch === 'function') {
+          (result as Promise<void>).catch(() => {});
+        }
+      } catch {
+        // Silently drop — sink errors must not affect workflow execution
+      }
+    };
+    eventBus.on(event, fn);
+    listeners.push({ event, fn });
+  }
+
+  return () => {
+    for (const { event, fn } of listeners) {
+      eventBus.off(event, fn);
+    }
+    listeners.length = 0;
+  };
+}

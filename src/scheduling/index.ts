@@ -21,15 +21,15 @@
 
 // Core scheduling service
 export {
-  SchedulingService,
-  type ScheduleWorkflowOptions,
   type GetScheduledWorkflowsOptions,
+  type ScheduleWorkflowOptions,
+  SchedulingService,
   type SchedulingServiceConfig,
 } from './scheduling.service.js';
 
 // Timezone utilities
 export {
+  type TimezoneCalculationResult,
   TimezoneHandler,
   timezoneHandler,
-  type TimezoneCalculationResult,
 } from './timezone-handler.js';

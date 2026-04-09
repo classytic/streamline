@@ -11,10 +11,11 @@
  * Philosophy: Be smart, not wasteful. Iron Man, not Homer Simpson.
  */
 
-import { TIMING, SCHEDULER, LIMITS } from '../config/constants.js';
-import { logger } from '../utils/logger.js';
-import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import { COMPUTED, LIMITS, SCHEDULER, TIMING } from '../config/constants.js';
 import type { WorkflowEventBus } from '../core/events.js';
+import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import { toError } from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
 
 // ============================================================================
 // Scheduler Metrics (inlined from scheduler-metrics.ts)
@@ -48,7 +49,10 @@ class SchedulerMetrics {
     uptime: 0,
   };
 
-  private pollDurations: number[] = [];
+  /** Ring buffer for O(1) insert — avoids Array.shift() which is O(n) */
+  private readonly pollDurations = new Array<number>(100).fill(0);
+  private pollDurationsIndex = 0;
+  private pollDurationsCount = 0;
   private startTime?: Date;
   private readonly maxDurationsToTrack = 100;
 
@@ -72,13 +76,18 @@ class SchedulerMetrics {
       this.stats.failedPolls++;
     }
 
-    this.pollDurations.push(duration);
-    if (this.pollDurations.length > this.maxDurationsToTrack) {
-      this.pollDurations.shift();
+    // Ring buffer insert — O(1), no array resizing or shifting
+    this.pollDurations[this.pollDurationsIndex] = duration;
+    this.pollDurationsIndex = (this.pollDurationsIndex + 1) % this.maxDurationsToTrack;
+    if (this.pollDurationsCount < this.maxDurationsToTrack) {
+      this.pollDurationsCount++;
     }
 
-    this.stats.avgPollDuration =
-      this.pollDurations.reduce((sum, d) => sum + d, 0) / this.pollDurations.length;
+    let sum = 0;
+    for (let i = 0; i < this.pollDurationsCount; i++) {
+      sum += this.pollDurations[i];
+    }
+    this.stats.avgPollDuration = sum / this.pollDurationsCount;
 
     this.stats.activeWorkflows = workflowsFound;
   }
@@ -127,8 +136,8 @@ class SchedulerMetrics {
   }
 }
 
-// JavaScript setTimeout max delay: 2^31-1 milliseconds = ~24.8 days
-const MAX_SETTIMEOUT_DELAY = 2147483647;
+/** JavaScript setTimeout max delay: 2^31-1 ms (~24.8 days) */
+const MAX_SETTIMEOUT_DELAY = COMPUTED.MAX_TIMEOUT_SAFE_MS;
 
 export interface SmartSchedulerConfig {
   /** Base poll interval (when active) */
@@ -179,16 +188,15 @@ export class SmartScheduler {
   private isStaleCheckActive = false;
   private currentInterval: number;
   private consecutiveFailures = 0;
-  private lastWorkflowCount = 0;
-  private metrics: SchedulerMetrics;
+  private readonly metrics: SchedulerMetrics;
   private staleRecoveryCallback?: (runId: string, thresholdMs: number) => Promise<unknown>;
   private retryCallback?: (runId: string) => Promise<unknown>;
 
   constructor(
-    private repository: WorkflowRunRepository,
-    private resumeCallback: (runId: string) => Promise<void>,
-    private config: SmartSchedulerConfig = DEFAULT_SCHEDULER_CONFIG,
-    private eventBus?: WorkflowEventBus
+    private readonly repository: WorkflowRunRepository,
+    private readonly resumeCallback: (runId: string) => Promise<void>,
+    private readonly config: SmartSchedulerConfig = DEFAULT_SCHEDULER_CONFIG,
+    private readonly eventBus?: WorkflowEventBus,
   ) {
     this.currentInterval = config.basePollInterval;
     this.metrics = new SchedulerMetrics();
@@ -198,7 +206,7 @@ export class SmartScheduler {
     if (this.eventBus) {
       this.eventBus.emit('scheduler:error', {
         runId,
-        error: error instanceof Error ? error : new Error(String(error)),
+        error: toError(error),
         context,
       });
     }
@@ -208,7 +216,9 @@ export class SmartScheduler {
    * Set callback for recovering stale 'running' workflows
    * Separate from resume because stale recovery requires different atomic claim logic
    */
-  setStaleRecoveryCallback(callback: (runId: string, thresholdMs: number) => Promise<unknown>): void {
+  setStaleRecoveryCallback(
+    callback: (runId: string, thresholdMs: number) => Promise<unknown>,
+  ): void {
     this.staleRecoveryCallback = callback;
   }
 
@@ -360,7 +370,9 @@ export class SmartScheduler {
     }
 
     // Clear all timers
-    this.timers.forEach((timer) => clearTimeout(timer));
+    this.timers.forEach((timer) => {
+      clearTimeout(timer);
+    });
     this.timers.clear();
   }
 
@@ -408,7 +420,7 @@ export class SmartScheduler {
     try {
       const staleWorkflows = await this.repository.getStaleRunningWorkflows(
         this.config.staleThreshold,
-        1
+        1,
       );
 
       if (staleWorkflows.length > 0 && !this.isPolling) {
@@ -513,10 +525,25 @@ export class SmartScheduler {
         }
       }
 
+      // Promote concurrency-queued drafts (status='draft', no scheduling, has concurrencyKey)
+      // These are runs that were queued because the concurrency limit was reached at start time.
+      const concurrencyDrafts = await this.repository.getConcurrencyDrafts(limit);
+
+      for (const draft of concurrencyDrafts) {
+        if (this.retryCallback) {
+          try {
+            await this.retryCallback(draft._id);
+            resumedCount++;
+          } catch (err) {
+            this.emitError('promote-concurrency-draft', err, draft._id);
+          }
+        }
+      }
+
       // Recover stale running workflows (no heartbeat threshold) - PAGINATED
       const stale = await this.repository.getStaleRunningWorkflows(
         this.config.staleThreshold,
-        limit
+        limit,
       );
 
       for (const run of stale) {
@@ -539,7 +566,6 @@ export class SmartScheduler {
       const totalWorkflows = waiting.length + retrying.length + scheduled.length + stale.length;
       this.metrics.recordPoll(duration, true, totalWorkflows);
       this.consecutiveFailures = 0;
-      this.lastWorkflowCount = totalWorkflows;
 
       // Adjust interval based on load (if adaptive)
       if (this.config.adaptivePolling) {
@@ -573,7 +599,7 @@ export class SmartScheduler {
         if (this.eventBus) {
           this.eventBus.emit('scheduler:circuit-open', {
             error: new Error(
-              `Circuit breaker triggered after ${this.consecutiveFailures} consecutive failures`
+              `Circuit breaker triggered after ${this.consecutiveFailures} consecutive failures`,
             ),
             context: 'circuit-breaker',
           });
@@ -624,6 +650,10 @@ export class SmartScheduler {
       // Don't start scheduler for healthy running workflows
       const stale = await this.repository.getStaleRunningWorkflows(this.config.staleThreshold, 1);
       if (stale.length > 0) return true;
+
+      // Check for concurrency-queued drafts waiting for promotion
+      const draftCount = await this.repository.countConcurrencyDrafts();
+      if (draftCount > 0) return true;
 
       return false;
     } catch (error) {

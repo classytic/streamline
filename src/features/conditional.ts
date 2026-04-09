@@ -14,7 +14,7 @@ export function isConditionalStep(step: Step): step is ConditionalStep {
 export async function shouldSkipStep<TContext>(
   step: ConditionalStep,
   context: TContext,
-  run: WorkflowRun<TContext>
+  run: WorkflowRun<TContext>,
 ): Promise<boolean> {
   if (step.condition) {
     // Condition function accepts unknown context/run, allowing any TContext
@@ -35,29 +35,41 @@ export async function shouldSkipStep<TContext>(
 }
 
 export function createCondition<TContext>(
-  predicate: (context: TContext) => boolean
+  predicate: (context: TContext) => boolean,
 ): (context: TContext) => boolean {
   return predicate;
 }
 
 export const conditions = {
-  hasValue: <TContext>(key: keyof TContext) => (context: TContext) =>
-    context[key] !== undefined && context[key] !== null,
+  hasValue:
+    <TContext>(key: keyof TContext) =>
+    (context: TContext) =>
+      context[key] !== undefined && context[key] !== null,
 
-  equals: <TContext>(key: keyof TContext, value: TContext[keyof TContext]) => (context: TContext) =>
-    context[key] === value,
+  equals:
+    <TContext>(key: keyof TContext, value: TContext[keyof TContext]) =>
+    (context: TContext) =>
+      context[key] === value,
 
-  notEquals: <TContext>(key: keyof TContext, value: TContext[keyof TContext]) => (context: TContext) =>
-    context[key] !== value,
+  notEquals:
+    <TContext>(key: keyof TContext, value: TContext[keyof TContext]) =>
+    (context: TContext) =>
+      context[key] !== value,
 
-  greaterThan: <TContext>(key: keyof TContext, value: number) => (context: TContext) =>
-    typeof context[key] === 'number' && (context[key] as number) > value,
+  greaterThan:
+    <TContext>(key: keyof TContext, value: number) =>
+    (context: TContext) =>
+      typeof context[key] === 'number' && (context[key] as number) > value,
 
-  lessThan: <TContext>(key: keyof TContext, value: number) => (context: TContext) =>
-    typeof context[key] === 'number' && (context[key] as number) < value,
+  lessThan:
+    <TContext>(key: keyof TContext, value: number) =>
+    (context: TContext) =>
+      typeof context[key] === 'number' && (context[key] as number) < value,
 
-  in: <TContext>(key: keyof TContext, values: readonly TContext[keyof TContext][]) => (context: TContext) =>
-    values.includes(context[key]),
+  in:
+    <TContext>(key: keyof TContext, values: readonly TContext[keyof TContext][]) =>
+    (context: TContext) =>
+      values.includes(context[key]),
 
   and:
     <TContext>(...predicates: Array<(context: TContext) => boolean>) =>

@@ -40,7 +40,11 @@ export async function setupTestDB(): Promise<void> {
     { key: { status: 1, paused: 1, updatedAt: 1, _id: 1 } },
     { key: { status: 1, lastHeartbeat: 1 } },
     { key: { status: 1, 'scheduling.executionTime': 1, paused: 1 } },
-  ]);
+    // Distributed primitives
+    { key: { idempotencyKey: 1, status: 1 }, sparse: true },
+    { key: { workflowId: 1, concurrencyKey: 1, status: 1 } },
+    { key: { status: 1, priority: -1, updatedAt: 1 } },
+  ] as any);
 }
 
 /**

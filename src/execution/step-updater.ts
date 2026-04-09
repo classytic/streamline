@@ -5,7 +5,7 @@
 
 import type { StepState, WorkflowRun } from '../core/types.js';
 
-export interface StepUpdateOperators {
+interface StepUpdateOperators {
   $set: Record<string, unknown>;
   $unset: Record<string, string>;
   [key: string]: unknown; // Index signature for compatibility with Record<string, unknown>
@@ -13,12 +13,12 @@ export interface StepUpdateOperators {
 
 /**
  * Build MongoDB update operators for step state changes
- * 
+ *
  * Automatically handles:
  * - undefined values → $unset (remove from document)
  * - defined values → $set (update document)
  * - Always updates workflow-level updatedAt timestamp
- * 
+ *
  * @param stepIndex - Array index of step in workflow.steps[]
  * @param updates - Partial step state with fields to update
  * @param includeStatus - Whether to include derived status in $set
@@ -27,7 +27,7 @@ export interface StepUpdateOperators {
 export function buildStepUpdateOps(
   stepIndex: number,
   updates: Partial<StepState>,
-  options?: { includeStatus?: string; includeUpdatedAt?: boolean }
+  options?: { includeStatus?: string; includeUpdatedAt?: boolean },
 ): StepUpdateOperators {
   const $set: Record<string, unknown> = {};
   const $unset: Record<string, string> = {};
@@ -35,7 +35,7 @@ export function buildStepUpdateOps(
   // Process each update field
   for (const [key, value] of Object.entries(updates)) {
     const fieldPath = `steps.${stepIndex}.${key}`;
-    
+
     if (value === undefined) {
       $unset[fieldPath] = ''; // Remove field
     } else {
@@ -60,10 +60,10 @@ export function buildStepUpdateOps(
  * Apply step updates to in-memory workflow run
  * Mirrors MongoDB update operations for consistency
  */
-export function applyStepUpdates<TContext>(
+export function applyStepUpdates<_TContext>(
   stepId: string,
   steps: StepState[],
-  updates: Partial<StepState>
+  updates: Partial<StepState>,
 ): StepState[] {
   return steps.map((step) => {
     if (step.stepId !== stepId) return step;
@@ -93,7 +93,7 @@ interface MongooseDocument<T> {
  * Preserves context field which Mongoose sometimes drops for empty objects
  */
 export function toPlainRun<TContext>(
-  run: WorkflowRun<TContext> | MongooseDocument<WorkflowRun<TContext>>
+  run: WorkflowRun<TContext> | MongooseDocument<WorkflowRun<TContext>>,
 ): WorkflowRun<TContext> {
   if ('toObject' in run && typeof run.toObject === 'function') {
     const savedContext = run.context;

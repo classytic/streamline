@@ -3,8 +3,8 @@
  * Centralized validation to prevent common errors with clear messages
  */
 
-import type { WorkflowDefinition, WorkflowHandlers, Step } from '../core/types.js';
 import { LIMITS } from '../config/constants.js';
+import type { WorkflowDefinition, WorkflowHandlers } from '../core/types.js';
 
 // ============================================================================
 // ID Validation
@@ -22,7 +22,7 @@ export function validateId(id: string, type: 'workflow' | 'step' = 'workflow'): 
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
     throw new Error(
       `${type} ID "${id}" contains invalid characters. ` +
-      `Only alphanumeric characters, hyphens, and underscores are allowed.`
+        `Only alphanumeric characters, hyphens, and underscores are allowed.`,
     );
   }
 
@@ -32,15 +32,38 @@ export function validateId(id: string, type: 'workflow' | 'step' = 'workflow'): 
 }
 
 /**
- * Validate retry configuration
+ * Validate retry/timeout/backoff configuration
  */
-export function validateRetryConfig(retries?: number, timeout?: number): void {
+export function validateRetryConfig(
+  retries?: number,
+  timeout?: number,
+  retryDelay?: number,
+  retryBackoff?: 'exponential' | 'linear' | 'fixed' | number,
+): void {
   if (retries !== undefined && (!Number.isInteger(retries) || retries < 0)) {
     throw new Error(`retries must be a non-negative integer, got: ${retries}`);
   }
 
   if (timeout !== undefined && (!Number.isInteger(timeout) || timeout <= 0)) {
     throw new Error(`timeout must be a positive integer (milliseconds), got: ${timeout}`);
+  }
+
+  if (retryDelay !== undefined && (!Number.isInteger(retryDelay) || retryDelay < 0)) {
+    throw new Error(`retryDelay must be a non-negative integer (milliseconds), got: ${retryDelay}`);
+  }
+
+  if (
+    retryBackoff !== undefined &&
+    !(
+      retryBackoff === 'exponential' ||
+      retryBackoff === 'linear' ||
+      retryBackoff === 'fixed' ||
+      (typeof retryBackoff === 'number' && Number.isFinite(retryBackoff) && retryBackoff > 0)
+    )
+  ) {
+    throw new Error(
+      `retryBackoff must be 'exponential', 'linear', 'fixed', or a positive number, got: ${String(retryBackoff)}`,
+    );
   }
 }
 
@@ -54,7 +77,7 @@ export function validateRetryConfig(retries?: number, timeout?: number): void {
  */
 export function validateWorkflowDefinition<TContext>(
   definition: WorkflowDefinition<TContext>,
-  handlers: WorkflowHandlers<TContext>
+  handlers: WorkflowHandlers<TContext>,
 ): void {
   if (!definition.id) throw new Error('Workflow ID is required');
   if (!definition.name) throw new Error('Workflow name is required');

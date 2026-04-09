@@ -1,5 +1,11 @@
 import mongoose, { Schema } from 'mongoose';
-import type { WorkflowRun, StepState, SchedulingInfo, RecurrencePattern } from '../core/types.js';
+import type {
+  RecurrencePattern,
+  SchedulingInfo,
+  StepLogEntry,
+  StepState,
+  WorkflowRun,
+} from '../core/types.js';
 
 const StepStateSchema = new Schema<StepState>(
   {
@@ -11,14 +17,27 @@ const StepStateSchema = new Schema<StepState>(
     },
     attempts: { type: Number, default: 0 },
     startedAt: Date,
+    completedAt: Date,
     endedAt: Date,
+    durationMs: Number,
     output: Schema.Types.Mixed,
     // Use Mixed for waitingFor and error so they can be completely removed
     waitingFor: { type: Schema.Types.Mixed, required: false },
     error: { type: Schema.Types.Mixed, required: false },
     retryAfter: Date, // Exponential backoff timestamp
   },
-  { _id: false }
+  { _id: false },
+);
+
+const StepLogEntrySchema = new Schema<StepLogEntry>(
+  {
+    stepId: { type: String, required: true },
+    message: { type: String, required: true },
+    data: Schema.Types.Mixed,
+    attempt: { type: Number, required: true },
+    timestamp: { type: Date, required: true },
+  },
+  { _id: false },
 );
 
 const RecurrencePatternSchema = new Schema<RecurrencePattern>(
@@ -35,7 +54,7 @@ const RecurrencePatternSchema = new Schema<RecurrencePattern>(
     count: Number,
     occurrences: { type: Number, default: 0 },
   },
-  { _id: false }
+  { _id: false },
 );
 
 const SchedulingInfoSchema = new Schema<SchedulingInfo>(
@@ -48,7 +67,7 @@ const SchedulingInfoSchema = new Schema<SchedulingInfo>(
     dstNote: String,
     recurrence: RecurrencePatternSchema,
   },
-  { _id: false }
+  { _id: false },
 );
 
 const WorkflowRunSchema = new Schema<WorkflowRun>(
@@ -74,6 +93,10 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
     lastHeartbeat: Date, // For detecting stale running workflows
     paused: { type: Boolean, default: false }, // User-initiated pause - scheduler skips paused workflows
     scheduling: SchedulingInfoSchema, // Optional: timezone-aware scheduling metadata
+    stepLogs: { type: [StepLogEntrySchema], default: undefined }, // Persisted step-level logs from ctx.log()
+    idempotencyKey: String, // Dedup key — non-terminal runs block duplicates
+    priority: { type: Number, default: 0 }, // Higher = picked up sooner by scheduler
+    concurrencyKey: String, // Grouping key for concurrency limits
     userId: { type: String, index: true },
     tags: [String],
     meta: Schema.Types.Mixed,
@@ -91,12 +114,21 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
      * For standalone dev instances, Mongoose/MongoDB gracefully degrades.
      */
     writeConcern: { w: 'majority', j: true },
-  }
+  },
 );
 
 // Core indexes for workflow execution
 WorkflowRunSchema.index({ workflowId: 1, status: 1 });
 WorkflowRunSchema.index({ status: 1, updatedAt: -1 });
+
+// Idempotency: compound index for "find active run by key" query
+WorkflowRunSchema.index({ idempotencyKey: 1, status: 1 }, { sparse: true });
+
+// Concurrency: count active runs per workflow + key
+WorkflowRunSchema.index({ workflowId: 1, concurrencyKey: 1, status: 1 });
+
+// Priority: scheduler picks highest priority first
+WorkflowRunSchema.index({ status: 1, priority: -1, updatedAt: 1 });
 WorkflowRunSchema.index({ userId: 1, createdAt: -1 });
 WorkflowRunSchema.index({ 'steps.stepId': 1 });
 
@@ -205,7 +237,7 @@ WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: 1, _id: 1 });
 
 /**
  * Export WorkflowRunModel with hot-reload safety
- * 
+ *
  * The pattern checks if the model already exists before creating a new one.
  * This prevents "OverwriteModelError" in development with hot module replacement.
  */
@@ -220,9 +252,3 @@ if (mongoose.models.WorkflowRun) {
 }
 
 export { WorkflowRunModel };
-
-/**
- * Document type for WorkflowRunModel
- * Used for typing Mongoose query filters and operations
- */
-export type WorkflowRunDocument = WorkflowRun;

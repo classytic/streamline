@@ -18,8 +18,8 @@
  * ```
  */
 
-import type { Tracer, Span } from '@opentelemetry/api';
-import { globalEventBus, WorkflowEventBus } from '../core/events.js';
+import type { Span, Tracer } from '@opentelemetry/api';
+import { globalEventBus, type WorkflowEventBus } from '../core/events.js';
 import type { WorkflowEventPayload } from '../core/types.js';
 
 interface TelemetryConfig {
@@ -29,7 +29,8 @@ interface TelemetryConfig {
 }
 
 const spans = new Map<string, Span>();
-const listeners: Array<{ event: string; fn: (...args: unknown[]) => void; bus: WorkflowEventBus }> = [];
+const listeners: Array<{ event: string; fn: (...args: unknown[]) => void; bus: WorkflowEventBus }> =
+  [];
 let currentEventBus: WorkflowEventBus | null = null;
 let enabled = false;
 
@@ -112,7 +113,9 @@ export function disableTelemetry(): void {
   if (!enabled) return;
 
   // Remove listeners from the event bus they were registered on
-  listeners.forEach(({ event, fn, bus }) => bus.off(event, fn));
+  listeners.forEach(({ event, fn, bus }) => {
+    bus.off(event, fn);
+  });
   listeners.length = 0;
   spans.clear();
   currentEventBus = null;

@@ -1,14 +1,14 @@
-import type { StepContext, WorkflowRun } from '../core/types.js';
-import type { WorkflowRunRepository } from '../storage/run.repository.js';
-import type { WorkflowEventBus } from '../core/events.js';
 import type { SignalStore } from '../core/container.js';
+import type { WorkflowEventBus } from '../core/events.js';
+import type { StepContext, StepLogEntry, WorkflowRun } from '../core/types.js';
+import type { WorkflowRunRepository } from '../storage/run.repository.js';
 import { logger } from '../utils/logger.js';
 
 export class WaitSignal extends Error {
   constructor(
     public type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow',
     public reason: string,
-    public data?: unknown
+    public data?: unknown,
   ) {
     super(reason);
     this.name = 'WaitSignal';
@@ -28,6 +28,8 @@ export class GotoSignal extends Error {
 
 export class StepContextImpl<TContext = Record<string, unknown>> implements StepContext<TContext> {
   public signal: AbortSignal;
+  /** Buffered log entries — flushed to DB once after step completes */
+  private readonly logBuffer: StepLogEntry[] = [];
 
   constructor(
     public runId: string,
@@ -39,7 +41,7 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     private repository: WorkflowRunRepository,
     private eventBus: WorkflowEventBus,
     signal?: AbortSignal,
-    private signalStore?: SignalStore
+    private signalStore?: SignalStore,
   ) {
     this.signal = signal ?? new AbortController().signal;
   }
@@ -65,7 +67,7 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
           updatedAt: new Date(),
         },
       },
-      { bypassTenant: true } // Internal operation - already scoped by runId
+      { bypassTenant: true }, // Internal operation - already scoped by runId
     );
 
     // If update failed (workflow was cancelled), throw error
@@ -105,7 +107,7 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
           status: { $ne: 'cancelled' },
         },
         { lastHeartbeat: new Date() },
-        { bypassTenant: true }
+        { bypassTenant: true },
       );
     } catch {
       // Ignore heartbeat failures - step continues execution
@@ -121,13 +123,41 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
   }
 
   log(message: string, data?: unknown): void {
-    // Nest user data under 'data' key to prevent accidental override of reserved fields
+    // Stdout logging (immediate)
     logger.info(message, {
       runId: this.runId,
       stepId: this.stepId,
       attempt: this.attempt,
       ...(data !== undefined && { data }),
     });
+
+    // Buffer log entry — flushed to DB once after step completes (avoids N+1 writes)
+    this.logBuffer.push({
+      stepId: this.stepId,
+      message,
+      attempt: this.attempt,
+      timestamp: new Date(),
+      ...(data !== undefined && { data }),
+    });
+  }
+
+  /**
+   * Flush buffered log entries to the run document in a single $push.
+   * Called by the executor after step completion (success, failure, or wait).
+   */
+  async flushLogs(): Promise<void> {
+    if (this.logBuffer.length === 0) return;
+
+    const entries = this.logBuffer.splice(0);
+    try {
+      await this.repository.updateOne(
+        { _id: this.runId },
+        { $push: { stepLogs: { $each: entries } } },
+        { bypassTenant: true },
+      );
+    } catch {
+      // Silently drop if persistence fails — stdout log is the fallback
+    }
   }
 
   async startChildWorkflow(workflowId: string, input: unknown): Promise<never> {
@@ -145,13 +175,15 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
 
   async scatter<T extends Record<string, () => Promise<unknown>>>(
     tasks: T,
-    options?: { concurrency?: number }
+    options?: { concurrency?: number },
   ): Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }> {
     const taskIds = Object.keys(tasks);
     const concurrency = options?.concurrency ?? Infinity;
 
     // Recover already-completed tasks from checkpoint
-    const checkpoint = this.getCheckpoint<Record<string, { done: boolean; value?: unknown; error?: string }>>() ?? {};
+    const checkpoint =
+      this.getCheckpoint<Record<string, { done: boolean; value?: unknown; error?: string }>>() ??
+      {};
     const results: Record<string, unknown> = {};
 
     // Restore completed results
@@ -182,9 +214,6 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
           const value = await taskFn();
           results[id] = value;
           checkpoint[id] = { done: true, value };
-        } catch (err) {
-          // Don't mark failed tasks as done — they should re-run on retry
-          throw err;
         } finally {
           executing.delete(promise);
           // Persist after each task completes — crash recovery resumes from here
@@ -213,7 +242,7 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     return results as { [K in keyof T]: Awaited<ReturnType<T[K]>> };
   }
 
-  async checkpoint(value: unknown): Promise<void> {
+  async checkpoint<T = unknown>(value: T): Promise<void> {
     if (this.signal.aborted) return;
 
     const stepIndex = this.run.steps.findIndex((s) => s.stepId === this.stepId);
@@ -228,7 +257,7 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
           lastHeartbeat: new Date(),
         },
       },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
     // Update in-memory state

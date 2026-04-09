@@ -1,5 +1,5 @@
-import type { WorkflowRun, RunStatus } from '../core/types.js';
-import { LIMITS, COMPUTED } from '../config/constants.js';
+import { COMPUTED, LIMITS } from '../config/constants.js';
+import type { RunStatus, WorkflowRun } from '../core/types.js';
 
 /** Cache health status for monitoring and alerting */
 export type CacheHealthStatus = 'healthy' | 'warning' | 'critical';
@@ -14,7 +14,7 @@ export type CacheHealthStatus = 'healthy' | 'warning' | 'critical';
  */
 export class WorkflowCache {
   private readonly maxSize: number;
-  private cache = new Map<string, WorkflowRun<unknown>>();
+  private readonly cache = new Map<string, WorkflowRun<unknown>>();
 
   constructor(maxSize: number = LIMITS.MAX_CACHE_SIZE) {
     this.maxSize = maxSize;
