@@ -21,9 +21,9 @@ export function calculateRetryDelay(
   attempt: number,
   multiplier: number,
   maxDelay: number,
-  jitterFactor: number = 0.3
+  jitterFactor: number = 0.3,
 ): number {
-  const exponentialDelay = baseDelay * Math.pow(multiplier, attempt);
+  const exponentialDelay = baseDelay * multiplier ** attempt;
   const cappedDelay = Math.min(exponentialDelay, maxDelay);
 
   // Apply jitter: ±jitterFactor (e.g., ±30%)
@@ -31,4 +31,19 @@ export function calculateRetryDelay(
   const delayWithJitter = Math.round(cappedDelay * jitter);
 
   return Math.max(delayWithJitter, 0); // Ensure non-negative
+}
+
+/**
+ * Resolve a retryBackoff config value into a numeric multiplier.
+ * - 'exponential' → TIMING.RETRY_MULTIPLIER (default 2)
+ * - 'linear' | 'fixed' → 1 (constant delay)
+ * - number → used directly as multiplier
+ */
+export function resolveBackoffMultiplier(
+  backoff: 'exponential' | 'linear' | 'fixed' | number | undefined,
+  defaultMultiplier: number,
+): number {
+  if (backoff === undefined || backoff === 'exponential') return defaultMultiplier;
+  if (typeof backoff === 'number') return backoff;
+  return 1; // linear / fixed
 }

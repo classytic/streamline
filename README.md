@@ -1,6 +1,6 @@
 # @classytic/streamline
 
-> MongoDB-native workflow orchestration for developers. Like Temporal, but simpler.
+> MongoDB-native durable workflow engine. Idempotency, concurrency control, event triggers, human-in-the-loop — zero infrastructure beyond MongoDB.
 
 ## Architecture
 
@@ -75,6 +75,72 @@ const scraper = createWorkflow('web-scraper', {
 
 // Execute
 const run = await scraper.start({ url: 'https://example.com' });
+```
+
+## Distributed Primitives (v2.1)
+
+### Idempotent Starts
+
+```typescript
+// Only one active run per key. Reusable after completion/failure.
+const run = await workflow.start(input, { idempotencyKey: `order:${orderId}` });
+const dup = await workflow.start(input, { idempotencyKey: `order:${orderId}` });
+// dup._id === run._id (returns existing non-terminal run)
+```
+
+### Concurrency Control
+
+```typescript
+const payments = createWorkflow('charge', {
+  steps: { ... },
+  // Max 5 concurrent runs per userId. Excess queued as draft, auto-promoted when slots free.
+  concurrency: { limit: 5, key: (input) => input.userId },
+});
+```
+
+### Event Triggers
+
+```typescript
+const onboarding = createWorkflow('onboard', {
+  steps: { ... },
+  trigger: { event: 'user.created' }, // Auto-starts when event fires
+});
+```
+
+### Reactive Cancellation
+
+```typescript
+const order = createWorkflow('process-order', {
+  steps: { ... },
+  cancelOn: [{ event: 'order.cancelled' }], // Auto-cancels on event
+});
+```
+
+### Priority
+
+```typescript
+// Higher priority = picked up first by scheduler
+await workflow.start(input, { priority: 10 });
+```
+
+### Non-Retriable Errors
+
+```typescript
+import { NonRetriableError } from '@classytic/streamline';
+
+async (ctx) => {
+  if (!valid(ctx.input)) throw new NonRetriableError('Bad input — no retry');
+};
+```
+
+### Centralized Logger
+
+```typescript
+import { configureStreamlineLogger } from '@classytic/streamline';
+
+configureStreamlineLogger({ enabled: false });          // Silence all
+configureStreamlineLogger({ level: 'debug' });          // Verbose
+configureStreamlineLogger({ transport: pinoAdapter });   // Custom transport
 ```
 
 ## Core Features

@@ -6,8 +6,13 @@
  */
 
 import { WorkflowCache } from '../storage/cache.js';
-import { WorkflowEventBus, globalEventBus } from './events.js';
-import { workflowRunRepository, createWorkflowRepository, type WorkflowRunRepository, type WorkflowRepositoryConfig } from '../storage/run.repository.js';
+import {
+  createWorkflowRepository,
+  type WorkflowRepositoryConfig,
+  type WorkflowRunRepository,
+  workflowRunRepository,
+} from '../storage/run.repository.js';
+import { globalEventBus, WorkflowEventBus } from './events.js';
 
 /**
  * Pluggable signal store for durable cross-process event delivery.
@@ -47,7 +52,7 @@ export interface SignalStore {
  * Sufficient for single-worker deployments and testing.
  */
 class InMemorySignalStore implements SignalStore {
-  private listeners = new Map<string, Set<(data: unknown) => void>>();
+  private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
 
   publish(channel: string, data: unknown): void {
     const handlers = this.listeners.get(channel);
@@ -60,7 +65,7 @@ class InMemorySignalStore implements SignalStore {
     if (!this.listeners.has(channel)) {
       this.listeners.set(channel, new Set());
     }
-    this.listeners.get(channel)!.add(handler);
+    this.listeners.get(channel)?.add(handler);
     return () => {
       this.listeners.get(channel)?.delete(handler);
     };
@@ -84,13 +89,13 @@ class InMemorySignalStore implements SignalStore {
  */
 export interface StreamlineContainer {
   /** MongoDB repository for workflow runs */
-  repository: WorkflowRunRepository;
+  readonly repository: WorkflowRunRepository;
   /** Event bus for workflow lifecycle events */
-  eventBus: WorkflowEventBus;
+  readonly eventBus: WorkflowEventBus;
   /** In-memory cache for active workflows */
-  cache: WorkflowCache;
+  readonly cache: WorkflowCache;
   /** Pluggable signal store for durable cross-process event delivery */
-  signalStore: SignalStore;
+  readonly signalStore: SignalStore;
 }
 
 /**
@@ -160,16 +165,18 @@ export interface ContainerOptions {
  * ```
  */
 export function createContainer(options: ContainerOptions = {}): StreamlineContainer {
-  // Resolve repository
+  // Resolve repository: instance (has 'create' method) vs config object
   let repository: WorkflowRunRepository;
   if (!options.repository) {
     repository = workflowRunRepository;
-  } else if ('create' in options.repository && 'getById' in options.repository) {
-    // It's a WorkflowRunRepository instance
-    repository = options.repository as WorkflowRunRepository;
+  } else if (
+    typeof options.repository === 'object' &&
+    'create' in options.repository &&
+    'getById' in options.repository
+  ) {
+    repository = options.repository;
   } else {
-    // It's a config object
-    repository = createWorkflowRepository(options.repository as WorkflowRepositoryConfig);
+    repository = createWorkflowRepository(options.repository);
   }
 
   // Resolve event bus
@@ -195,13 +202,12 @@ export function createContainer(options: ContainerOptions = {}): StreamlineConta
  * Type guard to check if an object is a valid StreamlineContainer
  */
 export function isStreamlineContainer(obj: unknown): obj is StreamlineContainer {
-  if (!obj || typeof obj !== 'object') return false;
-  const container = obj as Record<string, unknown>;
+  if (obj == null || typeof obj !== 'object') return false;
   return (
-    'repository' in container &&
-    'eventBus' in container &&
-    'cache' in container &&
-    container.eventBus instanceof WorkflowEventBus &&
-    container.cache instanceof WorkflowCache
+    'repository' in obj &&
+    'eventBus' in obj &&
+    'cache' in obj &&
+    (obj as StreamlineContainer).eventBus instanceof WorkflowEventBus &&
+    (obj as StreamlineContainer).cache instanceof WorkflowCache
   );
 }

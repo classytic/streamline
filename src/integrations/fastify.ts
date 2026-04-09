@@ -1,6 +1,6 @@
-import { WorkflowEngine } from '../execution/engine.js';
 import { createContainer } from '../core/container.js';
 import type { WorkflowDefinition, WorkflowHandlers } from '../core/types.js';
+import { WorkflowEngine } from '../execution/engine.js';
 
 interface WorkflowPluginOptions {
   workflows: Array<{

@@ -28,6 +28,30 @@ export interface Step {
    */
   timeout?: number;
 
+  /**
+   * Base delay in milliseconds before the first retry.
+   * Used as the starting point for exponential backoff.
+   *
+   * @default 1000 (1 second)
+   *
+   * @example
+   * ```typescript
+   * step({ id: 'call-api', retries: 3, retryDelay: 5000 }) // 5s, 10s, 20s
+   * ```
+   */
+  retryDelay?: number;
+
+  /**
+   * Backoff strategy for retries.
+   * - 'exponential': delay doubles each attempt (default)
+   * - 'linear': delay stays constant
+   * - 'fixed': alias for 'linear'
+   * - number: custom multiplier (e.g., 3 for tripling)
+   *
+   * @default 'exponential'
+   */
+  retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+
   // ============ Conditional Execution ============
 
   /**
@@ -68,6 +92,23 @@ export interface Step {
   runIf?: (context: unknown) => boolean | Promise<boolean>;
 }
 
+/**
+ * A single log entry persisted on the workflow run document.
+ * Captured via ctx.log() and visible via GET /api/workflows/:id/runs/:runId
+ */
+export interface StepLogEntry {
+  /** Step that produced this log */
+  stepId: string;
+  /** Log message */
+  message: string;
+  /** Optional structured data */
+  data?: unknown;
+  /** Attempt number when log was captured */
+  attempt: number;
+  /** Timestamp of the log entry */
+  timestamp: Date;
+}
+
 export interface StepError {
   message: string;
   code?: string;
@@ -94,7 +135,14 @@ export interface StepState<TOutput = unknown> {
   status: StepStatus;
   attempts: number;
   startedAt?: Date;
+  completedAt?: Date;
   endedAt?: Date;
+  /**
+   * Actual execution duration in milliseconds (completedAt - startedAt).
+   * Only set when step completes (done/failed/skipped).
+   * Useful for performance monitoring and SLA tracking.
+   */
+  durationMs?: number;
   output?: TOutput;
   waitingFor?: WaitingFor;
   error?: StepError;
@@ -163,6 +211,25 @@ export interface WorkflowRun<TContext = Record<string, unknown>> {
   paused?: boolean; // User-initiated pause - scheduler skips paused workflows
   /** Timezone-aware scheduling metadata (optional - only for scheduled workflows) */
   scheduling?: SchedulingInfo;
+  /**
+   * Persisted step-level logs captured via ctx.log().
+   * Each entry includes stepId, message, optional data, attempt, and timestamp.
+   * Queryable via GET /api/workflows/:workflowId/runs/:runId
+   */
+  stepLogs?: StepLogEntry[];
+  /**
+   * Idempotency key for deduplication.
+   * If set, only one non-terminal run can exist per key.
+   * Starting a workflow with a duplicate key returns the existing run.
+   */
+  idempotencyKey?: string;
+  /**
+   * Execution priority (higher = picked up sooner by scheduler).
+   * @default 0
+   */
+  priority?: number;
+  /** Concurrency grouping key (set by engine when concurrency config is active) */
+  concurrencyKey?: string;
   userId?: string;
   tags?: string[];
   meta?: Record<string, unknown>;
@@ -189,6 +256,16 @@ export interface WorkflowDefinition<TContext = Record<string, unknown>> {
      * @default undefined (no timeout)
      */
     timeout?: number;
+    /**
+     * Base delay in milliseconds before the first retry.
+     * @default 1000 (1 second)
+     */
+    retryDelay?: number;
+    /**
+     * Backoff strategy for retries.
+     * @default 'exponential'
+     */
+    retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
   };
 }
 
@@ -246,31 +323,25 @@ export interface StepContext<TContext = Record<string, unknown>> {
   log: (message: string, data?: unknown) => void;
 
   /**
-   * Save a checkpoint for crash-safe batch processing (durable loop).
-   *
-   * On crash recovery, `getCheckpoint()` returns the last saved value,
-   * so the step resumes from where it left off instead of restarting.
+   * Save a typed checkpoint for crash-safe batch processing (durable loop).
+   * On crash recovery, `getCheckpoint<T>()` returns the last saved value.
    *
    * @example
    * ```typescript
-   * async function processBatches(ctx) {
-   *   const batches = splitIntoBatches(ctx.input.data, 100);
-   *   const lastProcessed = ctx.getCheckpoint<number>() ?? -1;
-   *
-   *   for (let i = lastProcessed + 1; i < batches.length; i++) {
-   *     await processBatch(batches[i]);
-   *     await ctx.checkpoint(i);   // Survives crashes
-   *     await ctx.heartbeat();
-   *   }
-   *   return { processed: batches.length };
+   * const last = ctx.getCheckpoint<number>() ?? -1;
+   * for (let i = last + 1; i < items.length; i++) {
+   *   await process(items[i]);
+   *   await ctx.checkpoint(i);
    * }
    * ```
    */
-  checkpoint: (value: unknown) => Promise<void>;
+  checkpoint: <T = unknown>(value: T) => Promise<void>;
 
   /**
    * Read the last checkpoint value saved by `checkpoint()`.
    * Returns `undefined` on first execution (no prior crash).
+   *
+   * Use the same type parameter as your `checkpoint()` call for type safety.
    */
   getCheckpoint: <T = unknown>() => T | undefined;
 
@@ -358,12 +429,12 @@ export interface StepContext<TContext = Record<string, unknown>> {
    */
   scatter: <T extends Record<string, () => Promise<unknown>>>(
     tasks: T,
-    options?: { concurrency?: number }
+    options?: { concurrency?: number },
   ) => Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }>;
 }
 
 export type StepHandler<TOutput = unknown, TContext = Record<string, unknown>> = (
-  ctx: StepContext<TContext>
+  ctx: StepContext<TContext>,
 ) => Promise<TOutput>;
 
 export type WorkflowHandlers<TContext = Record<string, unknown>> = {
@@ -394,7 +465,7 @@ export type InferHandlersContext<T> = T extends WorkflowHandlers<infer TContext>
  */
 export type TypedHandlers<
   TWorkflow extends WorkflowDefinition<any>,
-  TContext = InferContext<TWorkflow>
+  TContext = InferContext<TWorkflow>,
 > = {
   [K in TWorkflow['steps'][number]['id']]: StepHandler<unknown, TContext>;
 };

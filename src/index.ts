@@ -3,142 +3,161 @@
 // ============================================================================
 
 /**
- * Main entry point for creating workflows.
- * Use this for 90% of use cases.
+ * Status utilities and validation
  */
-export { createWorkflow } from './workflow/define.js';
-export type { Workflow, WorkflowConfig, StepConfig, WaitForOptions } from './workflow/define.js';
-
-/**
- * Direct engine access for advanced use cases.
- * Most users should use createWorkflow instead.
- */
-export { WorkflowEngine } from './execution/engine.js';
-export type { WorkflowEngineOptions } from './execution/engine.js';
-
+export * from './core/status.js';
 /**
  * Core types exported from types.js
  * Includes: WorkflowDefinition, WorkflowRun, Step, StepContext, etc.
  */
 export * from './core/types.js';
-
+export type { WorkflowEngineOptions } from './execution/engine.js';
 /**
- * Status utilities and validation
+ * Direct engine access for advanced use cases.
+ * Most users should use createWorkflow instead.
  */
-export * from './core/status.js';
+export { WorkflowEngine } from './execution/engine.js';
+export type {
+  StartOptions,
+  StepConfig,
+  WaitForOptions,
+  Workflow,
+  WorkflowConfig,
+} from './workflow/define.js';
+/**
+ * Main entry point for creating workflows.
+ * Use this for 90% of use cases.
+ */
+export { createWorkflow } from './workflow/define.js';
 
 // ============================================================================
 // Hooks & Resume - For External Workflow Control
 // ============================================================================
 
+export { GotoSignal, WaitSignal } from './execution/context.js';
+export type { HookOptions, HookResult } from './features/hooks.js';
 /**
  * Create hooks for pausing workflows and resuming them from webhooks/APIs.
- * 
+ *
  * @example
  * ```typescript
  * const hook = createHook(ctx, 'awaiting-approval');
  * await resumeHook(hook.token, { approved: true });
  * ```
  */
-export { createHook, resumeHook, hookToken } from './features/hooks.js';
-export type { HookResult, HookOptions } from './features/hooks.js';
-export { WaitSignal, GotoSignal } from './execution/context.js';
+export { createHook, hookToken, resumeHook } from './features/hooks.js';
 
 // ============================================================================
 // Storage & Database - MongoDB Models & Repositories
 // ============================================================================
 
+export type { WorkflowDefinitionDoc } from './storage/definition.model.js';
+/**
+ * Optional: WorkflowDefinition storage for versioning and auditing.
+ */
+export {
+  WorkflowDefinitionModel,
+  workflowDefinitionRepository,
+} from './storage/definition.model.js';
+/**
+ * Query builder and common queries for workflows.
+ * Type-safe MongoDB query construction.
+ */
+export {
+  CommonQueries,
+  RUN_STATUS,
+  STEP_STATUS,
+  WorkflowQueryBuilder,
+} from './storage/query-builder.js';
 /**
  * Mongoose model for workflow runs.
  * Use this for direct MongoDB queries and custom indexes.
  */
 export { WorkflowRunModel } from './storage/run.model.js';
-
+export type { WorkflowRepositoryConfig, WorkflowRunRepository } from './storage/run.repository.js';
 /**
  * Repository for workflow run CRUD operations.
  * Supports multi-tenancy and atomic updates.
  */
 export {
-  workflowRunRepository,
   createWorkflowRepository,
+  workflowRunRepository,
 } from './storage/run.repository.js';
-export type { WorkflowRunRepository, WorkflowRepositoryConfig } from './storage/run.repository.js';
-
-/**
- * Query builder and common queries for workflows.
- * Type-safe MongoDB query construction.
- */
-export { WorkflowQueryBuilder, CommonQueries, RUN_STATUS, STEP_STATUS } from './storage/query-builder.js';
-
-/**
- * Optional: WorkflowDefinition storage for versioning and auditing.
- */
-export { WorkflowDefinitionModel, workflowDefinitionRepository } from './storage/definition.model.js';
-export type { WorkflowDefinitionDoc } from './storage/definition.model.js';
 
 // ============================================================================
 // Events & Observability
 // ============================================================================
 
+export type {
+  BaseEventPayload,
+  EngineErrorPayload,
+  EventPayloadMap,
+  EventSinkHandler,
+  EventSinkOptions,
+  StepCompletedPayload,
+  StepEventPayload,
+  StepFailedPayload,
+  StepRetryPayload,
+  WorkflowCompletedPayload,
+  WorkflowEventName,
+  WorkflowFailedPayload,
+  WorkflowResumedPayload,
+} from './core/events.js';
 /**
  * Event bus for workflow lifecycle events.
  * Subscribe to workflow:started, step:completed, etc.
  */
-export { WorkflowEventBus, globalEventBus } from './core/events.js';
-export type {
-  WorkflowEventName,
-  EventPayloadMap,
-  BaseEventPayload,
-  StepEventPayload,
-  StepCompletedPayload,
-  StepFailedPayload,
-  StepRetryPayload,
-  WorkflowCompletedPayload,
-  WorkflowFailedPayload,
-  WorkflowResumedPayload,
-  EngineErrorPayload,
-} from './core/events.js';
-
+export { createEventSink, globalEventBus, WorkflowEventBus } from './core/events.js';
+export type { StepTimeline, StepUIState, WorkflowProgress } from './utils/visualization.js';
 /**
  * Visualization helpers for building UIs.
  * Get step timeline, progress, execution path, etc.
  */
 export {
-  getStepTimeline,
-  getWorkflowProgress,
-  getStepUIStates,
-  getWaitingInfo,
   canRewindTo,
   getExecutionPath,
+  getStepTimeline,
+  getStepUIStates,
+  getWaitingInfo,
+  getWorkflowProgress,
 } from './utils/visualization.js';
-export type { StepTimeline, WorkflowProgress, StepUIState } from './utils/visualization.js';
 
 // ============================================================================
 // Dependency Injection - For Testing & Multi-Instance Support
 // ============================================================================
 
 /**
+ * Computed constants for monitoring and capacity planning.
+ */
+export { COMPUTED } from './config/constants.js';
+export type { ContainerOptions, SignalStore, StreamlineContainer } from './core/container.js';
+/**
  * Create isolated containers for testing or running multiple engines.
  * createWorkflow() handles this automatically for normal use.
  */
 export { createContainer, isStreamlineContainer } from './core/container.js';
-export type { StreamlineContainer, ContainerOptions, SignalStore } from './core/container.js';
-
+export type { CacheHealthStatus } from './storage/cache.js';
 /**
  * Cache health monitoring for operational dashboards.
  */
 export { WorkflowCache } from './storage/cache.js';
-export type { CacheHealthStatus } from './storage/cache.js';
-
+export type { LogLevel, LogTransport } from './utils/logger.js';
 /**
- * Computed constants for monitoring and capacity planning.
+ * Centralized logger configuration.
+ * Control log level, enable/disable, or plug in a custom transport (Pino, Winston, etc.).
  */
-export { COMPUTED } from './config/constants.js';
+export { configureStreamlineLogger } from './utils/logger.js';
 
 // ============================================================================
 // Scheduling - Timezone-Aware Workflow Scheduling
 // ============================================================================
 
+export type {
+  GetScheduledWorkflowsOptions,
+  ScheduleWorkflowOptions,
+  SchedulingServiceConfig,
+  TimezoneCalculationResult,
+} from './scheduling/index.js';
 /**
  * Schedule workflows for future execution with full timezone support.
  * Handles DST transitions automatically.
@@ -148,49 +167,42 @@ export {
   TimezoneHandler,
   timezoneHandler,
 } from './scheduling/index.js';
-export type {
-  ScheduleWorkflowOptions,
-  GetScheduledWorkflowsOptions,
-  SchedulingServiceConfig,
-  TimezoneCalculationResult,
-} from './scheduling/index.js';
 
 // ============================================================================
 // Multi-Tenancy - Repository Plugins
 // ============================================================================
 
+export type { TenantFilterOptions } from './plugins/index.js';
 /**
  * Plugins for multi-tenant deployments.
  * Automatically inject tenant filters into all queries.
  */
 export {
-  tenantFilterPlugin,
   singleTenantPlugin,
+  tenantFilterPlugin,
 } from './plugins/index.js';
-export type { TenantFilterOptions } from './plugins/index.js';
 
 // ============================================================================
 // Advanced Features - Parallel, Conditional, Subworkflows
 // ============================================================================
 
-/**
- * Execute multiple async tasks in parallel.
- * Supports concurrency limits, timeouts, and different execution modes.
- */
-export { executeParallel } from './features/parallel.js';
-export type { ExecuteParallelOptions } from './features/parallel.js';
-
+export type { ConditionalStep } from './features/conditional.js';
 /**
  * Conditional step execution utilities.
  * Skip steps based on runtime conditions.
  */
 export {
+  conditions,
+  createCondition,
   isConditionalStep,
   shouldSkipStep,
-  createCondition,
-  conditions,
 } from './features/conditional.js';
-export type { ConditionalStep } from './features/conditional.js';
+export type { ExecuteParallelOptions } from './features/parallel.js';
+/**
+ * Execute multiple async tasks in parallel.
+ * Supports concurrency limits, timeouts, and different execution modes.
+ */
+export { executeParallel } from './features/parallel.js';
 
 // ============================================================================
 // Advanced Configuration (Optional)
@@ -200,7 +212,7 @@ export type { ConditionalStep } from './features/conditional.js';
  * Scheduler configuration and stats for customizing and monitoring polling behavior.
  * Most users don't need this - engine handles it automatically.
  */
-export type { SmartSchedulerConfig, SchedulerStats } from './execution/smart-scheduler.js';
+export type { SchedulerStats, SmartSchedulerConfig } from './execution/smart-scheduler.js';
 
 // ============================================================================
 // Hook Registry - For External Workflow Resume
@@ -216,6 +228,7 @@ export { hookRegistry, workflowRegistry } from './execution/engine.js';
 // Error Classes - For Error Handling
 // ============================================================================
 
+export type { ErrorCode as ErrorCodeType } from './utils/errors.js';
 /**
  * Custom error classes with rich context for debugging.
  * Includes standardized error codes for programmatic error handling.
@@ -234,13 +247,13 @@ export { hookRegistry, workflowRegistry } from './execution/engine.js';
  * ```
  */
 export {
-  ErrorCode,
-  WorkflowError,
-  StepNotFoundError,
-  WorkflowNotFoundError,
-  InvalidStateError,
-  StepTimeoutError,
   DataCorruptionError,
+  ErrorCode,
+  InvalidStateError,
   MaxRetriesExceededError,
+  NonRetriableError,
+  StepNotFoundError,
+  StepTimeoutError,
+  WorkflowError,
+  WorkflowNotFoundError,
 } from './utils/errors.js';
-export type { ErrorCode as ErrorCodeType } from './utils/errors.js';

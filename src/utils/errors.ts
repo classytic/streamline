@@ -54,7 +54,7 @@ export class WorkflowError extends Error {
       workflowId?: string;
       stepId?: string;
       [key: string]: unknown;
-    }
+    },
   ) {
     super(message);
     this.name = 'WorkflowError';
@@ -74,7 +74,7 @@ export class StepNotFoundError extends WorkflowError {
     super(
       `Step "${stepId}" not found in workflow "${workflowId}". Available steps: ${availableSteps.join(', ')}`,
       ErrorCode.STEP_NOT_FOUND,
-      { stepId, workflowId, availableSteps }
+      { stepId, workflowId, availableSteps },
     );
     this.name = 'StepNotFoundError';
   }
@@ -82,11 +82,7 @@ export class StepNotFoundError extends WorkflowError {
 
 export class WorkflowNotFoundError extends WorkflowError {
   constructor(runId: string) {
-    super(
-      `Workflow run "${runId}" not found in database`,
-      ErrorCode.WORKFLOW_NOT_FOUND,
-      { runId }
-    );
+    super(`Workflow run "${runId}" not found in database`, ErrorCode.WORKFLOW_NOT_FOUND, { runId });
     this.name = 'WorkflowNotFoundError';
   }
 }
@@ -96,12 +92,12 @@ export class InvalidStateError extends WorkflowError {
     action: string,
     currentState: string,
     expectedStates: string[],
-    context: { runId?: string; stepId?: string }
+    context: { runId?: string; stepId?: string },
   ) {
     super(
       `Cannot ${action} - workflow is in state "${currentState}". Expected one of: ${expectedStates.join(', ')}`,
       ErrorCode.INVALID_STATE,
-      { action, currentState, expectedStates, ...context }
+      { action, currentState, expectedStates, ...context },
     );
     this.name = 'InvalidStateError';
   }
@@ -109,59 +105,55 @@ export class InvalidStateError extends WorkflowError {
 
 export class StepTimeoutError extends WorkflowError {
   constructor(stepId: string, timeoutMs: number, runId?: string) {
-    super(
-      `Step "${stepId}" exceeded timeout of ${timeoutMs}ms`,
-      ErrorCode.STEP_TIMEOUT,
-      { stepId, timeoutMs, runId }
-    );
+    super(`Step "${stepId}" exceeded timeout of ${timeoutMs}ms`, ErrorCode.STEP_TIMEOUT, {
+      stepId,
+      timeoutMs,
+      runId,
+    });
     this.name = 'StepTimeoutError';
   }
 }
 
 export class DataCorruptionError extends WorkflowError {
   constructor(reason: string, context: { runId: string; [key: string]: unknown }) {
-    super(
-      `Data corruption detected: ${reason}`,
-      ErrorCode.DATA_CORRUPTION,
-      context
-    );
+    super(`Data corruption detected: ${reason}`, ErrorCode.DATA_CORRUPTION, context);
     this.name = 'DataCorruptionError';
   }
 }
 
 export class MaxRetriesExceededError extends WorkflowError {
   constructor(stepId: string, attempts: number, runId?: string) {
-    super(
-      `Step "${stepId}" failed after ${attempts} attempts`,
-      ErrorCode.MAX_RETRIES_EXCEEDED,
-      { stepId, attempts, runId }
-    );
+    super(`Step "${stepId}" failed after ${attempts} attempts`, ErrorCode.MAX_RETRIES_EXCEEDED, {
+      stepId,
+      attempts,
+      runId,
+    });
     this.name = 'MaxRetriesExceededError';
   }
 }
 
 /**
- * Helper to create descriptive error messages
+ * Throw this to immediately fail a step without retrying.
+ * The executor checks `error.retriable === false` and skips all retry attempts.
+ *
+ * @example
+ * ```typescript
+ * if (!isValidInput(ctx.input)) {
+ *   throw new NonRetriableError('Invalid input — retrying won\'t help');
+ * }
+ * ```
  */
-export function createErrorMessage(parts: {
-  action: string;
-  subject?: string;
-  reason?: string;
-  suggestion?: string;
-}): string {
-  let message = parts.action;
-  
-  if (parts.subject) {
-    message += ` ${parts.subject}`;
+export class NonRetriableError extends Error {
+  public readonly retriable = false as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'NonRetriableError';
   }
-  
-  if (parts.reason) {
-    message += ` - ${parts.reason}`;
-  }
-  
-  if (parts.suggestion) {
-    message += `. ${parts.suggestion}`;
-  }
-  
-  return message;
+}
+
+/** Coerce any thrown value (null, string, number, Error) into an Error instance. */
+export function toError(value: unknown): Error {
+  if (value instanceof Error) return value;
+  return new Error(String(value ?? 'Unknown error'));
 }

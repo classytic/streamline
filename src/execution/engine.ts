@@ -1,25 +1,30 @@
-import { StepExecutor } from './executor.js';
-import {
-  SmartScheduler,
-  DEFAULT_SCHEDULER_CONFIG,
-  type SmartSchedulerConfig,
-} from './smart-scheduler.js';
-import { WorkflowRegistry } from '../workflow/registry.js';
-import { isTerminalState } from '../core/status.js';
 import { TIMING } from '../config/constants.js';
-import { WorkflowNotFoundError, InvalidStateError, StepNotFoundError } from '../utils/errors.js';
-import { logger } from '../utils/logger.js';
-import type {
-  WorkflowDefinition,
-  WorkflowRun,
-  WorkflowHandlers,
-  WorkflowEventPayload,
-  StepState,
-} from '../core/types.js';
 import type { StreamlineContainer } from '../core/container.js';
 import type { WorkflowEventBus } from '../core/events.js';
-import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import { isTerminalState } from '../core/status.js';
+import type {
+  StepState,
+  WorkflowDefinition,
+  WorkflowEventPayload,
+  WorkflowHandlers,
+  WorkflowRun,
+} from '../core/types.js';
 import type { WorkflowCache } from '../storage/cache.js';
+import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import {
+  InvalidStateError,
+  StepNotFoundError,
+  toError,
+  WorkflowNotFoundError,
+} from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
+import { WorkflowRegistry } from '../workflow/registry.js';
+import { StepExecutor } from './executor.js';
+import {
+  DEFAULT_SCHEDULER_CONFIG,
+  SmartScheduler,
+  type SmartSchedulerConfig,
+} from './smart-scheduler.js';
 
 // ============================================================================
 // Hook Registry (inlined from hook-registry.ts)
@@ -120,12 +125,12 @@ export const workflowRegistry = new WorkflowRegistryGlobal();
 function cleanupEventListeners(
   runId: string,
   listeners: Map<string, { listener: (...args: unknown[]) => void; eventName: string }>,
-  eventBus: WorkflowEventBus
+  eventBus: WorkflowEventBus,
 ): void {
   const prefix = `${runId}:`;
   const signalPrefix = `signal:${runId}:`;
   const keysToRemove = Array.from(listeners.keys()).filter(
-    key => key.startsWith(prefix) || key.startsWith(signalPrefix)
+    (key) => key.startsWith(prefix) || key.startsWith(signalPrefix),
   );
 
   for (const key of keysToRemove) {
@@ -151,7 +156,7 @@ async function handleShortDelayOrSchedule(
   targetTime: Date,
   scheduleLongDelay: () => void,
   repository: WorkflowRunRepository,
-  cache: WorkflowCache
+  cache: WorkflowCache,
 ): Promise<boolean> {
   const delayMs = targetTime.getTime() - Date.now();
 
@@ -172,7 +177,7 @@ async function handleShortDelayOrSchedule(
         paused: { $ne: true },
       },
       { status: 'running', updatedAt: new Date(), lastHeartbeat: new Date() },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
     if (claimed.modifiedCount > 0) {
@@ -201,12 +206,12 @@ export interface WorkflowEngineOptions {
 
 /**
  * Core workflow execution engine.
- * 
+ *
  * Manages workflow lifecycle: start, execute, pause, resume, cancel.
  * Handles waiting states, retries, and crash recovery automatically.
- * 
+ *
  * @typeParam TContext - Type of workflow context
- * 
+ *
  * @example
  * ```typescript
  * const engine = new WorkflowEngine(definition, handlers, container);
@@ -214,11 +219,14 @@ export interface WorkflowEngineOptions {
  * ```
  */
 export class WorkflowEngine<TContext = Record<string, unknown>> {
-  private executor: StepExecutor<TContext>;
-  private scheduler: SmartScheduler;
-  private registry: WorkflowRegistry<TContext>;
-  private options: WorkflowEngineOptions;
-  private eventListeners: Map<string, { listener: (...args: unknown[]) => void; eventName: string }>;
+  private readonly executor: StepExecutor<TContext>;
+  private scheduler: SmartScheduler; // Mutable: reconfigured in updateSchedulerConfig()
+  private readonly registry: WorkflowRegistry<TContext>;
+  private readonly options: WorkflowEngineOptions;
+  private readonly eventListeners = new Map<
+    string,
+    { listener: (...args: unknown[]) => void; eventName: string }
+  >();
 
   /** Exposed for hook registry and external access */
   readonly container: StreamlineContainer;
@@ -227,7 +235,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     definition: WorkflowDefinition<TContext>,
     public readonly handlers: WorkflowHandlers<TContext>,
     container: StreamlineContainer,
-    options: WorkflowEngineOptions = {}
+    options: WorkflowEngineOptions = {},
   ) {
     this.container = container;
     this.registry = new WorkflowRegistry(definition, handlers);
@@ -236,9 +244,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       container.repository,
       container.eventBus,
       container.cache,
-      container.signalStore
+      container.signalStore,
     );
-    this.eventListeners = new Map();
 
     const schedulerConfig = {
       ...DEFAULT_SCHEDULER_CONFIG,
@@ -251,7 +258,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         await this.resume(runId);
       },
       schedulerConfig,
-      container.eventBus
+      container.eventBus,
     );
 
     // Register in global workflow registry for child workflow lookup
@@ -286,26 +293,73 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
   /**
    * Start a new workflow run.
-   * 
+   *
    * @param input - Input data for the workflow
-   * @param meta - Optional metadata (userId, tags, etc.)
-   * @returns The created workflow run
+   * @param options - Optional: meta, idempotencyKey, priority, concurrencyKey, cancelOn, startAsDraft
+   * @returns The created workflow run (or existing run if idempotencyKey matches)
    */
-  async start(input: unknown, meta?: Record<string, unknown>): Promise<WorkflowRun<TContext>> {
-    const run = this.registry.createRun(input, meta);
-    run.status = 'running';
-    run.startedAt = new Date();
+  async start(
+    input: unknown,
+    options?: {
+      meta?: Record<string, unknown>;
+      idempotencyKey?: string;
+      priority?: number;
+      concurrencyKey?: string;
+      startAsDraft?: boolean;
+      cancelOn?: Array<{ event: string }>;
+    },
+  ): Promise<WorkflowRun<TContext>> {
+    const run = this.registry.createRun(input, options?.meta);
+
+    // Set distributed primitive fields
+    if (options?.idempotencyKey) run.idempotencyKey = options.idempotencyKey;
+    if (options?.priority) run.priority = options.priority;
+    if (options?.concurrencyKey) run.concurrencyKey = options.concurrencyKey;
+
+    // Idempotency: if a non-terminal run with this key exists, return it.
+    // Terminal runs (done/failed/cancelled) don't block — the key is reusable.
+    if (options?.idempotencyKey) {
+      const existing = await this.container.repository.findActiveByIdempotencyKey(
+        options.idempotencyKey,
+      );
+      if (existing) return existing as WorkflowRun<TContext>;
+    }
+
+    // Concurrency-limited: start as draft (scheduler will promote when slot opens)
+    if (options?.startAsDraft) {
+      run.status = 'draft';
+    } else {
+      run.status = 'running';
+      run.startedAt = new Date();
+    }
 
     await this.container.repository.create(run);
-    this.container.cache.set(run);
 
-    // Register this engine for the run so resumeHook() can find it
+    this.container.cache.set(run);
     hookRegistry.register(run._id, this as unknown as WorkflowEngine<unknown>);
+
+    // Register cancelOn event listeners
+    if (options?.cancelOn) {
+      for (const trigger of options.cancelOn) {
+        const cancelListener = (payload: unknown) => {
+          const p = payload as { runId?: string } | undefined;
+          // Cancel if: no runId filter, or runId matches, or broadcast
+          if (!p?.runId || p.runId === run._id) {
+            this.cancel(run._id).catch(() => {});
+          }
+        };
+        this.container.eventBus.on(trigger.event, cancelListener);
+        this.eventListeners.set(`${run._id}:cancelOn:${trigger.event}`, {
+          listener: cancelListener as (...args: unknown[]) => void,
+          eventName: trigger.event,
+        });
+      }
+    }
 
     this.container.eventBus.emit('workflow:started', { runId: run._id });
 
-    // Auto-execute if enabled (default: true)
-    if (this.options.autoExecute) {
+    // Auto-execute if enabled and not queued as draft
+    if (this.options.autoExecute && run.status === 'running') {
       setImmediate(() =>
         this.execute(run._id).catch((err) => {
           this.container.eventBus.emit('engine:error', {
@@ -313,8 +367,13 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
             error: err,
             context: 'auto-execution',
           });
-        })
+        }),
       );
+    }
+
+    // If queued as draft (concurrency limit), ensure scheduler is running to promote it
+    if (run.status === 'draft') {
+      this.scheduler.start();
     }
 
     return run;
@@ -323,7 +382,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   /**
    * Get a workflow run by ID.
    * Returns from cache if available, otherwise fetches from database.
-   * 
+   *
    * @param runId - Workflow run ID
    * @returns The workflow run or null if not found
    */
@@ -337,13 +396,13 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
   /**
    * Execute a workflow run to completion.
-   * 
+   *
    * Runs steps sequentially until:
    * - All steps complete (status: 'done')
    * - A step fails after retries (status: 'failed')
    * - A step waits for external input (status: 'waiting')
    * - The workflow is cancelled (status: 'cancelled')
-   * 
+   *
    * @param runId - Workflow run ID to execute
    * @returns The updated workflow run
    */
@@ -361,7 +420,9 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         if (run.status === 'waiting') {
           const continueExecution = await this.handleWaitingState(runId, run);
           if (!continueExecution) break;
-          run = (await this.get(runId))!;
+          const refreshed = await this.get(runId);
+          if (!refreshed) break;
+          run = refreshed;
         }
 
         // Handle terminal states
@@ -383,8 +444,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           runId,
           error: new Error(
             `Version mismatch: workflow "${run.workflowId}" run has currentStepId="${stepId}" ` +
-            `but this engine (v${this.definition.version}) doesn't define it. ` +
-            `Register the old version with workflowRegistry or migrate in-flight runs.`
+              `but this engine (v${this.definition.version}) doesn't define it. ` +
+              `Register the old version with workflowRegistry or migrate in-flight runs.`,
           ),
           context: 'version-mismatch',
         });
@@ -404,7 +465,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
               },
             },
           },
-          { bypassTenant: true }
+          { bypassTenant: true },
         );
 
         run.status = 'failed';
@@ -428,6 +489,12 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       if (run.status === 'failed' && this.options.compensationHandlers) {
         run = await this.runCompensation(run);
       }
+
+      // Promote concurrency-queued drafts immediately when a slot frees up.
+      // Don't wait for the scheduler poll cycle (could be 60s+).
+      if (run.concurrencyKey) {
+        this.promoteConcurrencyDrafts(run.workflowId, run.concurrencyKey);
+      }
     }
 
     return run;
@@ -448,7 +515,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
     if (completedSteps.length === 0) return run;
 
-    this.container.eventBus.emit('workflow:compensating' as Parameters<typeof this.container.eventBus.emit>[0], {
+    this.container.eventBus.emit('workflow:compensating', {
       runId: run._id,
       data: { steps: completedSteps.map((s) => s.stepId) },
     });
@@ -466,12 +533,12 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           stepState.attempts,
           run,
           this.container.repository,
-          this.container.eventBus
+          this.container.eventBus,
         );
 
         await (handler as (ctx: unknown) => Promise<unknown>)(ctx);
 
-        this.container.eventBus.emit('step:compensated' as Parameters<typeof this.container.eventBus.emit>[0], {
+        this.container.eventBus.emit('step:compensated', {
           runId: run._id,
           stepId: stepState.stepId,
         });
@@ -479,13 +546,40 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         // Compensation failures are logged but don't block other compensations
         this.container.eventBus.emit('engine:error', {
           runId: run._id,
-          error: err instanceof Error ? err : new Error(String(err)),
+          error: toError(err),
           context: `compensation-${stepState.stepId}`,
         });
       }
     }
 
     return run;
+  }
+
+  /**
+   * Immediately promote concurrency-queued drafts when a slot frees.
+   * Fire-and-forget — errors are emitted, not thrown.
+   */
+  private promoteConcurrencyDrafts(workflowId: string, concurrencyKey: string): void {
+    setImmediate(async () => {
+      try {
+        const drafts = await this.container.repository.getConcurrencyDrafts(10);
+        const matching = drafts.filter(
+          (d) => d.workflowId === workflowId && d.concurrencyKey === concurrencyKey,
+        );
+        for (const draft of matching) {
+          try {
+            await this.executeRetry(draft._id);
+          } catch {
+            // Failed to promote — scheduler will retry on next poll
+          }
+        }
+      } catch (err) {
+        this.container.eventBus.emit('engine:error', {
+          error: toError(err),
+          context: 'promote-concurrency-drafts',
+        });
+      }
+    });
   }
 
   // ============ Execute Helpers ============
@@ -501,7 +595,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   }
 
   private async executeNextStep(
-    run: WorkflowRun<TContext>
+    run: WorkflowRun<TContext>,
   ): Promise<{ run: WorkflowRun<TContext>; shouldBreak: boolean }> {
     const prevStepId = run.currentStepId;
     const prevStepStatus = run.steps.find((s) => s.stepId === prevStepId)?.status;
@@ -518,7 +612,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   private checkNoProgress(
     run: WorkflowRun<TContext>,
     prevStepId: string | null,
-    prevStepStatus: string | undefined
+    prevStepStatus: string | undefined,
   ): boolean {
     const currentStep = run.steps.find((s) => s.stepId === run.currentStepId);
     const isRetryPending = currentStep?.status === 'pending' && currentStep?.retryAfter;
@@ -532,9 +626,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     }
 
     return (
-      run.currentStepId === prevStepId &&
-      currentStep?.status === prevStepStatus &&
-      !isRetryPending
+      run.currentStepId === prevStepId && currentStep?.status === prevStepStatus && !isRetryPending
     );
   }
 
@@ -542,10 +634,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    * Handle different waiting states (event, retry, timer, human input)
    * @returns true if execution should continue, false to break
    */
-  private async handleWaitingState(
-    runId: string,
-    run: WorkflowRun<TContext>
-  ): Promise<boolean> {
+  private async handleWaitingState(runId: string, run: WorkflowRun<TContext>): Promise<boolean> {
     const stepState = this.findCurrentStep(run);
 
     if (!stepState && run.currentStepId) {
@@ -581,13 +670,15 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
     // Child workflow wait — auto-start the child and listen for completion
     if (stepState.waitingFor?.type === 'childWorkflow') {
-      const data = stepState.waitingFor.data as {
-        childWorkflowId: string;
-        childInput: unknown;
-        parentRunId: string;
-        parentStepId: string;
-        childRunId?: string;
-      } | undefined;
+      const data = stepState.waitingFor.data as
+        | {
+            childWorkflowId: string;
+            childInput: unknown;
+            parentRunId: string;
+            parentStepId: string;
+            childRunId?: string;
+          }
+        | undefined;
 
       if (data?.childWorkflowId && !data.childRunId) {
         // Look up the child workflow engine by workflowId
@@ -603,7 +694,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
             await this.container.repository.updateOne(
               { _id: runId },
               { $set: { [`steps.${stepIndex}.waitingFor.data.childRunId`]: childRun._id } },
-              { bypassTenant: true }
+              { bypassTenant: true },
             );
           }
 
@@ -648,8 +739,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
             runId,
             error: new Error(
               `Child workflow '${data.childWorkflowId}' not registered. ` +
-              `Ensure the child workflow is created with createWorkflow() before the parent starts. ` +
-              `Or resume the parent manually when the child completes.`
+                `Ensure the child workflow is created with createWorkflow() before the parent starts. ` +
+                `Or resume the parent manually when the child completes.`,
             ),
             context: 'child-workflow-not-found',
           });
@@ -675,7 +766,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    */
   private async failCorruption(
     runId: string,
-    run: WorkflowRun<TContext>
+    run: WorkflowRun<TContext>,
   ): Promise<WorkflowRun<TContext>> {
     const errorMsg = `Data corruption: currentStepId '${run.currentStepId}' not found in steps`;
 
@@ -691,7 +782,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     await this.container.repository.updateOne(
       { _id: runId },
       { status: 'failed', updatedAt: now, endedAt: now, error: errorPayload },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
     run.status = 'failed';
@@ -720,7 +811,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           logger.warn(
             `Event '${eventName}' emitted without runId or broadcast flag. ` +
               `This will resume ALL workflows waiting on '${eventName}'.`,
-            { runId, eventName }
+            { runId, eventName },
           );
         }
 
@@ -762,7 +853,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         if (!signalPayload || signalPayload.runId === runId || signalPayload.broadcast) {
           listener(signalPayload);
         }
-      }
+      },
     );
 
     // Store unsub for cleanup
@@ -798,7 +889,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       retryAfter,
       () => this.scheduler.start(),
       this.container.repository,
-      this.container.cache
+      this.container.cache,
     );
   }
 
@@ -814,7 +905,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         this.scheduler.scheduleResume(runId, resumeAt);
       },
       this.container.repository,
-      this.container.cache
+      this.container.cache,
     );
   }
 
@@ -822,11 +913,11 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
   /**
    * Resume a paused or waiting workflow.
-   * 
+   *
    * For waiting workflows:
    * - If waiting for human input: payload is passed as the step output
    * - If waiting for timer/retry: continues execution from current step
-   * 
+   *
    * @param runId - Workflow run ID to resume
    * @param payload - Data to pass to the waiting step (becomes step output)
    * @returns The updated workflow run
@@ -841,7 +932,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       const claimResult = await this.container.repository.updateOne(
         { _id: runId, paused: true },
         { $set: { paused: false, updatedAt: new Date() } },
-        { bypassTenant: true }
+        { bypassTenant: true },
       );
 
       if (claimResult.modifiedCount === 0) {
@@ -870,7 +961,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
   private async resumeWaitingWorkflow(
     run: WorkflowRun<TContext>,
-    payload?: unknown
+    payload?: unknown,
   ): Promise<WorkflowRun<TContext>> {
     const runId = run._id;
     const currentStepId = run.currentStepId;
@@ -901,7 +992,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    */
   async recoverStale(
     runId: string,
-    staleThresholdMs: number
+    staleThresholdMs: number,
   ): Promise<WorkflowRun<TContext> | null> {
     const staleTime = new Date(Date.now() - staleThresholdMs);
 
@@ -913,7 +1004,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
       },
       { lastHeartbeat: new Date(), updatedAt: new Date() },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
     if (claimResult.modifiedCount === 0) {
@@ -937,7 +1028,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
               [`steps.${stepIndex}.startedAt`]: undefined,
             },
           },
-          { bypassTenant: true }
+          { bypassTenant: true },
         );
       }
     }
@@ -975,10 +1066,10 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           lastHeartbeat: now,
         },
       },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
-    // If no retry workflow found, try to claim a scheduled workflow (status: draft)
+    // If no retry workflow found, try to claim a scheduled workflow (status: draft, has executionTime)
     if (claimResult.modifiedCount === 0) {
       claimResult = await this.container.repository.updateOne(
         {
@@ -995,8 +1086,41 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
             startedAt: now,
           },
         },
-        { bypassTenant: true }
+        { bypassTenant: true },
       );
+    }
+
+    // If no scheduled draft found, try to claim a concurrency-queued draft
+    if (claimResult.modifiedCount === 0) {
+      const draft = await this.container.repository.getConcurrencyDraft(runId);
+
+      if (draft?.concurrencyKey) {
+        const activeCount = await this.container.repository.countActiveByConcurrencyKey(
+          draft.workflowId,
+          draft.concurrencyKey,
+        );
+
+        // Only promote if under the limit (we don't know the limit here,
+        // so we check if there's room — at least one slot must be free)
+        // The limit was checked at start() time. Here we just check if any slot freed.
+        const concurrencyLimit = (draft.meta as Record<string, unknown> | undefined)
+          ?.concurrencyLimit as number | undefined;
+
+        if (concurrencyLimit === undefined || activeCount < concurrencyLimit) {
+          claimResult = await this.container.repository.updateOne(
+            { _id: runId, status: 'draft', paused: { $ne: true } },
+            {
+              $set: {
+                status: 'running',
+                updatedAt: now,
+                lastHeartbeat: now,
+                startedAt: now,
+              },
+            },
+            { bypassTenant: true },
+          );
+        }
+      }
     }
 
     if (claimResult.modifiedCount === 0) {
@@ -1018,7 +1142,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   /**
    * Rewind a workflow to a previous step.
    * Resets all steps from target step onwards to pending state.
-   * 
+   *
    * @param runId - Workflow run ID
    * @param stepId - Step ID to rewind to
    * @returns The rewound workflow run
@@ -1036,7 +1160,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   /**
    * Cancel a running workflow.
    * Cleans up all resources and marks workflow as cancelled.
-   * 
+   *
    * @param runId - Workflow run ID to cancel
    * @returns The cancelled workflow run
    */
@@ -1066,10 +1190,10 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
   /**
    * Pause a workflow run.
-   * 
+   *
    * Sets the `paused` flag to prevent the scheduler from processing this workflow.
    * Paused workflows can be resumed later with `resume()`.
-   * 
+   *
    * @param runId - Workflow run ID to pause
    * @returns The paused workflow run
    */
@@ -1118,7 +1242,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           await this.resume(runId);
         },
         currentConfig,
-        this.container.eventBus
+        this.container.eventBus,
       );
 
       // Re-set callbacks
@@ -1135,6 +1259,9 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
   shutdown(): void {
     this.scheduler.stop();
+
+    // Abort all in-flight step executions (stops heartbeat timers + timeouts)
+    this.executor.abortAll();
 
     // Clean up all event listeners
     for (const [, entry] of this.eventListeners.entries()) {

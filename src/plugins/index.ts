@@ -34,7 +34,7 @@
 
 // Tenant isolation plugin
 export {
-  tenantFilterPlugin,
   singleTenantPlugin,
   type TenantFilterOptions,
+  tenantFilterPlugin,
 } from './tenant-filter.plugin.js';

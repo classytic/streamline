@@ -47,10 +47,10 @@ export class TimezoneHandler {
    *
    * @param scheduledFor - Local date/time as ISO string WITHOUT timezone (naive datetime)
    *                       Format: "YYYY-MM-DDTHH:mm:ss" (e.g., "2024-03-10T09:00:00")
-   *                       
+   *
    *                       This represents the LOCAL time in the target timezone.
    *                       Do NOT include timezone offset (Z, +00:00, etc.)
-   * 
+   *
    * @param timezone - IANA timezone name (e.g., "America/New_York", "Europe/London")
    * @returns Calculation result with execution time and DST metadata
    *
@@ -85,14 +85,11 @@ export class TimezoneHandler {
    * // Result: Uses first occurrence (DST), isDSTTransition=true, dstNote warns of ambiguity
    * ```
    */
-  calculateExecutionTime(
-    scheduledFor: Date | string,
-    timezone: string
-  ): TimezoneCalculationResult {
+  calculateExecutionTime(scheduledFor: Date | string, timezone: string): TimezoneCalculationResult {
     // Validate timezone using Luxon (throws if invalid)
     if (!DateTime.local().setZone(timezone).isValid) {
       throw new Error(
-        `Invalid timezone: ${timezone}. Use IANA timezone names like "America/New_York"`
+        `Invalid timezone: ${timezone}. Use IANA timezone names like "America/New_York"`,
       );
     }
 
@@ -117,7 +114,7 @@ export class TimezoneHandler {
     if (!dt.isValid) {
       throw new Error(
         `Invalid scheduledFor: "${scheduledFor}". ` +
-        `Expected ISO format without timezone: "YYYY-MM-DDTHH:mm:ss" (e.g., "2024-03-10T09:00:00")`
+          `Expected ISO format without timezone: "YYYY-MM-DDTHH:mm:ss" (e.g., "2024-03-10T09:00:00")`,
       );
     }
 
@@ -131,7 +128,7 @@ export class TimezoneHandler {
     // Create DateTime in target timezone (using explicit components for DST handling)
     const dtInZone = DateTime.fromObject(
       { year, month, day, hour, minute, second },
-      { zone: timezone }
+      { zone: timezone },
     );
 
     // Edge Case 1: Spring Forward (non-existent time)
@@ -143,7 +140,7 @@ export class TimezoneHandler {
       // Adjust forward to next valid time (usually 1 hour ahead)
       const adjustedDt = DateTime.fromObject(
         { year, month, day, hour: hour + 1, minute, second },
-        { zone: timezone }
+        { zone: timezone },
       );
 
       return {
@@ -159,8 +156,7 @@ export class TimezoneHandler {
     // Check if this time is ambiguous by seeing if adding 1 hour crosses DST boundary
     const oneHourLater = dtInZone.plus({ hours: 1 });
     const isAmbiguous =
-      dtInZone.isInDST !== oneHourLater.isInDST &&
-      dtInZone.offset !== oneHourLater.offset;
+      dtInZone.isInDST !== oneHourLater.isInDST && dtInZone.offset !== oneHourLater.offset;
 
     if (isAmbiguous) {
       // During fall back, Luxon defaults to the FIRST occurrence (DST time)

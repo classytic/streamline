@@ -7,11 +7,11 @@ export default defineConfig({
     'src/telemetry/index.ts',
   ],
   format: 'esm',
-  dts: {
-    sourcemap: false,
+  dts: true,
+  clean: true,
+  deps: {
+    neverBundle: ['mongoose', '@classytic/mongokit', 'luxon', 'semver'],
   },
-  sourcemap: false,
-  minify: false,
-  // tsdown 0.21+ auto-externalizes all deps/peerDeps from package.json.
-  // No manual `external` list needed — can't miss a dep, can't bundle by accident.
+  publint: 'ci-only',
+  attw: 'ci-only',
 });

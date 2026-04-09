@@ -1,15 +1,20 @@
-import { StepContextImpl, WaitSignal, GotoSignal } from './context.js';
-import { deriveRunStatus } from '../core/status.js';
-import { isConditionalStep, shouldSkipStep } from '../features/conditional.js';
-import { calculateRetryDelay } from '../utils/helpers.js';
-import { TIMING, RETRY } from '../config/constants.js';
-import { StepNotFoundError, WorkflowNotFoundError, InvalidStateError } from '../utils/errors.js';
-import { buildStepUpdateOps, applyStepUpdates, toPlainRun } from './step-updater.js';
-import type { WorkflowRun, StepState, StepHandler } from '../core/types.js';
-import type { WorkflowRegistry } from '../workflow/registry.js';
-import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import { RETRY, TIMING } from '../config/constants.js';
 import type { WorkflowEventBus } from '../core/events.js';
+import { deriveRunStatus } from '../core/status.js';
+import type { StepHandler, StepState, WorkflowRun } from '../core/types.js';
+import { isConditionalStep, shouldSkipStep } from '../features/conditional.js';
 import type { WorkflowCache } from '../storage/cache.js';
+import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import {
+  InvalidStateError,
+  StepNotFoundError,
+  toError,
+  WorkflowNotFoundError,
+} from '../utils/errors.js';
+import { calculateRetryDelay, resolveBackoffMultiplier } from '../utils/helpers.js';
+import type { WorkflowRegistry } from '../workflow/registry.js';
+import { GotoSignal, StepContextImpl, WaitSignal } from './context.js';
+import { applyStepUpdates, buildStepUpdateOps, toPlainRun } from './step-updater.js';
 
 /**
  * Cancelled is the only externally-forced terminal state.
@@ -44,14 +49,14 @@ interface WaitSignalData {
  */
 export class StepExecutor<TContext = Record<string, unknown>> {
   /** Track active AbortControllers by runId for cancellation support */
-  private activeControllers = new Map<string, AbortController>();
+  private readonly activeControllers = new Map<string, AbortController>();
 
   constructor(
     private readonly registry: WorkflowRegistry<TContext>,
     private readonly repository: WorkflowRunRepository,
     private readonly eventBus: WorkflowEventBus,
     private readonly cache: WorkflowCache,
-    private readonly signalStore?: import('../core/container.js').SignalStore
+    private readonly signalStore?: import('../core/container.js').SignalStore,
   ) {}
 
   /**
@@ -71,6 +76,14 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     }
   }
 
+  /** Abort all in-flight step executions. Called by engine.shutdown(). */
+  abortAll(): void {
+    for (const [runId, controller] of this.activeControllers) {
+      controller.abort(new Error('Engine shutdown'));
+      this.activeControllers.delete(runId);
+    }
+  }
+
   // ============ Helper Methods ============
 
   /**
@@ -78,7 +91,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
    */
   private findStepOrThrow(
     run: WorkflowRun<TContext>,
-    stepId: string
+    stepId: string,
   ): { step: StepState; index: number } {
     const index = run.steps.findIndex((s) => s.stepId === stepId);
     if (index === -1) {
@@ -95,7 +108,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   private async checkConditionalSkip(
     run: WorkflowRun<TContext>,
     stepId: string,
-    step: import('../core/types.js').Step
+    step: import('../core/types.js').Step,
   ): Promise<WorkflowRun<TContext> | null> {
     if (!isConditionalStep(step)) {
       return null;
@@ -106,9 +119,12 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       return null;
     }
 
+    const skippedAt = new Date();
     run = await this.updateStepState(run, stepId, {
       status: 'skipped',
-      endedAt: new Date(),
+      completedAt: skippedAt,
+      endedAt: skippedAt,
+      durationMs: 0,
     });
     this.eventBus.emit('step:skipped', { runId: run._id, stepId });
     return await this.moveToNextStep(run);
@@ -120,7 +136,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
    */
   private async checkRetryBackoff(
     run: WorkflowRun<TContext>,
-    currentStepState: StepState
+    currentStepState: StepState,
   ): Promise<WorkflowRun<TContext> | null> {
     if (!currentStepState.retryAfter || new Date() >= currentStepState.retryAfter) {
       return null;
@@ -132,7 +148,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       const result = await this.repository.updateOne(
         { _id: run._id, ...CANCELLED_GUARD },
         { status: 'waiting', updatedAt: now },
-        { bypassTenant: true }
+        { bypassTenant: true },
       );
       // Only update in-memory if DB accepted the update
       if (result.modifiedCount > 0) {
@@ -152,7 +168,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
    */
   private async checkAlreadyRunning(
     run: WorkflowRun<TContext>,
-    currentStepState: StepState
+    currentStepState: StepState,
   ): Promise<WorkflowRun<TContext> | null> {
     if (currentStepState.status !== 'running') {
       return null;
@@ -171,12 +187,16 @@ export class StepExecutor<TContext = Record<string, unknown>> {
    * Orchestrates conditional checks, atomic claiming, and handler execution.
    */
   async executeStep(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
-    const stepId = run.currentStepId!;
+    const stepId = run.currentStepId;
+    if (!stepId) {
+      throw new InvalidStateError('execute step', run.status, ['running'], { runId: run._id });
+    }
+
     const step = this.registry.getStep(stepId);
     const handler = this.registry.getHandler(stepId);
 
     if (!step || !handler) {
-      const availableSteps = this.registry.definition.steps.map(s => s.id);
+      const availableSteps = this.registry.definition.steps.map((s) => s.id);
       throw new StepNotFoundError(stepId, run.workflowId, availableSteps);
     }
 
@@ -185,7 +205,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     if (skippedRun) return skippedRun;
 
     // 2. Check retry backoff
-    const currentStepState = run.steps.find((s) => s.stepId === stepId)!;
+    const { step: currentStepState } = this.findStepOrThrow(run, stepId);
     const waitingRun = await this.checkRetryBackoff(run, currentStepState);
     if (waitingRun) return waitingRun;
 
@@ -214,11 +234,11 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   private async claimStepExecution(
     run: WorkflowRun<TContext>,
     stepId: string,
-    currentStepState: StepState
+    currentStepState: StepState,
   ): Promise<WorkflowRun<TContext> | null> {
     const stepIndex = run.steps.findIndex((s) => s.stepId === stepId);
     if (stepIndex === -1) {
-      const availableSteps = this.registry.definition.steps.map(s => s.id);
+      const availableSteps = this.registry.definition.steps.map((s) => s.id);
       throw new StepNotFoundError(stepId, run.workflowId, availableSteps);
     }
 
@@ -249,7 +269,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
           [`steps.${stepIndex}.retryAfter`]: '',
         },
       },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
     if (claimResult.modifiedCount === 0) {
@@ -279,40 +299,47 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     run: WorkflowRun<TContext>,
     stepId: string,
     step: import('../core/types.js').Step,
-    handler: StepHandler<unknown, TContext>
+    handler: StepHandler<unknown, TContext>,
   ): Promise<WorkflowRun<TContext>> {
     const abortController = new AbortController();
 
     // Register controller for cancellation support
     this.activeControllers.set(run._id, abortController);
 
-    try {
-      const stepState = run.steps.find((s) => s.stepId === stepId)!;
-      const ctx = new StepContextImpl(
-        run._id,
-        stepId,
-        run.context,
-        run.input,
-        stepState.attempts,
-        run,
-        this.repository,
-        this.eventBus,
-        abortController.signal,
-        this.signalStore
-      );
+    const { step: stepState } = this.findStepOrThrow(run, stepId);
+    const ctx = new StepContextImpl(
+      run._id,
+      stepId,
+      run.context,
+      run.input,
+      stepState.attempts,
+      run,
+      this.repository,
+      this.eventBus,
+      abortController.signal,
+      this.signalStore,
+    );
 
+    try {
       const output = await this.executeWithTimeout(
         handler,
         ctx,
         step.timeout || this.registry.definition.defaults?.timeout,
         run._id,
-        abortController
+        abortController,
       );
 
-      // Success - update step and move to next
+      // Success - update step with timing metrics
+      const completedAt = new Date();
+      const stepStartedAt = run.steps.find((s) => s.stepId === stepId)?.startedAt;
+      const durationMs = stepStartedAt
+        ? completedAt.getTime() - new Date(stepStartedAt).getTime()
+        : undefined;
       run = await this.updateStepState(run, stepId, {
         status: 'done',
-        endedAt: new Date(),
+        completedAt,
+        endedAt: completedAt,
+        durationMs,
         output,
         error: undefined,
         waitingFor: undefined,
@@ -338,6 +365,8 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         return await this.handleFailure(run, stepId, error as Error);
       }
     } finally {
+      // Flush buffered logs to DB in a single write (avoids N+1)
+      ctx.flushLogs().catch(() => {});
       // Unregister controller when step completes (success, failure, or wait)
       this.activeControllers.delete(run._id);
     }
@@ -348,7 +377,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     ctx: StepContextImpl<TContext>,
     timeout?: number,
     runId?: string,
-    abortController?: AbortController
+    abortController?: AbortController,
   ): Promise<T> {
     // Start periodic heartbeat to prevent long-running steps from being marked stale
     let heartbeatTimer: NodeJS.Timeout | undefined;
@@ -361,7 +390,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
           await this.repository.updateOne(
             { _id: runId },
             { lastHeartbeat: new Date() },
-            { bypassTenant: true } // Internal operation - already scoped by _id
+            { bypassTenant: true }, // Internal operation - already scoped by _id
           );
           consecutiveHeartbeatFailures = 0;
         } catch (error) {
@@ -371,10 +400,8 @@ export class StepExecutor<TContext = Record<string, unknown>> {
           // workflow as crashed — emit a louder signal.
           this.eventBus.emit('engine:error', {
             runId,
-            error: error instanceof Error ? error : new Error(String(error)),
-            context: consecutiveHeartbeatFailures >= 3
-              ? 'heartbeat-critical'
-              : 'heartbeat-warning',
+            error: toError(error),
+            context: consecutiveHeartbeatFailures >= 3 ? 'heartbeat-critical' : 'heartbeat-warning',
           });
         }
       }, TIMING.HEARTBEAT_INTERVAL_MS);
@@ -427,7 +454,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   private async handleWait(
     run: WorkflowRun<TContext>,
     stepId: string,
-    signal: WaitSignal
+    signal: WaitSignal,
   ): Promise<WorkflowRun<TContext>> {
     const signalData = signal.data as WaitSignalData | undefined;
     const stepState = await this.updateStepState(run, stepId, {
@@ -455,25 +482,35 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   private async handleFailure(
     run: WorkflowRun<TContext>,
     stepId: string,
-    error: Error
+    error: Error,
   ): Promise<WorkflowRun<TContext>> {
     const step = this.registry.getStep(stepId);
-    const stepState = run.steps.find((s) => s.stepId === stepId)!;
+    const { step: stepState } = this.findStepOrThrow(run, stepId);
     const maxRetries = step?.retries ?? this.registry.definition.defaults?.retries ?? 3;
 
     // Check if error has retriable flag set to false (user explicitly disabled retries)
-    const errorWithRetriable = error as Error & { retriable?: boolean };
-    const isRetriable = errorWithRetriable.retriable !== false;
+    // Guard against null/non-object thrown values
+    const errorWithRetriable =
+      error != null && typeof error === 'object'
+        ? (error as Error & { retriable?: boolean })
+        : null;
+    const isRetriable = errorWithRetriable?.retriable !== false;
 
     // Check if we can retry (attempts is already incremented in executeStep)
     if (isRetriable && stepState.attempts < maxRetries) {
-      // Calculate exponential backoff with jitter to prevent thundering herd
+      // Resolve per-step retry config (step > workflow defaults > system defaults)
+      const defaults = this.registry.definition.defaults;
+      const baseDelay = step?.retryDelay ?? defaults?.retryDelay ?? TIMING.RETRY_BASE_DELAY_MS;
+      const backoffConfig = step?.retryBackoff ?? defaults?.retryBackoff;
+      const multiplier = resolveBackoffMultiplier(backoffConfig, TIMING.RETRY_MULTIPLIER);
+
+      // Calculate backoff with jitter to prevent thundering herd
       const delayMs = calculateRetryDelay(
-        TIMING.RETRY_BASE_DELAY_MS,
+        baseDelay,
         stepState.attempts - 1,
-        TIMING.RETRY_MULTIPLIER,
+        multiplier,
         TIMING.MAX_RETRY_DELAY_MS,
-        RETRY.JITTER_FACTOR
+        RETRY.JITTER_FACTOR,
       );
       const retryAfter = new Date(Date.now() + delayMs);
 
@@ -499,7 +536,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
             [`steps.${stepIndex}.waitingFor`]: '', // Clear any previous waitingFor
           },
         },
-        { bypassTenant: true }
+        { bypassTenant: true },
       );
 
       // Only update in-memory and emit events if DB accepted the update
@@ -507,13 +544,19 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         run.status = 'waiting';
         run.steps[stepIndex].status = 'pending';
         run.steps[stepIndex].retryAfter = retryAfter;
-        run.steps[stepIndex].error = { message: error.message, retriable: true, stack: error.stack };
+        run.steps[stepIndex].error = {
+          message: error.message,
+          retriable: true,
+          stack: error.stack,
+        };
         run.steps[stepIndex] = { ...run.steps[stepIndex], waitingFor: undefined };
 
         this.eventBus.emit('step:retry-scheduled', {
           runId: run._id,
           stepId,
-          data: { attempt: stepState.attempts, maxRetries, retryAfter },
+          attempt: stepState.attempts,
+          maxRetries,
+          retryAfter,
         });
       } else {
         // DB rejected update (workflow cancelled) - invalidate cache for consistency
@@ -523,21 +566,27 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       return run;
     }
 
-    // Preserve error code if present
-    const errorWithCode = error as Error & { code?: string };
+    const safeError = toError(error);
+    const failedAt = new Date();
+    const failStartedAt = stepState.startedAt;
+    const failDurationMs = failStartedAt
+      ? failedAt.getTime() - new Date(failStartedAt).getTime()
+      : undefined;
     const failedRun = await this.updateStepState(run, stepId, {
       status: 'failed',
-      endedAt: new Date(),
+      completedAt: failedAt,
+      endedAt: failedAt,
+      durationMs: failDurationMs,
       error: {
-        message: error.message,
-        code: errorWithCode.code,
+        message: safeError.message,
+        code: (safeError as Error & { code?: string }).code,
         retriable: false,
-        stack: error.stack,
+        stack: safeError.stack,
       },
     });
 
-    this.eventBus.emit('step:failed', { runId: run._id, stepId, data: { error } });
-    this.eventBus.emit('workflow:failed', { runId: run._id, data: { error } });
+    this.eventBus.emit('step:failed', { runId: run._id, stepId, error: safeError });
+    this.eventBus.emit('workflow:failed', { runId: run._id, error: safeError });
 
     return failedRun;
   }
@@ -549,21 +598,19 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   private async updateStepState(
     run: WorkflowRun<TContext>,
     stepId: string,
-    updates: Partial<StepState>
+    updates: Partial<StepState>,
   ): Promise<WorkflowRun<TContext>> {
     // Convert Mongoose document to plain object if needed
     run = toPlainRun(run);
 
     const { index: stepIndex } = this.findStepOrThrow(run, stepId);
 
-    // Derive new workflow status
-    const newStatus = deriveRunStatus({ ...run, steps: applyStepUpdates(stepId, run.steps, updates) });
-
-    // Build MongoDB update operators
+    // Apply updates to in-memory state (once — reused for status derivation)
+    const updatedSteps = applyStepUpdates(stepId, run.steps, updates);
+    const newStatus = deriveRunStatus({ ...run, steps: updatedSteps });
     const updateOps = buildStepUpdateOps(stepIndex, updates, { includeStatus: newStatus });
 
-    // Apply updates to in-memory state
-    run.steps = applyStepUpdates(stepId, run.steps, updates);
+    run.steps = updatedSteps;
     run.updatedAt = new Date();
     run.status = newStatus;
 
@@ -571,7 +618,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     const result = await this.repository.updateOne(
       { _id: run._id, ...CANCELLED_GUARD },
       updateOps,
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
     // If update was rejected and workflow is cancelled, invalidate cache and throw error
@@ -579,12 +626,10 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       this.cache.delete(run._id); // Force re-fetch on next access
       const current = await this.repository.getById(run._id);
       if (current?.status === 'cancelled') {
-        throw new InvalidStateError(
-          'update step',
-          'cancelled',
-          ['running', 'waiting', 'draft'],
-          { runId: run._id, stepId }
-        );
+        throw new InvalidStateError('update step', 'cancelled', ['running', 'waiting', 'draft'], {
+          runId: run._id,
+          stepId,
+        });
       }
     }
 
@@ -627,23 +672,18 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     run.updatedAt = updates.updatedAt as Date;
 
     // Atomic update via repository (rejects if workflow was cancelled)
-    const result = await this.repository.updateOne(
-      { _id: run._id, ...CANCELLED_GUARD },
-      updates,
-      { bypassTenant: true }
-    );
+    const result = await this.repository.updateOne({ _id: run._id, ...CANCELLED_GUARD }, updates, {
+      bypassTenant: true,
+    });
 
     // If update was rejected and workflow is cancelled, invalidate cache and throw error
     if (result.modifiedCount === 0) {
       this.cache.delete(run._id); // Force re-fetch on next access
       const current = await this.repository.getById(run._id);
       if (current?.status === 'cancelled') {
-        throw new InvalidStateError(
-          'move to next step',
-          'cancelled',
-          ['running', 'waiting'],
-          { runId: run._id }
-        );
+        throw new InvalidStateError('move to next step', 'cancelled', ['running', 'waiting'], {
+          runId: run._id,
+        });
       }
     }
 
@@ -657,12 +697,12 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   private async handleGoto(
     run: WorkflowRun<TContext>,
     fromStepId: string,
-    targetStepId: string
+    targetStepId: string,
   ): Promise<WorkflowRun<TContext>> {
     // Validate target step exists
     const targetStep = this.registry.getStep(targetStepId);
     if (!targetStep) {
-      const availableSteps = this.registry.definition.steps.map(s => s.id);
+      const availableSteps = this.registry.definition.steps.map((s) => s.id);
       throw new StepNotFoundError(targetStepId, run.workflowId, availableSteps);
     }
 
@@ -672,11 +712,15 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       endedAt: new Date(),
     });
 
-    this.eventBus.emit('step:completed', { runId: run._id, stepId: fromStepId, data: { goto: targetStepId } });
+    this.eventBus.emit('step:completed', {
+      runId: run._id,
+      stepId: fromStepId,
+      data: { goto: targetStepId },
+    });
 
     // Jump to target step and reset it to pending so executor can re-claim it.
     const now = new Date();
-    const targetIndex = this.registry.definition.steps.findIndex(s => s.id === targetStepId);
+    const targetIndex = this.registry.definition.steps.findIndex((s) => s.id === targetStepId);
     const updates: Record<string, unknown> = {
       currentStepId: targetStepId,
       status: 'running',
@@ -703,7 +747,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     await this.repository.updateOne(
       { _id: run._id, status: { $ne: 'cancelled' } },
       { $set: updates },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
 
     run.currentStepId = targetStepId;
@@ -716,19 +760,24 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   /**
    * Resume a waiting step with payload.
    * Marks the step as done and continues to next step.
-   * 
+   *
    * @param run - Workflow run to resume
    * @param payload - Data to pass as step output
    * @returns Updated workflow run
    * @throws {InvalidStateError} If step is not in waiting state
    */
   async resumeStep(run: WorkflowRun<TContext>, payload: unknown): Promise<WorkflowRun<TContext>> {
-    const stepId = run.currentStepId!;
+    const stepId = run.currentStepId;
+    if (!stepId) {
+      throw new InvalidStateError('resume step', run.status, ['waiting'], { runId: run._id });
+    }
     const { step: stepState } = this.findStepOrThrow(run, stepId);
 
     if (stepState.status !== 'waiting') {
-      const { InvalidStateError } = await import('../utils/errors.js');
-      throw new InvalidStateError('resume step', stepState.status, ['waiting'], { runId: run._id, stepId });
+      throw new InvalidStateError('resume step', stepState.status, ['waiting'], {
+        runId: run._id,
+        stepId,
+      });
     }
 
     // Mark step as done with the payload as output, then move to next step

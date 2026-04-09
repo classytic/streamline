@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type {
+  Step,
+  StepHandler,
+  StepState,
   WorkflowDefinition,
   WorkflowHandlers,
-  Step,
   WorkflowRun,
-  StepState,
-  StepHandler,
 } from '../core/types.js';
 import { validateWorkflowDefinition } from '../utils/validation.js';
 
@@ -16,7 +16,7 @@ import { validateWorkflowDefinition } from '../utils/validation.js';
 export class WorkflowRegistry<TContext = Record<string, unknown>> {
   constructor(
     public readonly definition: WorkflowDefinition<TContext>,
-    private readonly handlers: WorkflowHandlers<TContext>
+    private readonly handlers: WorkflowHandlers<TContext>,
   ) {
     // Use centralized validation
     validateWorkflowDefinition(definition, handlers);

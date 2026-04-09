@@ -1,4 +1,4 @@
-import type { WorkflowRun, StepState } from '../core/types.js';
+import type { StepState, WorkflowRun } from '../core/types.js';
 
 export interface StepTimeline {
   id: string;
@@ -26,9 +26,7 @@ export function getStepTimeline(run: WorkflowRun): StepTimeline[] {
     id: step.stepId,
     status: step.status,
     duration:
-      step.startedAt && step.endedAt
-        ? step.endedAt.getTime() - step.startedAt.getTime()
-        : null,
+      step.startedAt && step.endedAt ? step.endedAt.getTime() - step.startedAt.getTime() : null,
     startedAt: step.startedAt,
     endedAt: step.endedAt,
   }));

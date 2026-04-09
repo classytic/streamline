@@ -30,12 +30,18 @@
  * ```
  */
 
-import { WorkflowEngine } from '../execution/engine.js';
 import { createContainer, type StreamlineContainer } from '../core/container.js';
 import { isTerminalState } from '../core/status.js';
-import type { WorkflowDefinition, StepHandler, WorkflowRun, StepContext, Step } from '../core/types.js';
-import { validateId, validateRetryConfig } from '../utils/validation.js';
+import type {
+  Step,
+  StepContext,
+  StepHandler,
+  WorkflowDefinition,
+  WorkflowRun,
+} from '../core/types.js';
+import { WorkflowEngine } from '../execution/engine.js';
 import { WorkflowNotFoundError } from '../utils/errors.js';
+import { validateId, validateRetryConfig } from '../utils/validation.js';
 
 // camelCase/kebab-case -> Title Case
 const toName = (id: string) =>
@@ -75,6 +81,19 @@ export interface StepConfig<TOutput = unknown, TContext = Record<string, unknown
   handler: StepHandler<TOutput, TContext>;
   timeout?: number;
   retries?: number;
+  /**
+   * Base delay in milliseconds before the first retry.
+   * @default 1000 (1 second)
+   */
+  retryDelay?: number;
+  /**
+   * Backoff strategy for retries.
+   * - 'exponential': delay doubles each attempt (default)
+   * - 'linear' | 'fixed': delay stays constant
+   * - number: custom multiplier
+   * @default 'exponential'
+   */
+  retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
   condition?: (context: TContext, run: WorkflowRun) => boolean | Promise<boolean>;
   skipIf?: (context: TContext) => boolean | Promise<boolean>;
   runIf?: (context: TContext) => boolean | Promise<boolean>;
@@ -101,7 +120,7 @@ export interface StepConfig<TOutput = unknown, TContext = Record<string, unknown
 
 /** Type guard: is the step entry a StepConfig object (vs a plain handler fn)? */
 function isStepConfig<TOutput, TContext>(
-  step: StepHandler<TOutput, TContext> | StepConfig<TOutput, TContext>
+  step: StepHandler<TOutput, TContext> | StepConfig<TOutput, TContext>,
 ): step is StepConfig<TOutput, TContext> {
   return typeof step === 'object' && step !== null && 'handler' in step;
 }
@@ -119,6 +138,8 @@ function toStepDef<TContext>(stepId: string, entry: StepConfig<unknown, TContext
 
   if (entry.timeout !== undefined) step.timeout = entry.timeout;
   if (entry.retries !== undefined) step.retries = entry.retries;
+  if (entry.retryDelay !== undefined) step.retryDelay = entry.retryDelay;
+  if (entry.retryBackoff !== undefined) step.retryBackoff = entry.retryBackoff;
 
   // TContext → unknown widening: safe at this boundary.
   // The executor calls these with the real TContext value.
@@ -154,10 +175,46 @@ export interface WorkflowConfig<TContext, TInput = unknown> {
   steps: Record<string, StepHandler<unknown, TContext> | StepConfig<unknown, TContext>>;
   context?: (input: TInput) => TContext;
   version?: string;
-  defaults?: { retries?: number; timeout?: number };
+  defaults?: {
+    retries?: number;
+    timeout?: number;
+    retryDelay?: number;
+    retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+  };
   autoExecute?: boolean;
   /** Optional custom container for dependency injection */
   container?: StreamlineContainer;
+
+  // ============ Distributed Primitives ============
+
+  /**
+   * Auto-cancel workflow when any of these events fire.
+   * @example `cancelOn: [{ event: 'order.cancelled' }]`
+   */
+  cancelOn?: Array<{ event: string }>;
+
+  /**
+   * Concurrency limit for this workflow.
+   * `limit` = max simultaneous runs. `key` = optional grouping function.
+   * @example `concurrency: { limit: 5, key: (input) => input.userId }`
+   */
+  concurrency?: { limit: number; key?: (input: TInput) => string };
+
+  /**
+   * Auto-start workflow when this event fires on the event bus.
+   * @example `trigger: { event: 'user.created' }`
+   */
+  trigger?: { event: string };
+}
+
+/** Options for `Workflow.start()` */
+export interface StartOptions {
+  /** Metadata (userId, tags, etc.) */
+  meta?: Record<string, unknown>;
+  /** Idempotency key — only one non-terminal run per key. Duplicate starts return the existing run. */
+  idempotencyKey?: string;
+  /** Execution priority (higher = picked up sooner by scheduler). @default 0 */
+  priority?: number;
 }
 
 /** Options for `Workflow.waitFor()` */
@@ -181,7 +238,7 @@ export interface WaitForOptions {
  * ```
  */
 export interface Workflow<TContext, TInput = unknown> {
-  start: (input: TInput, meta?: Record<string, unknown>) => Promise<WorkflowRun<TContext>>;
+  start: (input: TInput, options?: StartOptions) => Promise<WorkflowRun<TContext>>;
   get: (runId: string) => Promise<WorkflowRun<TContext> | null>;
   execute: (runId: string) => Promise<WorkflowRun<TContext>>;
   resume: (runId: string, payload?: unknown) => Promise<WorkflowRun<TContext>>;
@@ -234,7 +291,7 @@ export interface Workflow<TContext, TInput = unknown> {
  */
 export function createWorkflow<TContext = Record<string, unknown>, TInput = unknown>(
   id: string,
-  config: WorkflowConfig<TContext, TInput>
+  config: WorkflowConfig<TContext, TInput>,
 ): Workflow<TContext, TInput> {
   validateId(id, 'workflow');
 
@@ -244,17 +301,25 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
   }
 
   if (config.defaults) {
-    validateRetryConfig(config.defaults.retries, config.defaults.timeout);
+    validateRetryConfig(
+      config.defaults.retries,
+      config.defaults.timeout,
+      config.defaults.retryDelay,
+      config.defaults.retryBackoff,
+    );
   }
 
   // Normalize: separate handlers, compensation handlers, and step definitions
   const handlers: Record<string, StepHandler<unknown, TContext>> = {};
   const compensationHandlers: Record<string, StepHandler<unknown, TContext>> = {};
   const steps: Step[] = stepIds.map((stepId) => {
+    validateId(stepId, 'step');
+
     // stepId comes from Object.keys(config.steps) — always defined
     const entry = config.steps[stepId]!;
 
     if (isStepConfig(entry)) {
+      validateRetryConfig(entry.retries, entry.timeout, entry.retryDelay, entry.retryBackoff);
       handlers[stepId] = entry.handler;
       if (entry.onCompensate) {
         compensationHandlers[stepId] = entry.onCompensate;
@@ -279,14 +344,18 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
 
   const engine = new WorkflowEngine(definition, handlers, container, {
     ...(config.autoExecute !== undefined && { autoExecute: config.autoExecute }),
-    compensationHandlers: Object.keys(compensationHandlers).length > 0
-      ? compensationHandlers as unknown as Record<string, import('../core/types.js').StepHandler<unknown, unknown>>
-      : undefined,
+    compensationHandlers:
+      Object.keys(compensationHandlers).length > 0
+        ? (compensationHandlers as unknown as Record<
+            string,
+            import('../core/types.js').StepHandler<unknown, unknown>
+          >)
+        : undefined,
   });
 
   const waitFor = async (
     runId: string,
-    options: WaitForOptions = {}
+    options: WaitForOptions = {},
   ): Promise<WorkflowRun<TContext>> => {
     const { pollInterval = 1000, timeout } = options;
     const startTime = Date.now();
@@ -304,7 +373,7 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
 
       if (timeout && Date.now() - startTime >= timeout) {
         throw new Error(
-          `Timeout waiting for workflow "${runId}" to complete after ${timeout}ms. Current status: ${run.status}`
+          `Timeout waiting for workflow "${runId}" to complete after ${timeout}ms. Current status: ${run.status}`,
         );
       }
 
@@ -312,8 +381,55 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     }
   };
 
+  // ============ Distributed Primitives Wiring ============
+
+  // Event trigger: auto-start workflow on event (track listener for safe cleanup)
+  let triggerListener: ((payload: unknown) => void) | undefined;
+  if (config.trigger?.event) {
+    triggerListener = (payload: unknown) => {
+      const data = (payload as { data?: unknown })?.data ?? payload;
+      engine.start(data).catch(() => {
+        // Trigger-started workflow failed — emitted via engine:error
+      });
+    };
+    container.eventBus.on(config.trigger.event, triggerListener);
+  }
+
+  const start = async (input: TInput, options?: StartOptions): Promise<WorkflowRun<TContext>> => {
+    const meta = options?.meta;
+    const idempotencyKey = options?.idempotencyKey;
+    const priority = options?.priority;
+    const concurrencyKey = config.concurrency?.key ? config.concurrency.key(input) : undefined;
+
+    // Concurrency check: if at limit, queue as draft
+    let startAsDraft = false;
+    if (config.concurrency && concurrencyKey !== undefined) {
+      const activeCount = await container.repository.countActiveByConcurrencyKey(
+        definition.id,
+        concurrencyKey,
+      );
+      if (activeCount >= config.concurrency.limit) {
+        startAsDraft = true;
+      }
+    }
+
+    // Store concurrency limit in meta so scheduler can check it during promotion
+    const enrichedMeta = config.concurrency
+      ? { ...meta, concurrencyLimit: config.concurrency.limit }
+      : meta;
+
+    return engine.start(input, {
+      meta: enrichedMeta,
+      idempotencyKey,
+      priority,
+      concurrencyKey,
+      startAsDraft,
+      cancelOn: config.cancelOn,
+    });
+  };
+
   return {
-    start: (input, meta) => engine.start(input, meta),
+    start,
     get: (runId) => engine.get(runId),
     execute: (runId) => engine.execute(runId),
     resume: (runId, payload) => engine.resume(runId, payload),
@@ -321,7 +437,13 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     pause: (runId) => engine.pause(runId),
     rewindTo: (runId, stepId) => engine.rewindTo(runId, stepId),
     waitFor,
-    shutdown: () => engine.shutdown(),
+    shutdown: () => {
+      // Remove only THIS workflow's trigger listener (safe for shared buses)
+      if (config.trigger?.event && triggerListener) {
+        container.eventBus.off(config.trigger.event, triggerListener);
+      }
+      engine.shutdown();
+    },
     definition,
     engine,
     container,

@@ -27,10 +27,9 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import type { StepContext, WorkflowRun } from '../core/types.js';
 import { hookRegistry, workflowRegistry } from '../execution/engine.js';
 import { workflowRunRepository } from '../storage/run.repository.js';
-import { WorkflowRunModel } from '../storage/run.model.js';
-import type { StepContext, WorkflowRun } from '../core/types.js';
 
 export interface HookOptions {
   /** Custom token (default: auto-generated with crypto-random suffix) */
@@ -54,7 +53,7 @@ export interface HookResult {
  * return ctx.wait(hook.token, { hookToken: hook.token });
  * ```
  */
-export function createHook(ctx: StepContext, reason: string, options?: HookOptions): HookResult {
+export function createHook(ctx: StepContext, _reason: string, options?: HookOptions): HookResult {
   const randomSuffix = randomBytes(16).toString('hex');
   const token = options?.token ?? `${ctx.runId}:${ctx.stepId}:${randomSuffix}`;
   const path = `/hooks/${token}`;
@@ -81,7 +80,7 @@ export function createHook(ctx: StepContext, reason: string, options?: HookOptio
  */
 export async function resumeHook(
   token: string,
-  payload: unknown
+  payload: unknown,
 ): Promise<{ runId: string; run: WorkflowRun }> {
   const [runId] = token.split(':');
 
@@ -105,7 +104,7 @@ async function resumeViaEngine(
   engine: ReturnType<typeof hookRegistry.getEngine> & {},
   runId: string,
   token: string,
-  payload: unknown
+  payload: unknown,
 ): Promise<{ runId: string; run: WorkflowRun }> {
   const run = await engine.container.repository.getById(runId);
 
@@ -130,7 +129,7 @@ async function resumeViaEngine(
 async function resumeViaDb(
   runId: string,
   token: string,
-  payload: unknown
+  payload: unknown,
 ): Promise<{ runId: string; run: WorkflowRun }> {
   const run = await workflowRunRepository.getById(runId);
 
@@ -151,7 +150,7 @@ async function resumeViaDb(
   }
 
   const now = new Date();
-  const stepId = run.steps[stepIndex]!.stepId;
+  const stepId = run.steps[stepIndex]?.stepId;
 
   // Atomic claim: only resume if still waiting (prevents concurrent double-resume)
   const result = await workflowRunRepository.updateOne(
@@ -173,7 +172,7 @@ async function resumeViaDb(
         [`steps.${stepIndex}.waitingFor`]: '',
       },
     },
-    { bypassTenant: true }
+    { bypassTenant: true },
   );
 
   if (result.modifiedCount === 0) {
@@ -190,7 +189,7 @@ async function resumeViaDb(
     await workflowRunRepository.updateOne(
       { _id: runId },
       { $set: { currentStepId: nextStepId, updatedAt: new Date() } },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
   } else {
     // No next step — workflow is complete
@@ -205,7 +204,7 @@ async function resumeViaDb(
           output: payload,
         },
       },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
   }
 
@@ -230,7 +229,7 @@ async function resumeViaDb(
     await workflowRunRepository.updateOne(
       { _id: runId },
       { $set: { lastHeartbeat: new Date(0) } },
-      { bypassTenant: true }
+      { bypassTenant: true },
     );
   }
 
