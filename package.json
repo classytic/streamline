@@ -1,6 +1,6 @@
 {
   "name": "@classytic/streamline",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "MongoDB-native durable workflow orchestration engine. Like Temporal but simpler - supports sleep, wait, retry, parallel execution, human-in-the-loop, and crash recovery. Perfect for payment gateways, approval flows, and scheduled tasks.",
   "type": "module",
   "sideEffects": false,
@@ -31,19 +31,18 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:unit": "vitest run test/unit/",
-    "test:security": "vitest run test/security/",
-    "test:e2e": "vitest run test/e2e/",
-    "test:integration": "vitest run test/integration/",
-    "test:regression": "vitest run test/regression/",
-    "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
+    "test": "vitest run --project unit --project integration",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "vitest run --project e2e",
+    "test:all": "vitest run",
+    "test:watch": "vitest --project unit --project integration",
+    "test:coverage": "vitest run --project unit --project integration --coverage",
     "lint": "biome check src/",
     "lint:fix": "biome check src/ --write",
     "format": "biome format src/ --write",
     "check": "biome ci src/ --diagnostic-level=error",
-    "prepublishOnly": "npm run check && npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "npm run check && npm run typecheck && npm run test:all && npm run build"
   },
   "engines": {
     "node": ">=22"
@@ -84,7 +83,8 @@
     "url": "https://github.com/classytic/streamline/issues"
   },
   "peerDependencies": {
-    "@classytic/mongokit": ">=3.5.6",
+    "@classytic/mongokit": ">=3.11.0",
+    "@classytic/primitives": ">=0.1.0",
     "@opentelemetry/api": ">=1.0.0",
     "mongoose": ">=9.4.1"
   },
@@ -95,7 +95,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.10",
-    "@classytic/mongokit": "^3.5.6",
+    "@classytic/mongokit": "^3.11.0",
+    "@classytic/primitives": "file:../../ecom/commerce/packages/reference-only/primitives",
     "@opentelemetry/api": "^1.9.0",
     "@types/luxon": "^3.7.1",
     "@types/node": "^22.0.0",
