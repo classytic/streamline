@@ -4,6 +4,38 @@
  * Automatically injects tenant filters into all queries for multi-tenant isolation.
  * Prevents accidental cross-tenant data leaks by enforcing tenant scope at the repository level.
  *
+ * ## Why streamline ships this instead of using mongokit's `multiTenantPlugin`
+ *
+ * mongokit 3.10+ exposes `multiTenantPlugin` with similar features (`tenantField`,
+ * `required`, `skipWhen`, `resolveContext`, `allowDataInjection`, `fieldType`).
+ * Streamline still ships its own because of three streamline-specific
+ * requirements that mongokit's plugin doesn't cover today:
+ *
+ * 1. **Nested-field tenant injection on `create` / `createMany`.** Streamline's
+ *    `WorkflowRun` stores tenant scope at `context.tenantId` (a nested path).
+ *    mongokit's plugin sets `data[tenantField]` literally — given
+ *    `tenantField: 'context.tenantId'` it would write a flat key with a dot,
+ *    not a nested object. Streamline's plugin walks the dotted path and
+ *    builds the nested structure. (Reads work either way — MongoDB queries
+ *    accept dotted keys natively.)
+ *
+ * 2. **`bypassTenant` flag for admin operations.** Streamline's scheduler
+ *    runs cross-tenant background jobs (claim races, retry sweeps) that need
+ *    to read every tenant's runs. mongokit's `skipWhen` could express this,
+ *    but streamline's `bypassTenant` is part of the documented call-site
+ *    contract — switching plugins would be a breaking API change for
+ *    `getReadyToResume`, `getReadyForRetry`, etc.
+ *
+ * 3. **`staticTenantId` for single-tenant deployments.** Apps that start
+ *    single-tenant and may grow multi-tenant set `staticTenantId` once at
+ *    plugin construction and forget about per-call tenant args. mongokit's
+ *    `resolveContext: () => staticTenantId` would express this, but the
+ *    config shape is more discoverable as a named option here.
+ *
+ * If/when mongokit's plugin grows nested-path injection (likely as
+ * `tenantPath` alongside `tenantField`), this plugin should be deprecated
+ * and consumers migrated.
+ *
  * Design Philosophy:
  * - Zero-trust: All queries must explicitly include tenantId (or disable via bypassTenant flag)
  * - Fail-fast: Throws error if tenantId is missing and not bypassed
