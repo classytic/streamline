@@ -16,7 +16,12 @@ let mongoServer: MongoMemoryServer | null = null;
  * Call once before all tests
  */
 export async function setupTestDB(): Promise<void> {
-  // Start MongoDB Memory Server
+  // Idempotent — safe to call from multiple test files' beforeAll hooks.
+  // With vitest singleFork the same worker hosts many files; we reuse one server.
+  if (mongoServer && mongoose.connection.readyState === 1) {
+    return;
+  }
+
   mongoServer = await MongoMemoryServer.create({
     binary: {
       version: '7.0.0', // Use MongoDB 7.0

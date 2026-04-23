@@ -6,10 +6,10 @@
  *
  * ## Why streamline ships this instead of using mongokit's `multiTenantPlugin`
  *
- * mongokit 3.10+ exposes `multiTenantPlugin` with similar features (`tenantField`,
- * `required`, `skipWhen`, `resolveContext`, `allowDataInjection`, `fieldType`).
- * Streamline still ships its own because of three streamline-specific
- * requirements that mongokit's plugin doesn't cover today:
+ * mongokit 3.11's `multiTenantPlugin` exposes `tenantField`, `required`,
+ * `skipWhen`, `resolveContext`, `allowDataInjection`, and `fieldType`.
+ * Streamline still ships its own plugin because of three streamline-specific
+ * requirements — re-verified against mongokit 3.11 in April 2026:
  *
  * 1. **Nested-field tenant injection on `create` / `createMany`.** Streamline's
  *    `WorkflowRun` stores tenant scope at `context.tenantId` (a nested path).
@@ -32,9 +32,11 @@
  *    `resolveContext: () => staticTenantId` would express this, but the
  *    config shape is more discoverable as a named option here.
  *
- * If/when mongokit's plugin grows nested-path injection (likely as
- * `tenantPath` alongside `tenantField`), this plugin should be deprecated
- * and consumers migrated.
+ * **Exit criterion:** when mongokit grows a `tenantPath` option (nested-path
+ * injection) alongside `tenantField`, reason (1) dissolves — at that point
+ * we can migrate `bypassTenant` and `staticTenantId` to `skipWhen` +
+ * `resolveContext` wrappers and delete this plugin. Tracked as a streamline
+ * tech-debt item, not blocked on any consumer.
  *
  * Design Philosophy:
  * - Zero-trust: All queries must explicitly include tenantId (or disable via bypassTenant flag)
@@ -82,7 +84,12 @@
  * ```
  */
 
-import type { Plugin, RepositoryContext, RepositoryInstance } from '@classytic/mongokit';
+import {
+  HOOK_PRIORITY,
+  type Plugin,
+  type RepositoryContext,
+  type RepositoryInstance,
+} from '@classytic/mongokit';
 
 /**
  * Tenant filter plugin options
@@ -216,9 +223,15 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
           context.operation === 'getById' ||
           context.operation === 'getByQuery' ||
           context.operation === 'update' ||
-          context.operation === 'delete'
+          context.operation === 'delete' ||
+          context.operation === 'updateMany' ||
+          context.operation === 'deleteMany'
         ) {
-          // For getById, getByQuery, update, delete: merge with query
+          // For getById, getByQuery, update, delete, updateMany, deleteMany:
+          // merge tenant filter into the query. `updateMany`/`deleteMany`
+          // were promoted to class primitives in mongokit 3.11 — without
+          // these branches they'd bypass tenant scope silently, letting one
+          // tenant bulk-touch another tenant's runs.
           context.query = {
             ...(context.query || {}),
             ...tenantFilter,
@@ -238,80 +251,53 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
         }
       };
 
-      // Register hooks for all read operations
-      repo.on('before:getAll', injectTenantFilter);
-      repo.on('before:getById', injectTenantFilter);
-      repo.on('before:getByQuery', injectTenantFilter);
-      repo.on('before:update', injectTenantFilter);
-      repo.on('before:delete', injectTenantFilter);
-      repo.on('before:aggregatePaginate', injectTenantFilter);
+      // Register hooks for all read/write operations. `updateMany` and
+      // `deleteMany` are class primitives as of mongokit 3.11 — they MUST
+      // be hooked here or bulk ops bypass tenant scope entirely.
+      //
+      // Priority: POLICY (100) — must run BEFORE cache (200) /
+      // observability (300) / default (500) so tenant scope is applied
+      // before anything reads or records the filter. Matches mongokit's
+      // own `multiTenantPlugin` priority tier.
+      const policy = { priority: HOOK_PRIORITY.POLICY };
+      repo.on('before:getAll', injectTenantFilter, policy);
+      repo.on('before:getById', injectTenantFilter, policy);
+      repo.on('before:getByQuery', injectTenantFilter, policy);
+      repo.on('before:update', injectTenantFilter, policy);
+      repo.on('before:delete', injectTenantFilter, policy);
+      repo.on('before:updateMany', injectTenantFilter, policy);
+      repo.on('before:deleteMany', injectTenantFilter, policy);
+      repo.on('before:aggregatePaginate', injectTenantFilter, policy);
 
-      // For create operations: auto-inject tenantId into document data
-      repo.on('before:create', (context: TenantRepositoryContext) => {
-        if (context.bypassTenant && allowBypass) {
-          return;
-        }
-
-        const tenantId = context.tenantId || staticTenantId;
-
-        if (!tenantId && strict) {
-          throw new Error(
-            `[tenantFilterPlugin] Missing tenantId in create operation. ` +
-              `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`,
-          );
-        }
-
-        if (tenantId) {
-          // Inject tenant ID into document data
-          const data = (context as Record<string, unknown>).data as Record<string, unknown>;
-          if (data) {
-            // Handle nested fields (e.g., 'context.tenantId')
-            const fieldParts = tenantField.split('.');
-            if (fieldParts.length === 1) {
-              // Simple field
-              data[tenantField] = tenantId;
-            } else {
-              // Nested field - create nested object structure
-              let current = data;
-              for (let i = 0; i < fieldParts.length - 1; i++) {
-                const part = fieldParts[i];
-                if (!current[part] || typeof current[part] !== 'object') {
-                  current[part] = {};
-                }
-                current = current[part] as Record<string, unknown>;
-              }
-              current[fieldParts[fieldParts.length - 1]] = tenantId;
-            }
+      // For create operations: auto-inject tenantId into document data.
+      // Same POLICY priority as the read/write hooks above.
+      repo.on(
+        'before:create',
+        (context: TenantRepositoryContext) => {
+          if (context.bypassTenant && allowBypass) {
+            return;
           }
-        }
-      });
 
-      // For createMany operations: auto-inject tenantId into all documents
-      repo.on('before:createMany', (context: TenantRepositoryContext) => {
-        if (context.bypassTenant && allowBypass) {
-          return;
-        }
+          const tenantId = context.tenantId || staticTenantId;
 
-        const tenantId = context.tenantId || staticTenantId;
+          if (!tenantId && strict) {
+            throw new Error(
+              `[tenantFilterPlugin] Missing tenantId in create operation. ` +
+                `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`,
+            );
+          }
 
-        if (!tenantId && strict) {
-          throw new Error(
-            `[tenantFilterPlugin] Missing tenantId in createMany operation. ` +
-              `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`,
-          );
-        }
-
-        if (tenantId) {
-          const dataArray = (context as Record<string, unknown>).dataArray as Array<
-            Record<string, unknown>
-          >;
-          if (Array.isArray(dataArray)) {
-            dataArray.forEach((data) => {
-              // Handle nested fields
+          if (tenantId) {
+            // Inject tenant ID into document data
+            const data = (context as Record<string, unknown>).data as Record<string, unknown>;
+            if (data) {
+              // Handle nested fields (e.g., 'context.tenantId')
               const fieldParts = tenantField.split('.');
               if (fieldParts.length === 1) {
+                // Simple field
                 data[tenantField] = tenantId;
               } else {
+                // Nested field - create nested object structure
                 let current = data;
                 for (let i = 0; i < fieldParts.length - 1; i++) {
                   const part = fieldParts[i];
@@ -322,10 +308,56 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
                 }
                 current[fieldParts[fieldParts.length - 1]] = tenantId;
               }
-            });
+            }
           }
-        }
-      });
+        },
+        policy,
+      );
+
+      // For createMany operations: auto-inject tenantId into all documents
+      repo.on(
+        'before:createMany',
+        (context: TenantRepositoryContext) => {
+          if (context.bypassTenant && allowBypass) {
+            return;
+          }
+
+          const tenantId = context.tenantId || staticTenantId;
+
+          if (!tenantId && strict) {
+            throw new Error(
+              `[tenantFilterPlugin] Missing tenantId in createMany operation. ` +
+                `Pass 'tenantId' in options or set 'staticTenantId' in plugin config.`,
+            );
+          }
+
+          if (tenantId) {
+            const dataArray = (context as Record<string, unknown>).dataArray as Array<
+              Record<string, unknown>
+            >;
+            if (Array.isArray(dataArray)) {
+              dataArray.forEach((data) => {
+                // Handle nested fields
+                const fieldParts = tenantField.split('.');
+                if (fieldParts.length === 1) {
+                  data[tenantField] = tenantId;
+                } else {
+                  let current = data;
+                  for (let i = 0; i < fieldParts.length - 1; i++) {
+                    const part = fieldParts[i];
+                    if (!current[part] || typeof current[part] !== 'object') {
+                      current[part] = {};
+                    }
+                    current = current[part] as Record<string, unknown>;
+                  }
+                  current[fieldParts[fieldParts.length - 1]] = tenantId;
+                }
+              });
+            }
+          }
+        },
+        policy,
+      );
     },
   };
 }

@@ -1,15 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import mongoose from 'mongoose';
-import { sleepWorkflow } from '../docs/examples/sleep-workflow.js';
+import { setupTestDB } from '../../utils/setup.js';
+import { sleepWorkflow } from '../../../docs/examples/sleep-workflow.js';
 
 describe('Sleep Workflow', () => {
-  beforeAll(async () => {
-    await mongoose.connect('mongodb://localhost:27017/streamline-test');
-  });
+  beforeAll(setupTestDB);
 
-  afterAll(async () => {
+  afterAll(() => {
     sleepWorkflow.shutdown();
-    await mongoose.connection.close();
   });
 
   it('should handle sleep correctly', async () => {

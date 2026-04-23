@@ -10,7 +10,7 @@ export default defineConfig({
   dts: true,
   clean: true,
   deps: {
-    neverBundle: ['mongoose', '@classytic/mongokit', 'luxon', 'semver'],
+    neverBundle: ['mongoose', /^@classytic\//, 'luxon', 'semver'],
   },
   publint: 'ci-only',
   attw: 'ci-only',

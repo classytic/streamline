@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import mongoose from 'mongoose';
-import { createWorkflow } from '../src/index.js';
+import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+import { createWorkflow } from '../../../src/index.js';
 
 interface TestContext {
   value: number;
@@ -10,11 +11,7 @@ interface TestContext {
 }
 
 describe('WorkflowEngine', () => {
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect('mongodb://localhost:27017/streamline-test');
-    }
-  });
+  beforeAll(setupTestDB);
 
   afterEach(async () => {
     // Clean up test data - commented out due to paginate plugin issues

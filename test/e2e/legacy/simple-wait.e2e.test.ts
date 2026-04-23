@@ -1,17 +1,14 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import mongoose from 'mongoose';
-import { createWorkflow } from '../src/index.js';
+import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+import { createWorkflow } from '../../../src/index.js';
 
 interface SimpleContext {
   value: number;
 }
 
 describe('Simple Wait Test', () => {
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect('mongodb://localhost:27017/streamline-test');
-    }
-  });
+  beforeAll(setupTestDB);
 
   it('should pause at wait signal', async () => {
     const workflow = createWorkflow<SimpleContext>('simple-wait', {

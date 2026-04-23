@@ -5,7 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.2.0] - 2026-04-22 — PACKAGE_RULES alignment + `@classytic/primitives` integration + mongokit 3.11 / repo-core 0.2.0 compat
+## [2.2.0] - 2026-04-22 — PACKAGE_RULES alignment + `@classytic/primitives` integration + mongokit 3.11 / repo-core 0.2.0 compat + durability/observability hardening
+
+### 🛠 Additional hardening landed in the v2.2 cycle
+
+- **`ctx.waitFor(eventName)` now resumes from `globalEventBus`.** Previously
+  the default container built an isolated event bus, so
+  `globalEventBus.emit('user-action', { runId })` never reached the
+  workflow — the documented API silently hung. `handleEventWait()` now
+  subscribes on *three* channels: the container bus, `globalEventBus` (when
+  distinct), and the `SignalStore` (cross-process). Cleanup is symmetric:
+  `engine.shutdown()` and post-resume teardown both detach every channel.
+  The previously-quarantined `test/e2e/legacy/event-wait.e2e.test.ts` is
+  un-skipped and passes.
+- **Bulk-op tenant isolation.** `multiTenantPlugin` promoted `updateMany` and
+  `deleteMany` to class primitives in 3.11 — which meant streamline's
+  `tenantFilterPlugin` (which only hooked `before:update` / `before:delete`)
+  was silently bypassing tenant scope on bulk ops. The plugin now hooks
+  `before:updateMany` and `before:deleteMany`; a new integration suite
+  proves a tenant-scoped `updateMany({ status: 'running' }, ...)` touches
+  only that tenant's runs and that strict mode rejects bulk ops without a
+  tenant. (**Security-relevant.** Any consumer bumping past 2.2 should
+  verify their tenant scope is not relying on the old plugin contract.)
+- **`normalizeUpdate()` guardrail on `WorkflowRunRepository.updateOne()`.**
+  Update docs that mix operators and raw fields
+  (e.g. `{ $set: {...}, status: 'foo' }`) used to let Mongo silently drop
+  the non-operator keys. `updateOne` now runs the input through
+  `normalizeUpdate` and throws a loud error naming both the offending
+  operators and field keys. Plain field-shape objects still auto-wrap in
+  `$set`; well-formed operator docs pass through untouched.
+- **New update-doc builders** at [`src/storage/update-builders.ts`](src/storage/update-builders.ts):
+  `MongoUpdate`, `normalizeUpdate`, `runSet`, `runSetUnset`, plus the
+  step-level helpers moved over from the old `step-updater.ts`
+  (`buildStepUpdateOps`, `applyStepUpdates`, `toPlainRun`). `runSet()` auto-
+  stamps `updatedAt`, eliminating a bug class where only some write paths
+  set it. Engine and executor migrated to the builders at 8 call sites.
+- **`hasConcurrencyDrafts()` bounded query.** Single-roundtrip `exists`
+  probe — the scheduler's `hasActiveWorkflows()` now uses it instead of
+  `countConcurrencyDrafts()` when the answer is just "is there any work?".
+- **Heartbeat backpressure.** After
+  `TIMING.HEARTBEAT_FAILURE_ABORT_THRESHOLD` (default 5) consecutive
+  heartbeat-write failures, the executor now aborts the step's
+  `AbortController` so the handler exits before the stale-detector flips
+  the run to crashed and re-claims it on another worker. Escalation
+  surfaces through `engine:error` context values
+  `heartbeat-warning` → `heartbeat-critical` → `heartbeat-abort`.
+- **No more swallowed draft-promotion errors.** `promoteConcurrencyDrafts`
+  now emits `engine:error` with context `'promote-concurrency-draft-failure'`
+  on each per-draft failure instead of `catch {}`. Operators can see stuck
+  promotions; the scheduler still retries on its next poll.
+- **Exhaustive `LEGACY_TO_CANONICAL` map.** Retyped as
+  `Record<WorkflowEventName, StreamlineEventName>` — adding a new event to
+  `EventPayloadMap` without mapping it in `event-constants.ts` is now a
+  compile error, so the bridge physically cannot silently drop events. A
+  runtime sanity test guards against accidental widening.
+- **`skipStep` helper.** Extracted the conditional-skip "mark-skipped-and-
+  advance" shape (`status: 'skipped'`, `completedAt/endedAt`, `durationMs: 0`,
+  emit `step:skipped`) into a single method. Future pre-execution skip
+  reasons (feature-flag, circuit-breaker) land here.
+- **New tests** — 34 new assertions across:
+  - [`test/unit/update-builders.test.ts`](test/unit/update-builders.test.ts)
+    (19 cases, normalize guardrail + builders + `applyStepUpdates`)
+  - [`test/unit/event-transport.test.ts`](test/unit/event-transport.test.ts)
+    — added exhaustiveness sanity for `LEGACY_TO_CANONICAL`
+  - [`test/integration/repository-primitives.test.ts`](test/integration/repository-primitives.test.ts)
+    (12 cases, `updateMany` / `deleteMany` with and without tenant scope,
+    `hasConcurrencyDrafts`, the mixed-update guardrail)
+  - [`test/integration/heartbeat-backpressure.test.ts`](test/integration/heartbeat-backpressure.test.ts)
+    (2 cases, abort threshold + transient-failure tolerance)
+
+### ⚠️ Security note — bulk-op tenant scope
+
+If any consumer was relying on pre-v2.2 streamline behavior where the
+tenant filter plugin did NOT hook bulk ops, their call sites will now be
+tenant-scoped. This is the correct behavior; the previous bypass was a
+bug. Non-multi-tenant deployments are unaffected.
+
+
 
 This release aligns streamline with the monorepo's PACKAGE_RULES and
 testing-infrastructure standards, and adopts `@classytic/primitives` as the

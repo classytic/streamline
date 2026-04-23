@@ -1,16 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import mongoose from 'mongoose';
-import { approvalWorkflow } from '../docs/examples/wait-workflow.js';
+import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+import { approvalWorkflow } from '../../../docs/examples/wait-workflow.js';
 
 describe('Wait Workflow', () => {
-  beforeAll(async () => {
-    await mongoose.connect('mongodb://localhost:27017/streamline_test');
-  });
+  beforeAll(setupTestDB);
 
-  afterAll(async () => {
-    await mongoose.connection.dropDatabase();
-    await mongoose.disconnect();
-  });
+  afterAll(teardownTestDB);
 
   it('should wait for approval and resume', async () => {
     const run = await approvalWorkflow.start({

@@ -454,8 +454,7 @@ export class SmartScheduler {
 
       // Concurrency gating: check how many slots are available
       if (this.config.maxConcurrentExecutions !== Infinity) {
-        const running = await this.repository.getRunningRuns();
-        const activeCount = running.length;
+        const activeCount = await this.repository.countRunning();
         if (activeCount >= this.config.maxConcurrentExecutions) {
           // All slots full — skip this poll cycle
           const duration = Date.now() - startTime;
@@ -621,8 +620,7 @@ export class SmartScheduler {
 
   private async hasWaitingWorkflows(): Promise<boolean> {
     try {
-      const waiting = await this.repository.getWaitingRuns();
-      return waiting.length > 0;
+      return await this.repository.hasWaitingWorkflows();
     } catch (error) {
       this.emitError('check-waiting', error);
       return false;
@@ -637,8 +635,7 @@ export class SmartScheduler {
   private async hasActiveWorkflows(): Promise<boolean> {
     try {
       // Check for waiting workflows (need resume/retry)
-      const waiting = await this.repository.getWaitingRuns();
-      if (waiting.length > 0) return true;
+      if (await this.repository.hasWaitingWorkflows()) return true;
 
       // Check for scheduled workflows ready to execute (timezone-aware)
       const scheduled = await this.repository.getScheduledWorkflowsReadyToExecute(new Date(), {
@@ -651,9 +648,9 @@ export class SmartScheduler {
       const stale = await this.repository.getStaleRunningWorkflows(this.config.staleThreshold, 1);
       if (stale.length > 0) return true;
 
-      // Check for concurrency-queued drafts waiting for promotion
-      const draftCount = await this.repository.countConcurrencyDrafts();
-      if (draftCount > 0) return true;
+      // Check for concurrency-queued drafts waiting for promotion (bounded
+      // exists-query — short-circuits on the first match).
+      if (await this.repository.hasConcurrencyDrafts()) return true;
 
       return false;
     } catch (error) {

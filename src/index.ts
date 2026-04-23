@@ -83,6 +83,22 @@ export {
   createWorkflowRepository,
   workflowRunRepository,
 } from './storage/run.repository.js';
+/**
+ * Typed Mongo update-doc builders used by `WorkflowRunRepository.updateOne()`.
+ *
+ * `MongoUpdate` is the public shape of a well-formed operator update
+ * (`$set`/`$unset`/`$inc`/`$push`/`$pull`/`$addToSet`). `normalizeUpdate`
+ * is the runtime guard that rejects malformed shapes that mix operators
+ * with raw field keys (Mongo would silently drop them). `runSet` /
+ * `runSetUnset` are the builders every streamline write path uses.
+ */
+export type { MongoUpdate } from './storage/update-builders.js';
+export {
+  buildStepUpdateOps,
+  normalizeUpdate,
+  runSet,
+  runSetUnset,
+} from './storage/update-builders.js';
 
 // ============================================================================
 // Events & Observability
@@ -223,6 +239,32 @@ export type { SchedulerStats, SmartSchedulerConfig } from './execution/smart-sch
  * Used internally by resumeHook() - exposed for advanced use cases.
  */
 export { hookRegistry, workflowRegistry } from './execution/engine.js';
+
+// ============================================================================
+// Arc-compatible Event Transport
+// ============================================================================
+
+/**
+ * Arc-compatible event transport — `DomainEvent`, `EventTransport`,
+ * `EventHandler` shapes are structurally identical to `@classytic/arc`'s.
+ * Pass any arc transport (Memory/Redis/Kafka) into `createContainer({
+ * eventTransport })` and subscribe glob-style:
+ *
+ * ```typescript
+ * engine.container.eventTransport.subscribe('streamline:workflow.*', handler);
+ * ```
+ */
+export type { DomainEvent, EventHandler, EventTransport } from '@classytic/primitives/events';
+export {
+  bridgeBusToTransport,
+  createEvent,
+  type EventContext,
+  type InProcessBusOptions,
+  InProcessStreamlineBus,
+  LEGACY_TO_CANONICAL,
+  STREAMLINE_EVENTS,
+  type StreamlineEventName,
+} from './events/index.js';
 
 // ============================================================================
 // Error Classes - For Error Handling

@@ -1,22 +1,31 @@
 /**
- * Simple test to verify event-based waits work with globalEventBus.emit()
+ * Verifies that `ctx.waitFor(eventName)` resumes workflows when the event is
+ * emitted on `globalEventBus` — even when the workflow's container uses an
+ * isolated bus (the default).
+ *
+ * Fixed in v2.2: `handleEventWait()` now also subscribes on `globalEventBus`
+ * (unless the container is already using it), so out-of-container emissions
+ * wake the run.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { createWorkflow, globalEventBus } from '../src/index.js';
-import { setupTestDB, cleanupTestDB, teardownTestDB, waitFor } from './utils/setup.js';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { createWorkflow, globalEventBus } from '../../../src/index.js';
+import { setupTestDB, waitFor } from '../../utils/setup.js';
 
 describe('Event-Based Wait Fix', () => {
-  beforeAll(async () => {
-    await setupTestDB();
-  });
+  beforeAll(setupTestDB);
 
-  afterAll(async () => {
-    await cleanupTestDB();
-    await teardownTestDB();
+  // The e2e tier runs in a singleFork — module state (including
+  // `globalEventBus` and the global `workflowRegistry`) persists across
+  // files. Strip any leftover `'user-action'` listeners a prior test left
+  // behind so this test owns the event.
+  afterEach(() => {
+    globalEventBus.removeAllListeners('user-action');
   });
 
   it('should resume workflow when event is emitted via globalEventBus', async () => {
+    globalEventBus.removeAllListeners('user-action'); // defensive entry
+
     let eventReceived = false;
 
     const workflow = createWorkflow('event-wait-test', {
@@ -38,11 +47,12 @@ describe('Event-Based Wait Fix', () => {
         },
       },
       context: () => ({ started: false, completed: false, eventData: null }),
+      autoExecute: false, // we drive execute() manually; avoids racing
     });
 
     // Start workflow
     const run = await workflow.start({});
-    
+
     // Execute until it waits
     await workflow.execute(run._id);
 
