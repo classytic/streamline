@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from './utils/setup.js';
+import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
 
 // ============================================================================
 // Proposal #1 & #4: Export Workflow and WorkflowConfig types
@@ -15,7 +15,7 @@ import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from './utils/s
 
 describe('Proposal #1 & #4: Export Workflow and WorkflowConfig types', () => {
   it('should export Workflow type from package index', async () => {
-    const mod = await import('../src/index.js');
+    const mod = await import('../../src/index.js');
     // Workflow is a type-only export — we verify it exists via the module's type exports
     // At runtime, we verify createWorkflow is exported and returns an object matching the Workflow interface
     expect(mod.createWorkflow).toBeDefined();
@@ -25,13 +25,13 @@ describe('Proposal #1 & #4: Export Workflow and WorkflowConfig types', () => {
     // This test validates the type export works at the module boundary.
     // If Workflow type is not exported, consumers get TS4023.
     // We verify by dynamically importing and checking the type re-export exists.
-    const indexModule = await import('../src/index.js');
+    const indexModule = await import('../../src/index.js');
 
     // createWorkflow should be a function
     expect(typeof indexModule.createWorkflow).toBe('function');
 
     // The module should export from workflow/define.js which now exports Workflow
-    const defineModule = await import('../src/workflow/define.js');
+    const defineModule = await import('../../src/workflow/define.js');
     // Workflow and WorkflowConfig are type-only exports — they won't appear at runtime
     // But we can verify the module doesn't throw when imported
     expect(defineModule.createWorkflow).toBeDefined();
@@ -42,7 +42,7 @@ describe('Proposal #1 & #4: Export Workflow and WorkflowConfig types', () => {
     // This is a structural test — TypeScript compilation is the real validator
     const fs = await import('node:fs');
     const indexSource = fs.readFileSync(
-      new URL('../src/index.ts', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'),
+      new URL('../../src/index.ts', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'),
       'utf-8'
     );
 
@@ -69,7 +69,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
   });
 
   it('should accept StepConfig objects alongside plain handlers', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     interface Ctx { value: number }
 
@@ -99,7 +99,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
   });
 
   it('should apply per-step timeout from StepConfig', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     interface Ctx { result?: string }
 
@@ -134,7 +134,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
   });
 
   it('should apply per-step retries from StepConfig', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     interface Ctx { attempts: number }
 
@@ -167,7 +167,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
   });
 
   it('should use workflow defaults when StepConfig omits timeout/retries', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     const workflow = createWorkflow('step-config-defaults', {
       steps: {
@@ -196,7 +196,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
   });
 
   it('should execute workflow with mixed StepConfig and plain handlers', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     interface Ctx { results: string[] }
 
@@ -233,7 +233,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
   });
 
   it('should respect per-step timeout during actual execution', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     interface Ctx { done: boolean }
 
@@ -264,7 +264,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
   });
 
   it('should support conditional execution via StepConfig', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     interface Ctx { skipOptional: boolean; results: string[] }
 
@@ -325,7 +325,7 @@ describe('Proposal #3: Scheduler concurrency limit', () => {
 
   it('should accept maxConcurrentExecutions in SmartSchedulerConfig', async () => {
     const { SmartScheduler, DEFAULT_SCHEDULER_CONFIG } = await import(
-      '../src/execution/smart-scheduler.js'
+      '../../src/execution/smart-scheduler.js'
     );
 
     // Default should be Infinity (backwards compatible)
@@ -333,7 +333,7 @@ describe('Proposal #3: Scheduler concurrency limit', () => {
   });
 
   it('should expose maxConcurrentExecutions through engine configure', async () => {
-    const { createWorkflow } = await import('../src/index.js');
+    const { createWorkflow } = await import('../../src/index.js');
 
     const workflow = createWorkflow('concurrency-config', {
       steps: {
@@ -351,8 +351,8 @@ describe('Proposal #3: Scheduler concurrency limit', () => {
   });
 
   it('should track running count via repository', async () => {
-    const { createWorkflow } = await import('../src/index.js');
-    const { workflowRunRepository } = await import('../src/storage/run.repository.js');
+    const { createWorkflow } = await import('../../src/index.js');
+    const { workflowRunRepository } = await import('../../src/storage/run.repository.js');
 
     // Create a slow workflow
     const workflow = createWorkflow('concurrency-test', {
@@ -371,8 +371,8 @@ describe('Proposal #3: Scheduler concurrency limit', () => {
     const run3 = await workflow.start({});
 
     // All should be in running state (since autoExecute is false, they're actually running status from start)
-    const running = await workflowRunRepository.getRunningRuns();
-    expect(running.length).toBeGreaterThanOrEqual(3);
+    const runningCount = await workflowRunRepository.countRunning();
+    expect(runningCount).toBeGreaterThanOrEqual(3);
 
     // Execute them
     await Promise.all([

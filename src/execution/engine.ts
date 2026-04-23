@@ -1,6 +1,6 @@
 import { TIMING } from '../config/constants.js';
 import type { StreamlineContainer } from '../core/container.js';
-import type { WorkflowEventBus } from '../core/events.js';
+import { globalEventBus, type WorkflowEventBus } from '../core/events.js';
 import { isTerminalState } from '../core/status.js';
 import type {
   StepState,
@@ -11,6 +11,7 @@ import type {
 } from '../core/types.js';
 import type { WorkflowCache } from '../storage/cache.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import { runSet } from '../storage/update-builders.js';
 import {
   InvalidStateError,
   StepNotFoundError,
@@ -120,31 +121,38 @@ export const workflowRegistry = new WorkflowRegistryGlobal();
 // ============================================================================
 
 /**
- * Clean up all event listeners for a specific workflow
+ * Clean up all event listeners for a specific workflow.
+ *
+ * Listeners fall into three key shapes:
+ *   - `<runId>:<event>`              → container event-bus listener
+ *   - `global:<runId>:<event>`       → globalEventBus listener (same fn wrapped)
+ *   - `signal:<runId>:<event>`       → SignalStore unsub closure
  */
 function cleanupEventListeners(
   runId: string,
   listeners: Map<string, { listener: (...args: unknown[]) => void; eventName: string }>,
   eventBus: WorkflowEventBus,
 ): void {
-  const prefix = `${runId}:`;
-  const signalPrefix = `signal:${runId}:`;
-  const keysToRemove = Array.from(listeners.keys()).filter(
-    (key) => key.startsWith(prefix) || key.startsWith(signalPrefix),
+  const prefixes = [`${runId}:`, `global:${runId}:`, `signal:${runId}:`];
+  const keysToRemove = Array.from(listeners.keys()).filter((key) =>
+    prefixes.some((p) => key.startsWith(p)),
   );
 
   for (const key of keysToRemove) {
     const entry = listeners.get(key);
-    if (entry) {
-      if (key.startsWith('signal:')) {
-        // Signal store unsub: the listener IS the unsub closure — call it
-        entry.listener();
-      } else {
-        // Event bus listener: remove from EventEmitter
-        eventBus.off(entry.eventName, entry.listener);
-      }
-      listeners.delete(key);
+    if (!entry) continue;
+
+    if (key.startsWith('signal:')) {
+      // Signal store unsub: the listener IS the unsub closure — call it.
+      entry.listener();
+    } else if (key.startsWith('global:')) {
+      // Remove from globalEventBus (shared across all containers).
+      globalEventBus.off(entry.eventName, entry.listener);
+    } else {
+      // Container event bus listener.
+      eventBus.off(entry.eventName, entry.listener);
     }
+    listeners.delete(key);
   }
 }
 
@@ -176,7 +184,7 @@ async function handleShortDelayOrSchedule(
         status: 'waiting',
         paused: { $ne: true },
       },
-      { status: 'running', updatedAt: new Date(), lastHeartbeat: new Date() },
+      runSet({ status: 'running', lastHeartbeat: new Date() }),
       { bypassTenant: true },
     );
 
@@ -454,17 +462,14 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         const now = new Date();
         await this.container.repository.updateOne(
           { _id: runId },
-          {
-            $set: {
-              status: 'failed',
-              updatedAt: now,
-              endedAt: now,
-              error: {
-                message: `Step "${stepId}" not found — code version changed while workflow was in-flight`,
-                code: 'VERSION_MISMATCH',
-              },
+          runSet({
+            status: 'failed',
+            endedAt: now,
+            error: {
+              message: `Step "${stepId}" not found — code version changed while workflow was in-flight`,
+              code: 'VERSION_MISMATCH',
             },
-          },
+          }),
           { bypassTenant: true },
         );
 
@@ -569,8 +574,14 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         for (const draft of matching) {
           try {
             await this.executeRetry(draft._id);
-          } catch {
-            // Failed to promote — scheduler will retry on next poll
+          } catch (err) {
+            // Emit per-draft failure so operators can see stuck promotions.
+            // The scheduler still retries on its next poll — this is advisory.
+            this.container.eventBus.emit('engine:error', {
+              runId: draft._id,
+              error: toError(err),
+              context: 'promote-concurrency-draft-failure',
+            });
           }
         }
       } catch (err) {
@@ -781,7 +792,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
     await this.container.repository.updateOne(
       { _id: runId },
-      { status: 'failed', updatedAt: now, endedAt: now, error: errorPayload },
+      runSet({ status: 'failed', endedAt: now, error: errorPayload }),
       { bypassTenant: true },
     );
 
@@ -795,18 +806,29 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   }
 
   /**
-   * Register event listener for event-based waits
-   * IMPORTANT: Paused workflows will NOT be resumed by events until explicitly resumed by user
+   * Register event listener for event-based waits (`ctx.waitFor(name)`).
+   *
+   * Listens on THREE channels so `globalEventBus.emit()`, container-bus
+   * emissions, and cross-process `SignalStore` messages all wake the run:
+   *
+   *   1. The container's own event bus — covers handlers inside the same
+   *      container that call `container.eventBus.emit()`.
+   *   2. `globalEventBus` — covers callers outside the container (HTTP
+   *      routes, workers in other containers, tests) that emit via
+   *      `globalEventBus.emit()`. Skipped if the container is already using
+   *      globalEventBus to avoid double-delivery.
+   *   3. `signalStore` — covers cross-process delivery via Redis/Kafka/etc.
+   *
+   * Paused workflows ignore events but keep their listeners active.
    */
   private handleEventWait(runId: string, eventName: string): void {
     const listenerKey = `${runId}:${eventName}`;
-
     if (this.eventListeners.has(listenerKey)) return;
 
     const listener = async (...args: unknown[]) => {
       const payload = args[0] as WorkflowEventPayload | undefined;
       try {
-        // Warn about unintentional broadcasts
+        // Warn about unintentional broadcasts.
         if (payload && !payload.runId && !payload.broadcast) {
           logger.warn(
             `Event '${eventName}' emitted without runId or broadcast flag. ` +
@@ -815,22 +837,18 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           );
         }
 
-        // Resume if: no payload, runId matches, or explicit broadcast
-        if (!payload || payload.runId === runId || payload.broadcast === true) {
-          // Check if workflow is paused before resuming
-          const run = await this.get(runId);
-          if (run?.paused) {
-            // Workflow is paused - ignore event but keep listener active
-            return;
-          }
+        // Resume if: no payload, runId matches, or explicit broadcast.
+        if (payload && payload.runId !== runId && payload.broadcast !== true) return;
 
-          const entry = this.eventListeners.get(listenerKey);
-          if (entry) {
-            this.container.eventBus.off(entry.eventName, entry.listener);
-            this.eventListeners.delete(listenerKey);
-          }
-          await this.resume(runId, payload?.data);
-        }
+        // Paused workflows ignore events but keep listeners active until
+        // explicit resume.
+        const run = await this.get(runId);
+        if (run?.paused) return;
+
+        // Tear down every channel for this (run, event) pair before resuming
+        // — prevents a second delivery from calling resume() mid-flight.
+        cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
+        await this.resume(runId, payload?.data);
       } catch (err) {
         this.container.eventBus.emit('engine:error', {
           runId,
@@ -840,12 +858,21 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       }
     };
 
+    // 1. Container event bus.
     this.container.eventBus.on(eventName, listener);
     this.eventListeners.set(listenerKey, { listener, eventName });
 
-    // Also subscribe via SignalStore for cross-process event delivery.
-    // If the user configured a Redis/Kafka signal store, this enables
-    // events emitted on one worker to resume workflows on another.
+    // 2. Global event bus — only if distinct from the container bus, to avoid
+    //    double-fire when the user chose `eventBus: 'global'`.
+    if (this.container.eventBus !== globalEventBus) {
+      globalEventBus.on(eventName, listener);
+      this.eventListeners.set(`global:${listenerKey}`, {
+        listener: listener as (...args: unknown[]) => void,
+        eventName,
+      });
+    }
+
+    // 3. Cross-process signal store (Redis/Kafka if configured).
     const signalUnsub = this.container.signalStore.subscribe(
       `streamline:event:${eventName}`,
       (data) => {
@@ -856,27 +883,13 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       },
     );
 
-    // Store unsub for cleanup
-    const signalKey = `signal:${listenerKey}`;
-    const currentEntry = this.eventListeners.get(listenerKey);
-    if (currentEntry) {
-      const origListener = currentEntry.listener;
-      // Wrap cleanup to also unsubscribe from signal store
-      this.eventListeners.set(listenerKey, {
-        ...currentEntry,
-        listener: ((...args: unknown[]) => {
-          origListener(...args);
-        }) as typeof origListener,
-      });
-      // Store signal unsub separately so cleanupEventListeners can call it
-      this.eventListeners.set(signalKey, {
-        listener: (() => {
-          if (typeof signalUnsub === 'function') signalUnsub();
-          else if (signalUnsub instanceof Promise) signalUnsub.then((fn) => fn());
-        }) as unknown as typeof origListener,
-        eventName: signalKey,
-      });
-    }
+    this.eventListeners.set(`signal:${listenerKey}`, {
+      listener: (() => {
+        if (typeof signalUnsub === 'function') signalUnsub();
+        else if (signalUnsub instanceof Promise) signalUnsub.then((fn) => fn());
+      }) as (...args: unknown[]) => void,
+      eventName: `signal:${listenerKey}`,
+    });
   }
 
   /**
@@ -931,7 +944,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     if (run.paused) {
       const claimResult = await this.container.repository.updateOne(
         { _id: runId, paused: true },
-        { $set: { paused: false, updatedAt: new Date() } },
+        runSet({ paused: false }),
         { bypassTenant: true },
       );
 
@@ -981,7 +994,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Otherwise, just continue execution (pending step or retry backoff)
     run.status = 'running';
     run.lastHeartbeat = new Date();
-    await this.container.repository.update(runId, run, { bypassTenant: true });
+    await this.container.repository.updateById(runId, run, { bypassTenant: true });
     this.container.cache.set(run);
     return this.execute(runId);
   }
@@ -1003,7 +1016,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         status: 'running',
         $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
       },
-      { lastHeartbeat: new Date(), updatedAt: new Date() },
+      runSet({ lastHeartbeat: new Date() }),
       { bypassTenant: true },
     );
 
@@ -1059,13 +1072,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           },
         },
       },
-      {
-        $set: {
-          status: 'running',
-          updatedAt: now,
-          lastHeartbeat: now,
-        },
-      },
+      runSet({ status: 'running', lastHeartbeat: now }),
       { bypassTenant: true },
     );
 
@@ -1078,14 +1085,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           'scheduling.executionTime': { $lte: now },
           paused: { $ne: true },
         },
-        {
-          $set: {
-            status: 'running',
-            updatedAt: now,
-            lastHeartbeat: now,
-            startedAt: now,
-          },
-        },
+        runSet({ status: 'running', lastHeartbeat: now, startedAt: now }),
         { bypassTenant: true },
       );
     }
@@ -1109,14 +1109,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         if (concurrencyLimit === undefined || activeCount < concurrencyLimit) {
           claimResult = await this.container.repository.updateOne(
             { _id: runId, status: 'draft', paused: { $ne: true } },
-            {
-              $set: {
-                status: 'running',
-                updatedAt: now,
-                lastHeartbeat: now,
-                startedAt: now,
-              },
-            },
+            runSet({ status: 'running', lastHeartbeat: now, startedAt: now }),
             { bypassTenant: true },
           );
         }
@@ -1151,7 +1144,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     const run = await this.getOrThrow(runId);
 
     const rewoundRun = this.registry.rewindRun(run, stepId);
-    await this.container.repository.update(runId, rewoundRun, { bypassTenant: true });
+    await this.container.repository.updateById(runId, rewoundRun, { bypassTenant: true });
     this.container.cache.set(rewoundRun);
 
     return rewoundRun;
@@ -1177,7 +1170,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       updatedAt: new Date(),
     };
 
-    await this.container.repository.update(runId, cancelledRun, { bypassTenant: true });
+    await this.container.repository.updateById(runId, cancelledRun, { bypassTenant: true });
 
     this.scheduler.cancelSchedule(runId);
     cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
@@ -1216,7 +1209,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       updatedAt: new Date(),
     };
 
-    await this.container.repository.update(runId, pausedRun, { bypassTenant: true });
+    await this.container.repository.updateById(runId, pausedRun, { bypassTenant: true });
     this.scheduler.cancelSchedule(runId);
     this.container.cache.set(pausedRun);
 
@@ -1263,9 +1256,17 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Abort all in-flight step executions (stops heartbeat timers + timeouts)
     this.executor.abortAll();
 
-    // Clean up all event listeners
-    for (const [, entry] of this.eventListeners.entries()) {
-      this.container.eventBus.off(entry.eventName, entry.listener);
+    // Clean up all event listeners — must respect the three key prefixes
+    // (container bus / global bus / signal store) or globalEventBus
+    // subscriptions survive between tests and leak across engine instances.
+    for (const [key, entry] of this.eventListeners.entries()) {
+      if (key.startsWith('signal:')) {
+        entry.listener();
+      } else if (key.startsWith('global:')) {
+        globalEventBus.off(entry.eventName, entry.listener);
+      } else {
+        this.container.eventBus.off(entry.eventName, entry.listener);
+      }
     }
     this.eventListeners.clear();
   }

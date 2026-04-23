@@ -1,555 +1,188 @@
 # Streamline Testing Guide
 
-Comprehensive testing guide for @classytic/streamline workflow engine.
+Testing conventions for `@classytic/streamline`. Aligned with the monorepo
+[testing-infrastructure.md](../testing-infrastructure.md).
 
-## Test Setup
+## Tiers
 
-### Vitest v3 Configuration
+Every test lives in **exactly one** tier. Pick based on what the test
+needs, not where the source file lives.
 
-The project uses **Vitest v3** for testing with the following setup:
+| Tier | Directory | May use | Timeout | Runs |
+|---|---|---|---|---|
+| **unit** | `test/unit/`, plus `test/core/`\* | pure functions, mocks, in-memory stores | **10 s** | every commit, watch |
+| **integration** | `test/integration/`, `test/plugins/`, `test/scheduling/`, `test/security/`, `test/telemetry/` | `mongodb-memory-server`, scripted MongoKit repos | **30 s** | every commit, pre-push |
+| **e2e** | `test/e2e/`, `test/regression/`, `test/pagination/`, `test/review/` | full workflow scenarios, real timing, scheduler polls | **120 s** | nightly, on-demand |
+
+\* `test/core/` intentionally lives in the e2e tier today — it exercises
+the engine end-to-end.
+
+**Invariant:** unit + integration must run with **no network, no API keys,
+no live MongoDB**. If a test needs any of those, it belongs in e2e.
+
+## Scripts
+
+```bash
+pnpm test               # unit + integration (fast CI path, ~20 s)
+pnpm test:unit          # unit only, ~5 s
+pnpm test:integration   # integration only, ~20 s
+pnpm test:e2e           # e2e only, ~2-3 min (mongodb-memory-server)
+pnpm test:all           # everything
+pnpm test:watch         # unit + integration in watch mode
+pnpm test:coverage      # unit + integration with coverage report
+```
+
+**Rules:**
+- `pnpm test` (no args) never runs e2e. Keep it under 30 s on a dev laptop
+  — if it crosses that, the next thing developers do is stop running tests
+  locally.
+- CI runs `pnpm test` on PRs. `pnpm test:e2e` runs nightly.
+- `pnpm prepublishOnly` runs `test:all` (unit + integration + e2e + build)
+  so releases see the full suite.
+
+## Config
+
+One [vitest.config.ts](./vitest.config.ts) with `projects: [unit, integration, e2e]`.
+Tier-specific timeouts live on each project; global options (coverage,
+`setupFiles`) are inherited via `extends: true`.
 
 ```typescript
-// vitest.config.ts
-export default defineConfig({
-  test: {
-    globals: true,
-    environment: 'node',
-    coverage: {
-      provider: 'v8',
-      reporter: ['text', 'json', 'html'],
-    },
-    testTimeout: 30000,
-    hookTimeout: 30000,
-  },
-});
+// vitest.config.ts (excerpt)
+projects: [
+  { extends: true, test: { name: 'unit', testTimeout: 10_000, ... } },
+  { extends: true, test: { name: 'integration', testTimeout: 30_000, ... } },
+  { extends: true, test: { name: 'e2e', testTimeout: 120_000, ... } },
+]
 ```
 
-### Dependencies
+## Helpers
 
-```json
-{
-  "devDependencies": {
-    "vitest": "^3.0.0",
-    "@vitest/coverage-v8": "^3.0.0",
-    "mongoose": "^8.0.0"
-  }
-}
-```
-
-## Running Tests
-
-### Run all tests
-```bash
-npm test
-```
-
-### Run tests in watch mode
-```bash
-npm run test:watch
-```
-
-### Run with coverage
-```bash
-npm test -- --coverage
-```
-
-### Run specific test file
-```bash
-npm test -- hello-world.test.ts
-```
-
-### Run tests matching pattern
-```bash
-npm test -- --grep "parallel"
-```
-
-## Test Structure
-
-### Test Files
-
-Located in `test/` directory:
-
-1. **hello-world.test.ts** - Basic workflow execution
-2. **sleep-workflow.test.ts** - Timer functionality
-3. **wait-workflow.test.ts** - Human-in-the-loop approval
-4. **parallel.test.ts** - Parallel step execution (all, race, any modes)
-5. **conditional.test.ts** - Conditional step execution with built-in conditions
-6. **engine.test.ts** - Comprehensive engine tests (start, execute, resume, rewind, etc.)
-7. **newsletter.test.ts** - Real-world newsletter automation workflow
-8. **ai-pipeline.test.ts** - AI content pipeline with quality checks
-9. **memory-concurrency.test.ts** - Memory management and concurrency control
-
-### Test Coverage
-
-#### Core Engine (engine.test.ts)
-- ✅ Start and execute simple workflow
-- ✅ Handle workflow with retry
-- ✅ Handle workflow failure after max retries
-- ✅ Handle wait and resume
-- ✅ Handle pause and resume
-- ✅ Handle cancel
-- ✅ Handle rewindTo
-- ✅ Retrieve workflow from cache
-- ✅ Handle step timeout
-- ✅ Handle getOutput from previous steps
-
-#### Parallel Execution (parallel.test.ts)
-- ✅ Execute steps in parallel (all mode)
-- ✅ Execute with race mode (fastest wins)
-- ✅ Validate isParallelStep type guard
-- ✅ Handle parallel execution errors gracefully
-
-#### Conditional Steps (conditional.test.ts)
-- ✅ Skip steps based on condition
-- ✅ Validate isConditionalStep type guard
-- ✅ Test built-in condition helpers (hasValue, equals, greaterThan, lessThan, and, or, not)
-- ✅ Test skipIf and runIf conditions
-- ✅ Create custom conditions
-
-#### Memory & Concurrency (memory-concurrency.test.ts)
-- ✅ Track memory usage
-- ✅ Detect memory threshold exceeded
-- ✅ Trigger garbage collection
-- ✅ Start and stop automatic GC
-- ✅ Limit concurrent workflow execution
-- ✅ Limit concurrent step execution
-- ✅ Queue tasks when limit reached
-- ✅ Get concurrency stats
-- ✅ Integrate with workflow engine
-
-#### Examples Tests
-- ✅ Newsletter automation workflow
-- ✅ AI pipeline workflow
-- ✅ Sleep workflow
-- ✅ Wait/resume workflow
-- ✅ Hello world workflow
-
-## Local Build Testing
-
-### Example Project Setup
-
-The `streamline-example` directory demonstrates importing from local build:
-
-```json
-{
-  "dependencies": {
-    "@classytic/streamline": "file:../streamline"
-  }
-}
-```
-
-### Running Example Project
-
-```bash
-cd ../streamline-example
-npm install
-npm start    # Run example application
-npm test     # Run integration tests
-```
-
-### Integration Tests (streamline-example/src/example.test.ts)
-
-- ✅ Import and execute workflow from local build
-- ✅ Verify all exports are available
-- ✅ Handle wait and resume from local build
-
-## MongoDB Setup for Tests
-
-Tests require a running MongoDB instance:
-
-```bash
-# Using Docker
-docker run -d -p 27017:27017 --name mongodb mongo:8
-
-# Or install MongoDB locally
-# https://www.mongodb.com/docs/manual/installation/
-```
-
-Update connection string in tests if needed:
-```typescript
-await mongoose.connect('mongodb://localhost:27017/streamline-test');
-```
-
-## Writing Tests
-
-### Basic Test Template
+`test/helpers/` is the single source of truth for shared test code. Import
+from the barrel — **do not write parallel helpers in individual test files**.
 
 ```typescript
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import mongoose from 'mongoose';
-import { createWorkflow } from '@classytic/streamline';
+import {
+  // lifecycle
+  useTestDb,         // beforeAll(setup) + afterEach(clean) + afterAll(teardown)
+  useTestDbPersistent,
+  // fixtures
+  makeWorkflowRun,   // in-memory WorkflowRun builder (overrides merge shallowly)
+  makeStepState,
+  uniqueWorkflowId,  // collision-free id for parallel tests
+  uniqueTenantId,
+  // assertions
+  expectRunStatus,   // rich failure messages with full run context
+  expectStepStatus,
+  expectStepSequence,
+  expectDone,
+  // mocks
+  mockResolved,
+  mockFlaky,         // fails `failCount` times then succeeds — for retry tests
+} from '../helpers';
+```
 
-interface TestContext {
-  value: number;
-  result?: number;
-}
+**Rules for helpers** (from testing-infrastructure.md §3):
+1. Helpers never call `describe` / `it`. They return values or register hooks.
+2. Every fixture builder takes `Partial<T>` overrides — never hardcode ids.
+3. Mocks used inside `vi.mock(...)` factories must be loaded via async
+   dynamic import — see the warning at the top of
+   [test/helpers/mocks.ts](./test/helpers/mocks.ts).
 
-describe('My Workflow Test', () => {
-  beforeAll(async () => {
-    await mongoose.connect('mongodb://localhost:27017/test');
-  });
+## Writing a test — canonical shape
 
-  afterAll(async () => {
-    await mongoose.connection.close();
-  });
+```typescript
+import { describe, it, expect } from 'vitest';
+import { createWorkflow } from '../../src/index.js';
+import { useTestDb, expectDone, uniqueWorkflowId } from '../helpers';
 
-  it('should execute workflow', async () => {
-    const workflow = createWorkflow<TestContext, { value: number }>('test-workflow', {
-      steps: {
-        compute: async (ctx) => {
-          const result = ctx.context.value * 2;
-          await ctx.set('result', result);
-          return { result };
-        },
-      },
-      context: (input) => ({ value: input.value }),
-      version: '1.0.0',
-    });
+describe('my feature', () => {
+  useTestDb(); // one line; sets up DB, clears between tests, tears down at end
+
+  it('does the thing', async () => {
+    const wfId = uniqueWorkflowId('my-feature');
+    const workflow = createWorkflow(wfId, { steps: { /* ... */ } });
 
     const run = await workflow.start({ value: 10 });
+    const result = await workflow.execute(run._id);
 
-    // Wait for execution to complete
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    const result = await workflow.get(run._id);
-
-    expect(result?.status).toBe('done');
-    expect(result?.context.result).toBe(20);
+    expectDone(result, { value: 10 });
   });
 });
 ```
 
-### Testing Wait/Resume
+## MongoDB setup
 
-```typescript
-it('should wait and resume', async () => {
-  const workflow = defineWorkflow<TestContext>()
-    .step({ id: 'wait', name: 'Wait' })
-    .build();
+`test/utils/setup.ts` uses [`mongodb-memory-server`](https://github.com/typegoose/mongodb-memory-server)
+— no external MongoDB required. The server is:
 
-  const handlers = {
-    wait: async (ctx) => {
-      await ctx.wait('Waiting for input', { value: ctx.context.value });
-    },
-  };
+- **Shared across test files in the same worker** (via `singleFork: true`
+  in the integration + e2e projects).
+- **Started lazily** by `setupTestDB()`, which is idempotent.
+- **Torn down once** per worker via the global `afterAll` in
+  [test/vitest-setup.ts](./test/vitest-setup.ts) — individual test files
+  should **not** call `teardownTestDB()` directly (mixing per-file
+  teardowns with worker-shared state triggers "different connection
+  strings" races).
+- **First run** downloads the Mongo binary — that's why `hookTimeout` on
+  integration/e2e is 60 s. CI caches after the first build.
 
-  const engine = new WorkflowEngine(workflow, handlers);
-  const run = await engine.start({ value: 5 });
+## Test coverage expectations
 
-  // Execute until waiting
-  const waitingRun = await engine.execute(run._id);
-  expect(waitingRun.status).toBe('waiting');
+From testing-infrastructure.md §10, before a PR:
 
-  // Resume with payload
-  const resumedRun = await engine.resume(run._id, { approved: true });
-  expect(resumedRun.status).toBe('completed');
-});
-```
+- [ ] `pnpm test` green in < 30 s.
+- [ ] At least one **scenario** test in e2e exercising the feature's main
+      primitive end-to-end (not a unit test in disguise).
+- [ ] No `.skip` without a `TODO(issue#N)` comment.
+- [ ] No `any` in test files — `unknown` + narrowing, or explicit
+      test-only type aliases.
 
-### Testing Parallel Execution
+## Common anti-patterns (don't)
 
-```typescript
-it('should execute in parallel', async () => {
-  const workflow = defineWorkflow()
-    .step({
-      id: 'parallel',
-      name: 'Parallel',
-      parallel: ['step1', 'step2', 'step3'],
-      mode: 'all',
-    })
-    .build();
+| Anti-pattern | Why | Fix |
+|---|---|---|
+| `mongoose.connect('mongodb://localhost:27017/streamline-test')` at top of a test file | Won't run in CI; leaks state across files | `useTestDb()` from helpers |
+| Hardcoded workflow id `'my-workflow'` across tests | Collisions under parallel execution | `uniqueWorkflowId('prefix')` |
+| `afterAll(teardownTestDB)` in a test file | The global worker teardown handles it. Per-file teardowns race | Delete the `afterAll` |
+| `await new Promise(r => setTimeout(r, 1000))` to "wait for scheduler" | Race condition in disguise | `waitUntil(cond, timeout)` from `test/utils/setup.ts` |
+| `expect(result.status).toBe('done')` | Failure message has no context | `expectDone(result, { ... })` from helpers |
+| Snapshot tests for workflow output | Non-deterministic timestamps | Assert on structure + regex |
+| Live API calls in unit/integration | Breaks CI, masks real regressions | Move to e2e with env gate |
 
-  const handlers = {
-    parallel: async (ctx) => {
-      const results = await Promise.all([
-        fetch('api1'),
-        fetch('api2'),
-        fetch('api3'),
-      ]);
-      return { results };
-    },
-  };
+## Targeted commands
 
-  const engine = new WorkflowEngine(workflow, handlers);
-  const run = await engine.start({});
-  const result = await engine.execute(run._id);
-
-  expect(result.status).toBe('completed');
-});
-```
-
-### Testing Conditional Steps
-
-```typescript
-import { conditions } from '@classytic/streamline';
-
-it('should skip steps conditionally', async () => {
-  const workflow = defineWorkflow()
-    .step({
-      id: 'premium',
-      name: 'Premium Feature',
-      condition: conditions.equals('tier', 'premium'),
-    })
-    .build();
-
-  const handlers = {
-    premium: async (ctx) => {
-      return { activated: true };
-    },
-  };
-
-  const engine = new WorkflowEngine(workflow, handlers);
-
-  // Test with standard tier
-  const run1 = await engine.start({ tier: 'standard' });
-  const result1 = await engine.execute(run1._id);
-  expect(result1.steps[0].status).toBe('skipped');
-
-  // Test with premium tier
-  const run2 = await engine.start({ tier: 'premium' });
-  const result2 = await engine.execute(run2._id);
-  expect(result2.steps[0].status).toBe('done');
-});
-```
-
-### Testing Error Handling
-
-```typescript
-it('should handle errors with retry', async () => {
-  let attempts = 0;
-
-  const workflow = defineWorkflow()
-    .step({ id: 'flaky', name: 'Flaky Step', retries: 2 })
-    .build();
-
-  const handlers = {
-    flaky: async (ctx) => {
-      attempts++;
-      if (attempts < 2) {
-        throw new Error('Temporary error');
-      }
-      return { success: true, attempts };
-    },
-  };
-
-  const engine = new WorkflowEngine(workflow, handlers);
-  const run = await engine.start({});
-  const result = await engine.execute(run._id);
-
-  expect(result.status).toBe('completed');
-  expect(attempts).toBe(2);
-});
-```
-
-## Test Best Practices
-
-### 1. Clean Up After Tests
-
-```typescript
-afterEach(async () => {
-  // Clean up test data
-  const runs = await workflowRunRepository.getAll({ limit: 100 });
-  for (const run of runs.docs) {
-    await workflowRunRepository.delete(run._id);
-  }
-});
-```
-
-### 2. Use Unique Workflow IDs
-
-```typescript
-const workflow = defineWorkflow()
-  .id(`test-${Date.now()}`)  // Unique ID per test
-  .build();
-```
-
-### 3. Test Timeout Configuration
-
-```typescript
-it('should timeout properly', async () => {
-  const workflow = defineWorkflow()
-    .step({ id: 'slow', name: 'Slow', timeout: 100 })
-    .build();
-
-  const handlers = {
-    slow: async () => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    },
-  };
-
-  const engine = new WorkflowEngine(workflow, handlers);
-  const run = await engine.start({});
-  const result = await engine.execute(run._id);
-
-  expect(result.status).toBe('failed');
-  expect(result.steps[0].error?.message).toContain('timed out');
-});
-```
-
-### 4. Mock External Dependencies
-
-```typescript
-import { vi } from 'vitest';
-
-it('should call external API', async () => {
-  const mockFetch = vi.fn().mockResolvedValue({ data: 'test' });
-
-  const handlers = {
-    fetch: async (ctx) => {
-      const data = await mockFetch();
-      return data;
-    },
-  };
-
-  // ... test execution
-
-  expect(mockFetch).toHaveBeenCalledTimes(1);
-});
-```
-
-## Coverage Goals
-
-Target coverage metrics:
-
-- **Statements**: > 90%
-- **Branches**: > 85%
-- **Functions**: > 90%
-- **Lines**: > 90%
-
-Check coverage:
 ```bash
-npm test -- --coverage
-```
+# Single file
+pnpm vitest run --project integration test/integration/smoke.test.ts
 
-Coverage report will be generated in `coverage/` directory.
+# By pattern
+pnpm vitest run --project e2e -t "idempotency"
+pnpm vitest run --project e2e test/e2e/distributed-*
 
-## CI/CD Integration
+# Watch a single tier during development
+pnpm vitest --project unit
+pnpm vitest --project integration
 
-### GitHub Actions Example
-
-```yaml
-name: Test
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-
-    services:
-      mongodb:
-        image: mongo:8
-        ports:
-          - 27017:27017
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run tests
-        run: npm test -- --coverage
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
+# Performance profiling
+pnpm vitest run --reporter=verbose       # per-test durations
+pnpm vitest run --bail=1                 # stop on first failure
 ```
 
 ## Troubleshooting
 
-### MongoDB Connection Issues
+**"different connection strings" error.** You're running a test file that
+calls `mongoose.connect()` or `teardownTestDB()` directly in its own
+lifecycle. Remove those and use `useTestDb()` — the global setup handles
+both the start and the stop.
 
-```typescript
-// Increase timeout
-beforeAll(async () => {
-  await mongoose.connect('mongodb://localhost:27017/test', {
-    serverSelectionTimeoutMS: 5000,
-  });
-}, 10000);
-```
+**Test timeouts on first run.** mongodb-memory-server is downloading the
+binary (~250 MB). `hookTimeout: 60_000` covers it. Subsequent runs use the
+cached binary.
 
-### Test Timeout Issues
+**Hook timeouts mid-suite.** Usually means a previous test file's workflow
+didn't shut down. Call `workflow.shutdown()` in `afterEach` / `afterAll` —
+the scheduler keeps a timer alive until then.
 
-```typescript
-// Increase test timeout in vitest.config.ts
-export default defineConfig({
-  test: {
-    testTimeout: 60000,  // 60 seconds
-  },
-});
-```
+---
 
-### Memory Leaks
-
-```typescript
-// Ensure proper cleanup
-afterAll(async () => {
-  await mongoose.connection.close();
-  await new Promise(resolve => setTimeout(resolve, 100));
-});
-```
-
-## Performance Testing
-
-### Load Testing Example
-
-```typescript
-it('should handle 100 concurrent workflows', async () => {
-  const workflow = defineWorkflow()
-    .step({ id: 'process', name: 'Process' })
-    .build();
-
-  const handlers = {
-    process: async (ctx) => {
-      await new Promise(resolve => setTimeout(resolve, 10));
-      return { processed: true };
-    },
-  };
-
-  const engine = new WorkflowEngine(workflow, handlers);
-
-  const startTime = Date.now();
-
-  const runs = await Promise.all(
-    Array.from({ length: 100 }, async (_, i) => {
-      const run = await engine.start({ id: i });
-      return await engine.execute(run._id);
-    })
-  );
-
-  const duration = Date.now() - startTime;
-
-  expect(runs).toHaveLength(100);
-  runs.forEach(run => {
-    expect(run.status).toBe('completed');
-  });
-
-  console.log(`Executed 100 workflows in ${duration}ms`);
-  expect(duration).toBeLessThan(5000); // Should complete in < 5 seconds
-});
-```
-
-## Summary
-
-The streamline workflow engine includes comprehensive test coverage across:
-
-- ✅ Core workflow execution
-- ✅ Step retry and error handling
-- ✅ Wait/resume functionality
-- ✅ Parallel execution
-- ✅ Conditional steps
-- ✅ Memory management
-- ✅ Concurrency control
-- ✅ Real-world use cases (newsletter, AI pipeline)
-- ✅ Local build integration
-
-All tests use **Vitest v3** and are designed to be:
-- Fast (< 30 seconds total)
-- Reliable (no flaky tests)
-- Maintainable (clear structure)
-- Comprehensive (> 90% coverage)
-
-Run `npm test` to execute all tests and verify the implementation!
+**Last reviewed:** 2026-04-23.

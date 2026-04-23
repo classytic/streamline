@@ -6,6 +6,12 @@ import { isConditionalStep, shouldSkipStep } from '../features/conditional.js';
 import type { WorkflowCache } from '../storage/cache.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
 import {
+  applyStepUpdates,
+  buildStepUpdateOps,
+  runSet,
+  toPlainRun,
+} from '../storage/update-builders.js';
+import {
   InvalidStateError,
   StepNotFoundError,
   toError,
@@ -14,7 +20,6 @@ import {
 import { calculateRetryDelay, resolveBackoffMultiplier } from '../utils/helpers.js';
 import type { WorkflowRegistry } from '../workflow/registry.js';
 import { GotoSignal, StepContextImpl, WaitSignal } from './context.js';
-import { applyStepUpdates, buildStepUpdateOps, toPlainRun } from './step-updater.js';
 
 /**
  * Cancelled is the only externally-forced terminal state.
@@ -119,15 +124,35 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       return null;
     }
 
+    return this.skipStep(run, stepId, { emitSkipped: true, advance: true });
+  }
+
+  /**
+   * Mark a step `skipped`, optionally emit `step:skipped`, and optionally
+   * advance to the next step. Used by conditional skip (emit + advance) and
+   * by `handleGoto` (emit `step:completed` itself, no advance — the goto
+   * handler sets `currentStepId` manually).
+   *
+   * Consolidates the "step is done without success" shape: `status: skipped`,
+   * `completedAt/endedAt` set, `durationMs: 0`. Every future addition (e.g.
+   * a new terminal transition) goes here, not at each call site.
+   */
+  private async skipStep(
+    run: WorkflowRun<TContext>,
+    stepId: string,
+    options: { emitSkipped?: boolean; advance?: boolean } = {},
+  ): Promise<WorkflowRun<TContext>> {
     const skippedAt = new Date();
-    run = await this.updateStepState(run, stepId, {
+    const skipped = await this.updateStepState(run, stepId, {
       status: 'skipped',
       completedAt: skippedAt,
       endedAt: skippedAt,
       durationMs: 0,
     });
-    this.eventBus.emit('step:skipped', { runId: run._id, stepId });
-    return await this.moveToNextStep(run);
+    if (options.emitSkipped) {
+      this.eventBus.emit('step:skipped', { runId: skipped._id, stepId });
+    }
+    return options.advance ? this.moveToNextStep(skipped) : skipped;
   }
 
   /**
@@ -144,16 +169,15 @@ export class StepExecutor<TContext = Record<string, unknown>> {
 
     // Too early to retry - ensure workflow is waiting so scheduler handles it
     if (run.status !== 'waiting') {
-      const now = new Date();
       const result = await this.repository.updateOne(
         { _id: run._id, ...CANCELLED_GUARD },
-        { status: 'waiting', updatedAt: now },
+        runSet({ status: 'waiting' }),
         { bypassTenant: true },
       );
       // Only update in-memory if DB accepted the update
       if (result.modifiedCount > 0) {
         run.status = 'waiting';
-        run.updatedAt = now;
+        run.updatedAt = new Date();
       } else {
         // DB rejected update (workflow cancelled) - invalidate cache for consistency
         this.cache.delete(run._id);
@@ -395,14 +419,31 @@ export class StepExecutor<TContext = Record<string, unknown>> {
           consecutiveHeartbeatFailures = 0;
         } catch (error) {
           consecutiveHeartbeatFailures++;
+          const overThreshold =
+            consecutiveHeartbeatFailures >= TIMING.HEARTBEAT_FAILURE_ABORT_THRESHOLD;
+
           // Emit warning so operators can monitor heartbeat health.
-          // After 3 consecutive failures, the stale detector may mark this
-          // workflow as crashed — emit a louder signal.
           this.eventBus.emit('engine:error', {
             runId,
             error: toError(error),
-            context: consecutiveHeartbeatFailures >= 3 ? 'heartbeat-critical' : 'heartbeat-warning',
+            context: overThreshold
+              ? 'heartbeat-abort'
+              : consecutiveHeartbeatFailures >= 3
+                ? 'heartbeat-critical'
+                : 'heartbeat-warning',
           });
+
+          // Backpressure: once heartbeats have failed this many times in a
+          // row, the stale detector is the next thing to notice — and it will
+          // re-claim the run on another worker, producing a double-execution
+          // hazard. Cancel the step locally so we exit cleanly before that.
+          if (overThreshold && abortController && !abortController.signal.aborted) {
+            abortController.abort(
+              new Error(
+                `Heartbeat failed ${consecutiveHeartbeatFailures} consecutive times — aborting step to prevent double execution`,
+              ),
+            );
+          }
         }
       }, TIMING.HEARTBEAT_INTERVAL_MS);
     }
@@ -706,7 +747,8 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       throw new StepNotFoundError(targetStepId, run.workflowId, availableSteps);
     }
 
-    // Mark current step as skipped (goto exits the step without completing it normally)
+    // Mark current step as skipped (goto exits mid-execution — the step did
+    // start, so don't pretend it completed in 0ms like a conditional skip).
     run = await this.updateStepState(run, fromStepId, {
       status: 'skipped',
       endedAt: new Date(),

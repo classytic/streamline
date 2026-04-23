@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import mongoose from 'mongoose';
-import { createWorkflow } from '../src/index.js';
+import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+import { createWorkflow } from '../../../src/index.js';
 
 interface SimpleContext {
   value: number;
@@ -8,11 +9,7 @@ interface SimpleContext {
 }
 
 describe('Simple Workflow Test', () => {
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect('mongodb://localhost:27017/streamline-test');
-    }
-  });
+  beforeAll(setupTestDB);
 
   it('should complete simple 2-step workflow', async () => {
     const workflow = createWorkflow<SimpleContext>('simple-2-step', {

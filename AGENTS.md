@@ -13,7 +13,7 @@
 ### Core Components
 
 - **src/core/types.ts**: Core type definitions (Step, StepState, WorkflowRun, StepContext)
-- **src/core/events.ts**: Typed event bus with 19 lifecycle events and external event sink
+- **src/core/events.ts**: Typed event bus with 19 lifecycle events and external event sink (see `EventPayloadMap`)
 - **src/core/container.ts**: DI container (SignalStore, EventBus, Cache, Repository)
 - **src/core/status.ts**: State machine validation and transitions
 - **src/execution/engine.ts**: WorkflowEngine — lifecycle management, idempotency, cancelOn, concurrency
@@ -21,7 +21,9 @@
 - **src/execution/context.ts**: StepContextImpl — handler API (wait, sleep, scatter, checkpoint, log)
 - **src/execution/smart-scheduler.ts**: Adaptive polling, circuit breaker, stale recovery, priority
 - **src/storage/run.model.ts**: Mongoose schema with indexes (idempotencyKey, concurrencyKey, priority)
-- **src/storage/run.repository.ts**: MongoKit-based repository with multi-tenant support
+- **src/storage/run.repository.ts**: `WorkflowRunRepository extends Repository<WorkflowRun>` — tenant-scoped atomic `updateOne` (with `normalizeUpdate` guardrail), bounded existence probes (`countRunning`, `hasWaitingWorkflows`, `hasConcurrencyDrafts`), and scheduler-claim queries
+- **src/storage/update-builders.ts**: Mongo update-doc builders used across the engine (`MongoUpdate`, `normalizeUpdate`, `runSet`, `runSetUnset`, `buildStepUpdateOps`, `applyStepUpdates`, `toPlainRun`). Raw operators by design — streamline is Mongo-only, so the repo-core Update IR's portability value is zero here.
+- **src/events/**: Arc-compatible event layer. `DomainEvent` / `EventTransport` / `EventHandler` re-exported from `@classytic/primitives/events`; `EventContext` extends primitives' `OperationContext`; `InProcessStreamlineBus` wraps primitives' `matchEventPattern`; bridge from the legacy `WorkflowEventBus` onto any arc transport
 - **src/workflow/define.ts**: `createWorkflow()` — main public API (trigger, cancelOn, concurrency)
 - **src/features/hooks.ts**: Durable webhooks/resumeHook with DB fallback
 - **src/features/parallel.ts**: In-memory parallel execution (all/race/any/allSettled)
@@ -50,31 +52,35 @@ npm run format
 
 ### Testing Commands
 
-**During development — run per-suite for speed:**
+Tests live in three tiers (unit / integration / e2e) configured via
+`projects: [...]` in [vitest.config.ts](./vitest.config.ts). `npm test`
+runs unit + integration only — **never** e2e by default.
+
+**During development:**
 
 ```bash
-npm run test:unit          # Pure functions, no DB (~1s)
-npm run test:security      # Input validation, injection, isolation (~3s)
-npm run test:e2e           # Feature-level with MongoDB (~30s)
-npm run test:integration   # Real-world smoke tests (~5s)
-npm run test:regression    # Bug regression tests (~15s)
+npm run test:unit          # Pure functions, no DB (~5s)
+npm run test:integration   # mongodb-memory-server, mocks (~20s)
+npm run test:e2e           # Full scenarios, slow (~2-3 min)
+npm run test:watch         # Watch mode, unit + integration
 ```
 
-**Before publishing — run full suite:**
+**Before publishing:**
 
 ```bash
-npm test                   # All tests
-npm run test:coverage      # With coverage report
-npm run prepublishOnly     # lint + typecheck + test + build
+npm test                   # unit + integration (fast CI path)
+npm run test:all           # every tier
+npm run test:coverage      # unit + integration with coverage
+npm run prepublishOnly     # lint + typecheck + test:all + build
 ```
 
-**Targeted testing during feature work:**
+**Targeted testing:**
 
 ```bash
-npx vitest run test/unit/helpers.test.ts          # Single file
-npx vitest run test/e2e/ -t "idempotency"         # By test name
-npx vitest run test/e2e/distributed-primitives*   # By glob
-npx vitest --watch test/unit/                      # Watch mode per suite
+npx vitest run --project unit test/unit/helpers.test.ts   # Single file
+npx vitest run --project e2e -t "idempotency"              # By test name
+npx vitest run --project e2e test/e2e/distributed-*        # By glob
+npx vitest --project unit --project integration            # Watch
 ```
 
 ## Test Organization
@@ -87,12 +93,16 @@ test/
 │   ├── errors.test.ts       toError, NonRetriableError, error classes
 │   ├── logger.test.ts       levels, enable/disable, custom transport
 │   ├── status.test.ts       deriveRunStatus, state transitions, type guards
-│   └── cache.test.ts        LRU eviction, MRU promotion, health
-├── security/                ← Injection, validation, tenant isolation
-│   └── input-validation.test.ts
-├── integration/             ← Real-world smoke tests with full pipeline
+│   ├── cache.test.ts        LRU eviction, MRU promotion, health
+│   ├── event-transport.test.ts  arc-shape bus, glob matcher, createEvent
+│   └── package-exports.test.ts  public API surface
+├── integration/             ← mongodb-memory-server, real-world pipelines
 │   └── smoke.test.ts        Order processing, content approval, cancel+abort
-├── e2e/                     ← Feature-level integration (MongoDB memory server)
+├── security/                ← Injection, validation, tenant isolation
+├── plugins/                 ← Multi-tenant plugin tests
+├── scheduling/              ← Timezone-aware scheduling
+├── telemetry/               ← OpenTelemetry integration
+├── e2e/                     ← Feature-level, end-to-end (slow tier)
 │   ├── distributed-primitives.e2e.test.ts  idempotency, cancelOn, concurrency, trigger, priority
 │   ├── v2.1-enhancements.e2e.test.ts       stepLogs, retry config, checkpoint, metrics, events
 │   ├── agentic-workflows.e2e.test.ts       AI pipeline, tool orchestration, approval flows
@@ -107,23 +117,39 @@ test/
 │   ├── fault-tolerance.e2e.test.ts         concurrent resume, type exports
 │   ├── scatter-child.e2e.test.ts           scatter/gather, child orchestration
 │   ├── smart-scheduler.e2e.test.ts         resume timing, multi-instance
-│   └── version-saga.e2e.test.ts            version mismatch detection
-├── regression/              ← Bug-specific regression tests
-├── plugins/                 ← Multi-tenant plugin tests
-├── pagination/              ← Repository/scheduler pagination
-├── scheduling/              ← Timezone-aware scheduling
-├── telemetry/               ← OpenTelemetry integration
-├── core/                    ← Legacy core tests (engine, scheduler, edge cases)
-└── *.test.ts                ← Legacy root tests (use localhost MongoDB, not memory server)
+│   ├── version-saga.e2e.test.ts            version mismatch detection
+│   └── legacy/                             relocated from test/ root (hello-world, engine, parallel, etc.)
+├── regression/              ← Bug-specific regression tests (e2e tier)
+├── pagination/              ← Repository/scheduler pagination (e2e tier)
+├── core/                    ← Engine / scheduler core behaviour (e2e tier)
+├── review/                  ← Architecture review tests (e2e tier)
+├── helpers/                 ← Shared test helpers (fixtures, lifecycle, assertions, mocks)
+│   ├── index.ts             barrel — always import from here
+│   ├── fixtures.ts          makeWorkflowRun, makeStepState, uniqueWorkflowId
+│   ├── lifecycle.ts         useTestDb() — one-line hook setup
+│   ├── assertions.ts        expectDone, expectStepSequence, expectRunStatus
+│   └── mocks.ts             mockResolved, mockFlaky, mockLoggerTransport
+└── utils/                   ← Low-level DB setup primitives
+    └── setup.ts             setupTestDB, cleanupTestDB, teardownTestDB (idempotent)
 ```
 
 ### Test Conventions
 
-- **DB tests**: Use `setupTestDB()` / `cleanupTestDB()` / `teardownTestDB()` from `test/utils/setup.ts`
-- **Sequential**: `fileParallelism: false` in vitest.config.ts (prevents MongoDB conflicts)
-- **Timeouts**: 30s per test, 60s for hooks
-- **autoExecute: false**: Use in tests for deterministic execution (call `execute()` explicitly)
-- **Suppress logs**: Call `configureStreamlineLogger({ enabled: false })` in beforeAll
+- **DB tests**: prefer `useTestDb()` from `test/helpers/lifecycle.ts`.
+  Raw `setupTestDB`/`cleanupTestDB`/`teardownTestDB` primitives live in
+  `test/utils/setup.ts` for advanced lifecycle.
+- **One mongodb-memory-server per worker** (`singleFork: true` on
+  integration + e2e projects). The global `afterAll` in
+  `test/vitest-setup.ts` handles teardown — do **not** add per-file
+  `afterAll(teardownTestDB)`.
+- **Per-tier timeouts**: unit 10 s, integration 30 s, e2e 120 s. If a
+  test needs longer, it's in the wrong tier.
+- **`autoExecute: false`**: use in tests for deterministic execution (call
+  `execute()` explicitly).
+- **Suppress logs**: global `configureLogger(false)` is set in
+  `test/vitest-setup.ts`; no need per-file.
+- **Unique ids**: use `uniqueWorkflowId(prefix)` from helpers — hardcoded
+  ids collide under parallel execution.
 
 ## Code Style
 
@@ -135,10 +161,28 @@ test/
 
 ## Dependencies
 
-- **Peer**: `@classytic/mongokit >=3.5.6`, `mongoose >=9.4.1`
+- **Peer**: `@classytic/mongokit >=3.11.0`, `@classytic/primitives >=0.1.0`, `mongoose >=9.4.1`
 - **Optional peer**: `@opentelemetry/api >=1.0.0`
 - **Runtime**: `luxon ^3.0.0` (timezone), `semver ^7.0.0` (versioning)
 - **Build**: tsdown (ESM, no bundling of deps via `neverBundle`)
+
+### Why `@classytic/primitives`?
+
+Shared source of truth for cross-package shapes that have to stay
+bit-for-bit identical across arc, mongokit, streamline, and domain
+packages:
+
+- `DomainEvent`, `EventTransport`, `EventHandler`, `EventMeta` — lets any
+  arc transport plug into `createContainer({ eventTransport })` with zero
+  adapter code.
+- `matchEventPattern` — the single glob matcher every package uses for
+  `subscribe('namespace:*', ...)`.
+- `OperationContext` — the ambient request-context shape
+  (`actorId` / `organizationId` / `correlationId` / `session`) that flows
+  through domain verbs. `createEvent`'s input context extends it.
+
+Ship-shape rule: **never re-declare these under a streamline-local alias**.
+Import from primitives and re-export unchanged.
 
 ## Key Patterns
 

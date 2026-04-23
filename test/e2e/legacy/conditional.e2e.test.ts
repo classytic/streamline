@@ -1,13 +1,14 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import mongoose from 'mongoose';
+import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
 import {
   createWorkflow,
   isConditionalStep,
   shouldSkipStep,
   conditions,
   createCondition,
-} from '../src/index.js';
-import type { ConditionalStep, WorkflowRun } from '../src/index.js';
+} from '../../../src/index.js';
+import type { ConditionalStep, WorkflowRun } from '../../../src/index.js';
 
 interface OrderContext {
   orderId: string;
@@ -20,11 +21,7 @@ interface OrderContext {
 }
 
 describe('Conditional Workflow', () => {
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect('mongodb://localhost:27017/streamline-test');
-    }
-  });
+  beforeAll(setupTestDB);
 
   it('should skip steps based on condition', async () => {
     const workflow = createWorkflow<OrderContext>('conditional-order-test', {

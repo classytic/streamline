@@ -9,7 +9,7 @@ import { describe, it, expect } from 'vitest';
 
 describe('Package exports: main entry point', () => {
   it('should export createWorkflow and core workflow API', async () => {
-    const mod = await import('../src/index.js');
+    const mod = await import('../../src/index.js');
 
     // Core API
     expect(mod.createWorkflow).toBeTypeOf('function');
@@ -82,12 +82,42 @@ describe('Package exports: main entry point', () => {
     // Constants
     expect(mod.COMPUTED).toBeDefined();
     expect(mod.hookRegistry).toBeDefined();
+
+    // Update-doc builders (v2.2)
+    expect(mod.normalizeUpdate).toBeTypeOf('function');
+    expect(mod.runSet).toBeTypeOf('function');
+    expect(mod.runSetUnset).toBeTypeOf('function');
+    expect(mod.buildStepUpdateOps).toBeTypeOf('function');
+
+    // Arc-compatible event transport (v2.2)
+    expect(mod.InProcessStreamlineBus).toBeTypeOf('function');
+    expect(mod.createEvent).toBeTypeOf('function');
+    expect(mod.bridgeBusToTransport).toBeTypeOf('function');
+    expect(mod.STREAMLINE_EVENTS).toBeDefined();
+    expect(mod.LEGACY_TO_CANONICAL).toBeDefined();
+  });
+
+  it('updateOne accepts a MongoUpdate from normalizeUpdate / runSet', async () => {
+    // The point of exposing MongoUpdate + helpers is so consumers can compose
+    // atomic updates without guessing the internal shape. This verifies the
+    // helpers + repository types align at runtime.
+    const { normalizeUpdate, runSet, runSetUnset } = await import('../../src/index.js');
+
+    const ops = normalizeUpdate({ status: 'running' });
+    expect(ops.$set?.status).toBe('running');
+
+    const set = runSet({ status: 'done', output: { ok: true } });
+    expect(set.$set?.status).toBe('done');
+    expect(set.$set?.updatedAt).toBeInstanceOf(Date);
+
+    const both = runSetUnset({ status: 'waiting' }, ['error', 'waitingFor']);
+    expect(both.$unset).toEqual({ error: '', waitingFor: '' });
   });
 
   it('should export all type-only exports (compilation test)', async () => {
     // These are type-only — importing them verifies they compile.
     // At runtime we just check the module loaded without errors.
-    const mod = await import('../src/index.js');
+    const mod = await import('../../src/index.js');
 
     // Type re-exports from define.ts
     // Workflow, WorkflowConfig, StepConfig, WaitForOptions are type-only
@@ -96,7 +126,7 @@ describe('Package exports: main entry point', () => {
   });
 
   it('should export SignalStore type via createContainer', async () => {
-    const { createContainer } = await import('../src/index.js');
+    const { createContainer } = await import('../../src/index.js');
     const container = createContainer();
     expect(container.signalStore).toBeDefined();
     expect(container.signalStore.publish).toBeTypeOf('function');
@@ -106,12 +136,12 @@ describe('Package exports: main entry point', () => {
 
 describe('Package exports: subpath entry points', () => {
   it('should export from ./fastify subpath', async () => {
-    const mod = await import('../src/integrations/fastify.js');
+    const mod = await import('../../src/integrations/fastify.js');
     expect(mod).toBeDefined();
   });
 
   it('should export from ./telemetry subpath', async () => {
-    const mod = await import('../src/telemetry/index.js');
+    const mod = await import('../../src/telemetry/index.js');
     expect(mod).toBeDefined();
   });
 });

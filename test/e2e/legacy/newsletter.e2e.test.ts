@@ -1,14 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import mongoose from 'mongoose';
-import { newsletterWorkflow } from '../docs/examples/newsletter-automation.js';
-import { waitUntil } from './utils/setup.js';
+import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+import { newsletterWorkflow } from '../../../docs/examples/newsletter-automation.js';
+import { waitUntil } from '../../utils/setup.js';
 
 describe('Newsletter Automation', () => {
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect('mongodb://localhost:27017/streamline-test');
-    }
-  });
+  beforeAll(setupTestDB);
 
   afterAll(async () => {
     newsletterWorkflow.shutdown();

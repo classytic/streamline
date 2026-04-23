@@ -1,19 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import mongoose from 'mongoose';
-import { helloWorld } from '../docs/examples/hello-world.js';
-import { waitUntil } from './utils/setup.js';
+import { describe, it, expect, beforeAll } from 'vitest';
+import { setupTestDB, waitUntil } from '../../utils/setup.js';
+import { helloWorld } from '../../../docs/examples/hello-world.js';
 
 describe('Hello World Workflow', () => {
-  beforeAll(async () => {
-    await mongoose.connect('mongodb://localhost:27017/streamline_test', {
-      serverSelectionTimeoutMS: 5000,
-    });
-  });
-
-  afterAll(async () => {
-    await mongoose.connection.dropDatabase();
-    await mongoose.disconnect();
-  });
+  beforeAll(setupTestDB);
 
   it('should complete hello world workflow', async () => {
     const run = await helloWorld.start({ name: 'Vitest' });

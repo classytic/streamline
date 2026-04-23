@@ -1,14 +1,27 @@
 /**
  * Workflow Run Repository
  *
- * MongoKit-powered repository with multi-tenant support and atomic operations.
+ * Extends mongokit's `Repository<WorkflowRun>` — callers get the full CRUD /
+ * pagination / query surface for free. Only domain-specific verbs live here.
+ *
+ * See packages/streamline/docs/PACKAGE_RULES alignment note in CHANGELOG:
+ * this file was refactored in v2.2 to extend rather than wrap. Pure proxy
+ * methods (`getActiveRuns`, `getRunningRuns`, `getWaitingRuns`,
+ * `getRunsByWorkflow`) were removed — use `repo.getAll({ filters })` directly
+ * or `CommonQueries.*` from `./query-builder.js` for canonical filter shapes.
  */
 
-import { methodRegistryPlugin, mongoOperationsPlugin, Repository } from '@classytic/mongokit';
+import {
+  methodRegistryPlugin,
+  mongoOperationsPlugin,
+  type PluginType,
+  Repository,
+} from '@classytic/mongokit';
 import type { WorkflowRun } from '../core/types.js';
 import { type TenantFilterOptions, tenantFilterPlugin } from '../plugins/tenant-filter.plugin.js';
 import { CommonQueries } from './query-builder.js';
 import { WorkflowRunModel } from './run.model.js';
+import { type MongoUpdate, normalizeUpdate } from './update-builders.js';
 
 // ============================================================================
 // Types
@@ -35,144 +48,93 @@ export interface WorkflowRepositoryConfig {
 }
 
 // ============================================================================
-// Repository Interface
+// Repository
 // ============================================================================
 
 /**
- * Repository interface for workflow run storage operations.
- * Provides CRUD, queries, and atomic updates for workflow runs.
+ * Thin extension of mongokit's Repository carrying only workflow-specific
+ * domain verbs. Inherits `create`, `getById`, `getAll`, `update`, `delete`,
+ * `countDocuments`, pagination, populate, aggregate, hooks, and transactions.
  */
-export interface WorkflowRunRepository {
-  /** Create a new workflow run */
-  create<TContext = unknown>(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>>;
-
-  /** Get a workflow run by ID */
-  getById<TContext = unknown>(id: string): Promise<WorkflowRun<TContext> | null>;
-
-  /** Get all workflow runs with filtering and pagination */
-  getAll: Repository<WorkflowRun>['getAll'];
-
-  /** Update a workflow run */
-  update<TContext = unknown>(
-    id: string,
-    data: Partial<WorkflowRun<TContext>>,
-    options?: AtomicUpdateOptions,
-  ): Promise<WorkflowRun<TContext>>;
-
-  /** Delete a workflow run */
-  delete: Repository<WorkflowRun>['delete'];
-
-  /** Atomic update with filter (for concurrent workflow claiming) */
-  updateOne(
-    filter: Record<string, unknown>,
-    update: Record<string, unknown>,
-    options?: AtomicUpdateOptions,
-  ): Promise<{ modifiedCount: number }>;
-
-  /** Get all active (running/waiting) workflow runs */
-  getActiveRuns(): Promise<LeanWorkflowRun[]>;
-
-  /** Get workflow runs by workflow ID */
-  getRunsByWorkflow(workflowId: string, limit?: number): Promise<LeanWorkflowRun[]>;
-
-  /** Get all waiting workflow runs */
-  getWaitingRuns(): Promise<LeanWorkflowRun[]>;
-
-  /** Get all running workflow runs */
-  getRunningRuns(): Promise<LeanWorkflowRun[]>;
-
-  /** Get workflows ready to resume (resumeAt <= now) */
-  getReadyToResume(now: Date, limit?: number): Promise<LeanWorkflowRun[]>;
-
-  /** Get workflows ready for retry (retryAt <= now) */
-  getReadyForRetry(now: Date, limit?: number): Promise<LeanWorkflowRun[]>;
-
-  /** Get stale running workflows (no heartbeat in threshold) */
-  getStaleRunningWorkflows(staleThresholdMs: number, limit?: number): Promise<LeanWorkflowRun[]>;
-
-  /** Get scheduled workflows ready to execute */
-  getScheduledWorkflowsReadyToExecute(
-    now: Date,
-    options?: { page?: number; limit?: number; cursor?: string | null; tenantId?: string },
-  ): Promise<PaginatedResult<LeanWorkflowRun>>;
-
-  // Distributed primitives
-
-  /** Find active (non-terminal) run by idempotency key */
-  findActiveByIdempotencyKey(key: string): Promise<LeanWorkflowRun | null>;
-
-  /** Count active runs for a workflow + concurrency key */
-  countActiveByConcurrencyKey(workflowId: string, concurrencyKey: string): Promise<number>;
-
-  /** Find concurrency-queued drafts eligible for promotion */
-  getConcurrencyDrafts(limit?: number): Promise<LeanWorkflowRun[]>;
-
-  /** Count concurrency-queued drafts */
-  countConcurrencyDrafts(): Promise<number>;
-
-  /** Find a draft run by ID with concurrency key */
-  getConcurrencyDraft(runId: string): Promise<LeanWorkflowRun | null>;
-
-  /** Access to underlying MongoKit repository */
-  readonly base: Repository<WorkflowRun>;
-
-  /** Access to repository hooks */
-  readonly _hooks: Map<string, unknown[]>;
-}
-
-// ============================================================================
-// Repository Implementation
-// ============================================================================
-
-class WorkflowRepository implements WorkflowRunRepository {
-  private readonly repo: Repository<WorkflowRun>;
+export class WorkflowRunRepository extends Repository<WorkflowRun> {
   private readonly tenantField: string;
   private readonly isMultiTenant: boolean;
   private readonly isStrictTenant: boolean;
 
   constructor(config: WorkflowRepositoryConfig = {}) {
-    this.isMultiTenant = !!config.multiTenant;
-    this.isStrictTenant = config.multiTenant?.strict !== false;
-    this.tenantField = config.multiTenant?.tenantField || 'context.tenantId';
-
-    const plugins = [
+    const plugins: PluginType[] = [
       methodRegistryPlugin(),
       mongoOperationsPlugin(),
       ...(config.multiTenant ? [tenantFilterPlugin(config.multiTenant)] : []),
     ];
 
-    this.repo = new Repository<WorkflowRun>(WorkflowRunModel, plugins);
+    super(WorkflowRunModel, plugins);
+
+    this.isMultiTenant = !!config.multiTenant;
+    this.isStrictTenant = config.multiTenant?.strict !== false;
+    this.tenantField = config.multiTenant?.tenantField || 'context.tenantId';
+  }
+
+  /**
+   * Default to `throwOnNotFound: false` — the workflow engine treats a
+   * missing run as a not-found result, not an exception. Explicit
+   * `throwOnNotFound: true` still works for callers that want the throw.
+   */
+  override async getById(
+    id: Parameters<Repository<WorkflowRun>['getById']>[0],
+    options: Parameters<Repository<WorkflowRun>['getById']>[1] = {},
+  ): Promise<WorkflowRun | null> {
+    return super.getById(id, { throwOnNotFound: false, ...options });
+  }
+
+  /**
+   * Accept a `WorkflowRun<TContext>` shape directly (convenience over
+   * mongokit's `Record<string, unknown>`). Callers already build the full
+   * run with their own context type before persisting it; the stored type
+   * is `WorkflowRun` at rest regardless.
+   */
+  override async create<TContext = unknown>(
+    data: WorkflowRun<TContext> | Record<string, unknown>,
+    options: Parameters<Repository<WorkflowRun>['create']>[1] = {},
+  ): Promise<WorkflowRun<TContext>> {
+    return super.create(data as Record<string, unknown>, options) as Promise<WorkflowRun<TContext>>;
   }
 
   // ---------------------------------------------------------------------------
-  // Core CRUD
+  // Atomic claim — used by scheduler to race multiple workers for a run.
+  // Real domain logic (tenant bypass + operator-aware update merge), not a
+  // proxy.
   // ---------------------------------------------------------------------------
 
-  async create<TContext = unknown>(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
-    return this.repo.create(run as unknown as Record<string, unknown>) as Promise<
-      WorkflowRun<TContext>
-    >;
+  /**
+   * Atomic `updateOne` with tenant-scoped filter. Accepts either a
+   * well-formed Mongo update doc (`{ $set, $unset, ... }`) or a plain
+   * field-shape object (auto-wrapped in `$set`). Mixing the two — e.g.
+   * `{ $set: {...}, status: 'foo' }` — throws loudly instead of letting
+   * Mongo silently drop the non-operator keys.
+   */
+  async updateOne(
+    filter: Record<string, unknown>,
+    update: MongoUpdate | Record<string, unknown>,
+    options?: AtomicUpdateOptions,
+  ): Promise<{ modifiedCount: number }> {
+    const finalFilter = this.applyTenantFilter(filter, options, 'updateOne');
+    const finalUpdate = normalizeUpdate(update);
+
+    const result = await WorkflowRunModel.updateOne(finalFilter, finalUpdate);
+    return { modifiedCount: result.modifiedCount };
   }
 
-  async getById<TContext = unknown>(id: string): Promise<WorkflowRun<TContext> | null> {
-    // MongoKit >=3.5.6 correctly handles String/UUID _id via id-resolution primitive.
-    // throwOnNotFound: false returns null instead of throwing 404.
-    return this.repo.getById(id, {
-      throwOnNotFound: false,
-    }) as Promise<WorkflowRun<TContext> | null>;
-  }
-
-  getAll(...args: Parameters<Repository<WorkflowRun>['getAll']>) {
-    return this.repo.getAll(...args);
-  }
-
-  async update<TContext = unknown>(
+  /**
+   * Update a run by id, optionally bypassing the tenant filter (internal
+   * operations that are already scoped by `_id`). Delegates to `super.update`
+   * for the normal path so hooks and plugins fire.
+   */
+  async updateById<TContext = unknown>(
     id: string,
     data: Partial<WorkflowRun<TContext>>,
     options?: AtomicUpdateOptions,
   ): Promise<WorkflowRun<TContext>> {
-    // Bypass tenant filter for internal operations (already scoped by _id)
-    // Uses same approach as MongoKit: findByIdAndUpdate without $set wrapper
     if (options?.bypassTenant) {
       const result = await WorkflowRunModel.findByIdAndUpdate(id, data, {
         returnDocument: 'after',
@@ -185,52 +147,15 @@ class WorkflowRepository implements WorkflowRunRepository {
       return result as WorkflowRun<TContext>;
     }
 
-    return this.repo.update(id, data as unknown as Record<string, unknown>) as Promise<
-      WorkflowRun<TContext>
-    >;
-  }
-
-  delete(...args: Parameters<Repository<WorkflowRun>['delete']>) {
-    return this.repo.delete(...args);
+    return super.update(id, data as Record<string, unknown>) as Promise<WorkflowRun<TContext>>;
   }
 
   // ---------------------------------------------------------------------------
-  // Atomic Update (for concurrent workflow claiming)
+  // Scheduler claim queries — encode timer/retry/stale/scheduled semantics.
+  // These are genuine domain verbs: the filter composition and cutoff
+  // reasoning belongs on the repository, not repeated at 4 scheduler call
+  // sites.
   // ---------------------------------------------------------------------------
-
-  async updateOne(
-    filter: Record<string, unknown>,
-    update: Record<string, unknown>,
-    options?: AtomicUpdateOptions,
-  ): Promise<{ modifiedCount: number }> {
-    const finalFilter = this.applyTenantFilter(filter, options, 'updateOne');
-
-    const hasOperators = Object.keys(update).some((k) => k.startsWith('$'));
-    const finalUpdate = hasOperators ? update : { $set: update };
-
-    const result = await WorkflowRunModel.updateOne(finalFilter, finalUpdate);
-    return { modifiedCount: result.modifiedCount };
-  }
-
-  // ---------------------------------------------------------------------------
-  // Query Methods
-  // ---------------------------------------------------------------------------
-
-  async getActiveRuns(): Promise<LeanWorkflowRun[]> {
-    return this.queryLean(CommonQueries.active(), '-updatedAt', 1000);
-  }
-
-  async getRunsByWorkflow(workflowId: string, limit = 100): Promise<LeanWorkflowRun[]> {
-    return this.queryLean({ workflowId }, '-createdAt', limit);
-  }
-
-  async getWaitingRuns(): Promise<LeanWorkflowRun[]> {
-    return this.queryLean({ status: 'waiting', paused: { $ne: true } }, '-updatedAt', 1000);
-  }
-
-  async getRunningRuns(): Promise<LeanWorkflowRun[]> {
-    return this.queryLean({ status: 'running' }, '-updatedAt', 1000);
-  }
 
   async getReadyToResume(now: Date, limit = 100): Promise<LeanWorkflowRun[]> {
     return this.queryLean(CommonQueries.readyToResume(now), { updatedAt: 1 }, limit);
@@ -253,7 +178,7 @@ class WorkflowRepository implements WorkflowRunRepository {
   ): Promise<PaginatedResult<LeanWorkflowRun>> {
     const { page = 1, limit = 100, cursor, tenantId } = options;
 
-    const result = await this.repo.getAll(
+    const result = await this.getAll(
       {
         filters: CommonQueries.scheduledReady(now),
         sort: { 'scheduling.executionTime': 1 },
@@ -269,10 +194,41 @@ class WorkflowRepository implements WorkflowRunRepository {
   }
 
   // ---------------------------------------------------------------------------
-  // Distributed Primitives
+  // Lightweight existence/count probes — cheaper than fetching docs for
+  // "do we need to poll?" checks. Single-roundtrip, bounded.
   // ---------------------------------------------------------------------------
 
-  /** Find an active (non-terminal) run by idempotency key. Returns null if none or all terminal. */
+  async countRunning(): Promise<number> {
+    return WorkflowRunModel.countDocuments({ status: 'running' });
+  }
+
+  async hasWaitingWorkflows(): Promise<boolean> {
+    const found = await WorkflowRunModel.exists({
+      status: 'waiting',
+      paused: { $ne: true },
+    });
+    return !!found;
+  }
+
+  /**
+   * Single-roundtrip existence check for concurrency-queued drafts. Cheaper
+   * than `countConcurrencyDrafts()` when the caller just wants "is there any
+   * work?" — Mongo can short-circuit on the first match.
+   */
+  async hasConcurrencyDrafts(): Promise<boolean> {
+    const found = await WorkflowRunModel.exists({
+      status: 'draft',
+      concurrencyKey: { $exists: true, $ne: null },
+      scheduling: { $exists: false },
+      paused: { $ne: true },
+    });
+    return !!found;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Distributed primitives — idempotency + concurrency gating.
+  // ---------------------------------------------------------------------------
+
   async findActiveByIdempotencyKey(key: string): Promise<LeanWorkflowRun | null> {
     return WorkflowRunModel.findOne({
       idempotencyKey: key,
@@ -280,7 +236,6 @@ class WorkflowRepository implements WorkflowRunRepository {
     }).lean() as Promise<LeanWorkflowRun | null>;
   }
 
-  /** Count active (running/waiting) runs for a workflow + concurrency key. */
   async countActiveByConcurrencyKey(workflowId: string, concurrencyKey: string): Promise<number> {
     return WorkflowRunModel.countDocuments({
       workflowId,
@@ -289,7 +244,6 @@ class WorkflowRepository implements WorkflowRunRepository {
     });
   }
 
-  /** Find concurrency-queued drafts eligible for promotion. */
   async getConcurrencyDrafts(limit = 100): Promise<LeanWorkflowRun[]> {
     return WorkflowRunModel.find({
       status: 'draft',
@@ -302,7 +256,6 @@ class WorkflowRepository implements WorkflowRunRepository {
       .lean() as Promise<LeanWorkflowRun[]>;
   }
 
-  /** Count concurrency-queued drafts (for scheduler startup check). */
   async countConcurrencyDrafts(): Promise<number> {
     return WorkflowRunModel.countDocuments({
       status: 'draft',
@@ -312,7 +265,6 @@ class WorkflowRepository implements WorkflowRunRepository {
     });
   }
 
-  /** Find a draft run by ID with concurrency key (for promotion check). */
   async getConcurrencyDraft(runId: string): Promise<LeanWorkflowRun | null> {
     return WorkflowRunModel.findOne({
       _id: runId,
@@ -322,19 +274,7 @@ class WorkflowRepository implements WorkflowRunRepository {
   }
 
   // ---------------------------------------------------------------------------
-  // Utilities
-  // ---------------------------------------------------------------------------
-
-  get base(): Repository<WorkflowRun> {
-    return this.repo;
-  }
-
-  get _hooks(): Map<string, unknown[]> {
-    return this.repo._hooks;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Private Helpers
+  // Private helpers
   // ---------------------------------------------------------------------------
 
   private async queryLean(
@@ -342,8 +282,7 @@ class WorkflowRepository implements WorkflowRunRepository {
     sort: string | Record<string, 1 | -1>,
     limit: number,
   ): Promise<LeanWorkflowRun[]> {
-    const result = await this.repo.getAll({ filters, sort, limit }, { lean: true });
-    // MongoKit getAll returns paginated result or array — extract docs
+    const result = await this.getAll({ filters, sort, limit }, { lean: true });
     const docs = Array.isArray(result) ? result : (result as { docs: LeanWorkflowRun[] }).docs;
     return docs as LeanWorkflowRun[];
   }
@@ -373,7 +312,7 @@ class WorkflowRepository implements WorkflowRunRepository {
 }
 
 // ============================================================================
-// Factory Functions
+// Factory + default singleton
 // ============================================================================
 
 /**
@@ -391,11 +330,7 @@ class WorkflowRepository implements WorkflowRunRepository {
 export function createWorkflowRepository(
   config: WorkflowRepositoryConfig = {},
 ): WorkflowRunRepository {
-  return new WorkflowRepository(config);
+  return new WorkflowRunRepository(config);
 }
-
-// ============================================================================
-// Default Instance (Single-Tenant)
-// ============================================================================
 
 export const workflowRunRepository = createWorkflowRepository();

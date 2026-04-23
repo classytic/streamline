@@ -5,6 +5,9 @@
  * All shared dependencies are passed through this container.
  */
 
+import type { EventTransport } from '@classytic/primitives/events';
+import { bridgeBusToTransport } from '../events/bridge.js';
+import { InProcessStreamlineBus } from '../events/in-process-bus.js';
 import { WorkflowCache } from '../storage/cache.js';
 import {
   createWorkflowRepository,
@@ -90,8 +93,15 @@ class InMemorySignalStore implements SignalStore {
 export interface StreamlineContainer {
   /** MongoDB repository for workflow runs */
   readonly repository: WorkflowRunRepository;
-  /** Event bus for workflow lifecycle events */
+  /** Event bus for workflow lifecycle events (internal, legacy shape) */
   readonly eventBus: WorkflowEventBus;
+  /**
+   * Arc-compatible event transport. Every event emitted on `eventBus` is
+   * republished here under its canonical `streamline:<resource>.<verb>`
+   * name in arc `DomainEvent` shape. Defaults to an in-process bus; pass
+   * `eventTransport` to `createContainer` to use Redis/Kafka/etc.
+   */
+  readonly eventTransport: EventTransport;
   /** In-memory cache for active workflows */
   readonly cache: WorkflowCache;
   /** Pluggable signal store for durable cross-process event delivery */
@@ -130,6 +140,21 @@ export interface ContainerOptions {
    * - If undefined: uses default in-memory store (process-local)
    */
   signalStore?: SignalStore;
+
+  /**
+   * Arc-compatible event transport (from `@classytic/arc/events` or any
+   * implementation of `@classytic/primitives/events`' `EventTransport`
+   * interface).
+   *
+   * If provided: internal events are bridged to this transport using
+   * canonical `streamline:<resource>.<verb>` names. Hosts can
+   * `transport.subscribe('streamline:*', handler)` to consume every event.
+   *
+   * If omitted: defaults to `InProcessStreamlineBus`, which wraps
+   * primitives' `matchEventPattern` and mirrors arc's
+   * `MemoryEventTransport` semantics.
+   */
+  eventTransport?: EventTransport;
 }
 
 /**
@@ -195,7 +220,15 @@ export function createContainer(options: ContainerOptions = {}): StreamlineConta
   // Resolve signal store
   const signalStore = options.signalStore ?? new InMemorySignalStore();
 
-  return { repository, eventBus, cache, signalStore };
+  // Resolve arc-shape event transport (default: in-process bus).
+  const eventTransport: EventTransport = options.eventTransport ?? new InProcessStreamlineBus();
+
+  // Bridge every legacy event bus emission onto the transport using
+  // canonical streamline:<resource>.<verb> names. The bridge lives for the
+  // lifetime of the container — no explicit teardown needed in normal use.
+  bridgeBusToTransport(eventBus, eventTransport);
+
+  return { repository, eventBus, eventTransport, cache, signalStore };
 }
 
 /**
@@ -206,6 +239,7 @@ export function isStreamlineContainer(obj: unknown): obj is StreamlineContainer 
   return (
     'repository' in obj &&
     'eventBus' in obj &&
+    'eventTransport' in obj &&
     'cache' in obj &&
     (obj as StreamlineContainer).eventBus instanceof WorkflowEventBus &&
     (obj as StreamlineContainer).cache instanceof WorkflowCache

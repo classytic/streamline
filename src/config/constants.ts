@@ -26,6 +26,16 @@ export const TIMING = {
 
   /** Hook registry cleanup interval */
   HOOK_CLEANUP_INTERVAL_MS: 60_000, // 1 minute
+
+  /**
+   * Consecutive heartbeat-write failures after which the executor aborts the
+   * step to prevent the stale-detector from flipping the run to 'crashed'
+   * while another worker is still executing it (double-run risk). At default
+   * `HEARTBEAT_INTERVAL_MS` (30s), the stale threshold is 5 minutes — so 5
+   * consecutive failures == 2.5 minutes of degraded heartbeat, still within
+   * the safety envelope.
+   */
+  HEARTBEAT_FAILURE_ABORT_THRESHOLD: 5,
 } as const;
 
 export const LIMITS = {
