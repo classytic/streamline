@@ -42,6 +42,7 @@
     "lint:fix": "biome check src/ --write",
     "format": "biome format src/ --write",
     "check": "biome ci src/ --diagnostic-level=error",
+    "push": "classytic-push",
     "prepublishOnly": "npm run check && npm run typecheck && npm run test:all && npm run build"
   },
   "engines": {
@@ -95,6 +96,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.10",
+    "@classytic/dev-tools": "^0.2.0",
     "@classytic/mongokit": "^3.11.0",
     "@classytic/primitives": "file:../../ecom/commerce/packages/reference-only/primitives",
     "@opentelemetry/api": "^1.9.0",
