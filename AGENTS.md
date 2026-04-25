@@ -4,6 +4,8 @@
 
 - All changes require tests for new functionality
 
+**Releases:** see [RELEASING.md](RELEASING.md) — canonical commit/push/publish for every `@classytic/*` package.
+
 ## Overview
 
 `@classytic/streamline` is a MongoDB-native durable workflow orchestration engine for TypeScript. It provides Temporal/Inngest-like capabilities (sleep, wait, retry, parallel execution, human-in-the-loop, crash recovery, idempotency, concurrency control, event triggers) with simpler ergonomics and zero infrastructure beyond MongoDB.
