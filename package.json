@@ -43,6 +43,8 @@
     "format": "biome format src/ --write",
     "check": "biome ci src/ --diagnostic-level=error",
     "push": "classytic-push",
+    "release:tag": "node -e \"require('child_process').execSync('npm run push -- v'+require('./package.json').version,{stdio:'inherit'})\"",
+    "release": "npm run push -- main && npm run release:tag && npm publish",
     "prepublishOnly": "npm run check && npm run typecheck && npm run test:all && npm run build"
   },
   "engines": {
