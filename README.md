@@ -14,7 +14,26 @@ draft → running → waiting ↔ running → done
 npm install @classytic/streamline @classytic/mongokit @classytic/primitives mongoose
 ```
 
-Peer deps: `@classytic/mongokit >=3.11`, `@classytic/primitives >=0.1`, `mongoose >=9.4.1`. Optional: `@opentelemetry/api >=1.0`.
+Peer deps: `@classytic/mongokit >=3.13`, `@classytic/primitives >=0.1`, `mongoose >=9.4.1`. Optional: `@opentelemetry/api >=1.0`. (3.13 ships `Repository.claim()` + `MongoOperatorUpdate` — both load-bearing in streamline ≥2.3.)
+
+## Design philosophy — what streamline is *not*
+
+Streamline is a **state-machine durable workflow engine**, not a deterministic-replay one. Each step's input/output is checkpointed to MongoDB; on crash or restart the scheduler resumes from the last completed step. The orchestrator code is **not** re-executed from an event log to reconstruct state (the model used by Inngest, Temporal, and Vercel Workflow SDK).
+
+What you get from this choice:
+
+- **No compiler magic.** Plain `async` functions. No SWC plugins, no sandboxed VM, no `"use workflow"` pragmas, no two-bundle splits.
+- **No determinism constraints.** `Date.now()`, `Math.random()`, `crypto.randomUUID()`, closures over mutable state — all fine inside step handlers. Replay engines forbid these or require `step.run` wrappers around them.
+- **Smaller mental model.** A run is a Mongo document; steps are entries in `run.steps[]`. You can read it, query it, index it, dump it.
+- **Zero new infrastructure.** Reuses your existing Mongo connection. No Redis, no Postgres, no separate server process.
+
+What you give up:
+
+- **No free time-travel debugging from an event log** (the run document is the audit trail; `stepLogs` is the per-step log).
+- **Long-running orchestrators with branchy logic** are less memory-efficient than a replay engine — streamline keeps step outputs in the run doc rather than re-deriving them.
+- **Cross-step transactional rollback** isn't free — you write compensation steps yourself.
+
+If your workload is "background jobs and multi-step workflows on a Mongo-backed app," this is the right trade. If you need deterministic replay across language boundaries or month-long orchestrators, reach for Temporal/Inngest.
 
 ## Quick start
 
@@ -138,6 +157,49 @@ createWorkflow('charge', {
 });
 ```
 
+### Throttle (best-effort start-rate smoothing — *not* a strict rate limiter)
+
+```typescript
+createWorkflow('send-receipt', {
+  steps: { /* ... */ },
+  concurrency: {
+    key: (input) => input.userId,
+    throttle: { limit: 10, windowMs: 60_000 }, // smooth starts toward 10/user/min
+  },
+});
+// First `limit` starts in any rolling window fire immediately. Excess starts
+// queue as scheduled drafts and are spread by `windowMs / limit` (1 every 6 s
+// in this example) so a burst of 100 doesn't all land on a single future slot.
+// The scheduler picks them up — no dropped calls.
+```
+
+**Honest contract.** This is best-effort smoothing, not a distributed strict rate limiter:
+
+- **Sequential safety:** ✅ Within one process, sequential `start()` calls produce strictly-staggered queued slots — `tail.executionTime + windowMs / limit`. Bursts smooth correctly.
+- **Parallel races:** ⚠️ Two concurrent `start()` calls can read the same tail before either persists, so they reserve the same future slot. Burst correctness is bounded by parallelism, not by `limit`.
+- **What you get:** "starts will be smoothed *toward* `limit / windowMs` under typical load."
+- **What you don't get:** "at most `limit` starts will *ever* fire in any `windowMs` window."
+
+If you need a strict distributed rate limit (payment captures, partner API quotas), wrap `start()` in your own atomic counter / Redis token-bucket / semaphore — streamline's throttle is for "don't overload the embedding API," not "exactly N or fail."
+
+### Debounce (collapse rapid bursts)
+
+```typescript
+createWorkflow('rebuild-search-index', {
+  steps: { /* ... */ },
+  concurrency: {
+    key: (input) => input.tenantId,
+    debounce: { windowMs: 30_000 }, // fire once 30s after the last start call
+  },
+});
+// Trailing-edge: each start atomically pushes the timer forward and overwrites
+// `input` / `context` with the latest values. Lodash semantics. The single run
+// that eventually fires sees the most recent input. Use a global key
+// (`key: () => 'global'`) for workflow-wide debounce.
+```
+
+`throttle` and `debounce` are mutually exclusive — debounce already collapses bursts to one fire per quiet window. Both require `key`. `key: () => 'global'` gives you a workflow-wide bucket.
+
 ### Event triggers & auto-cancel
 
 ```typescript
@@ -161,6 +223,20 @@ await ctx.startChildWorkflow('billing', { orderId });
 // Parent waits for child. Child's output becomes the step's output.
 ```
 
+## Race semantics — what's closed, what isn't
+
+Distributed primitives have specific guarantees. Honest summary:
+
+| Primitive | Guarantee | Mechanism |
+|---|---|---|
+| `idempotencyKey` | **Race-safe.** Concurrent starts with the same key produce exactly one active run. | Partial unique index on `idempotencyKey` (filtered to non-terminal statuses) + E11000 catch in `repository.create()`. The losing insert returns the winning run instead of throwing. |
+| Scheduler claim (waiting → running, draft → running) | **Race-safe.** A given run is claimed by exactly one worker. | Atomic `findOneAndUpdate` with status guard in the filter. Plugin hooks fire on the claim. |
+| `concurrency.limit` | **Best-effort, advisory.** Steady-state correct; under bursts of concurrent starts/promotions the limit can briefly oversubscribe. | Count-then-create (and count-then-promote on slot release). Not wrapped in a transaction or counter doc. |
+| `concurrency.throttle` | **Best-effort smoothing, not a strict distributed rate limiter.** Sequential bursts get strictly-staggered slots (`tail + windowMs/limit`). Parallel concurrent starts can reserve the same slot — bounded by parallelism, not by `limit`. Use an external token-bucket / counter for strict guarantees. |
+| `concurrency.debounce` | **Race-safe for the bump path.** Each start is a single atomic `findOneAndUpdate` against `(workflowId, concurrencyKey)`; the timer push is serialized by Mongo. The fall-through "no draft existed yet → create one" can race two creates if the first start in a quiet window arrives twice within the same millisecond — bounded to two drafts max, both at the same `executionTime`. |
+
+If your workload is concurrency-sensitive in the strict sense — payment captures, ticket reservations, license-seat allocation — wrap the start call in your own gate (Redis lock, partial-unique resource index per [PACKAGE_RULES §32](https://github.com/classytic/specs)) instead of relying on `concurrency.limit`. The streamline gate is fine for "don't overload the embedding API" but not for "exactly N seats."
+
 ## Multi-tenant
 
 ```typescript
@@ -175,7 +251,7 @@ const wf = createWorkflow('my-flow', { steps: { /* ... */ }, container });
 // `bypassTenant: true` for admin ops; `staticTenantId` for single-tenant deployments.
 ```
 
-Works with the full MongoKit plugin surface (cache, audit, observability, field-filter, etc.). Tenant scope applies to `updateMany` / `deleteMany` too — 3.11 class primitives, hooked since streamline v2.2.
+Works with the MongoKit plugin surface (cache, audit, observability, field-filter, etc.). Every read and write — including atomic claims like the scheduler's `findOneAndUpdate` race — routes through inherited `Repository<TDoc>` methods, so plugin hooks fire on engine writes, not just user writes. Tenant scope applies to `updateMany` / `deleteMany` and to the atomic-claim path; `bypassTenant: true` is the explicit opt-out for `_id`-scoped admin operations.
 
 ## Indexing
 
@@ -210,10 +286,11 @@ await repo.updateMany({ status: 'waiting' }, { $set: { status: 'cancelled' } });
 ```typescript
 import { createHook, resumeHook } from '@classytic/streamline';
 
-// In a step:
+// In a step — MUST pass `hookToken` to ctx.wait so resumeHook can validate it.
+// Without it, resumeHook fails closed (no token in the run = no resume).
 const hook = createHook(ctx, 'awaiting-approval');
 console.log(hook.path); // /hooks/<token>
-await ctx.wait('Awaiting approval');
+await ctx.wait('Awaiting approval', { hookToken: hook.token });
 
 // In your HTTP handler:
 app.post('/hooks/:token', async (req, res) => {
@@ -294,21 +371,45 @@ workflow.engine.configure({ scheduler: { maxConcurrentExecutions: 10 } });
 
 ## Error handling
 
+`WorkflowError` (and every subclass) implements [`HttpError`](https://github.com/classytic/repo-core) from `@classytic/repo-core/errors`. Three equivalent ways to identify an error — pick whichever matches your codebase:
+
 ```typescript
-import { ErrorCode } from '@classytic/streamline';
+import { WorkflowError, ErrorCode, ErrorCodeHierarchical } from '@classytic/streamline';
 
 try { await workflow.resume(runId, payload); }
 catch (err) {
+  if (!(err instanceof WorkflowError)) throw err;
+
+  // (A) Cleanest in HTTP layers — the status is right on the error.
+  return res.status(err.status).json({ code: err.code, message: err.message, meta: err.meta });
+
+  // (B) Hierarchical (HttpError-canonical) code — switch on `'workflow.X'` ids.
   switch (err.code) {
-    case ErrorCode.WORKFLOW_NOT_FOUND: return res.status(404).end();
-    case ErrorCode.INVALID_STATE:      return res.status(400).end();
-    case ErrorCode.STEP_TIMEOUT:       return res.status(408).end();
+    case ErrorCodeHierarchical.WORKFLOW_NOT_FOUND: return res.status(404).end();
+    case ErrorCodeHierarchical.INVALID_STATE:      return res.status(400).end();
+    case ErrorCodeHierarchical.STEP_TIMEOUT:       return res.status(408).end();
     default: throw err;
+  }
+
+  // (C) Legacy SCREAMING_SNAKE — kept for backwards compat. New code should
+  // prefer (A) or (B). The legacy value lives on `legacyCode` post-migration.
+  switch (err.legacyCode) {
+    case ErrorCode.WORKFLOW_NOT_FOUND: return res.status(404).end();
+    // ...
   }
 }
 ```
 
-Codes: `WORKFLOW_NOT_FOUND`, `WORKFLOW_CANCELLED`, `STEP_NOT_FOUND`, `STEP_TIMEOUT`, `INVALID_STATE`, `DATA_CORRUPTION`, `MAX_RETRIES_EXCEEDED`.
+Status mapping (also exported as `ERROR_STATUS_MAP`):
+
+| Code | Status | Hierarchical id |
+|---|---|---|
+| `WORKFLOW_NOT_FOUND` | 404 | `workflow.not_found` |
+| `STEP_NOT_FOUND` | 404 | `workflow.step.not_found` |
+| `STEP_TIMEOUT` | 408 | `workflow.step.timeout` |
+| `WORKFLOW_CANCELLED` / `WORKFLOW_ALREADY_COMPLETED` / `EXECUTION_ABORTED` | 409 | `workflow.cancelled` / `…` |
+| `INVALID_STATE` / `INVALID_TRANSITION` / `VALIDATION_ERROR` | 400 | `workflow.invalid_state` / `…` |
+| `DATA_CORRUPTION` / `STEP_FAILED` / `MAX_RETRIES_EXCEEDED` | 500 | `workflow.data_corruption` / `…` |
 
 ## Type-safe exports
 

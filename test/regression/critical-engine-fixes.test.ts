@@ -283,8 +283,8 @@ describe('Critical Engine Fixes', () => {
       });
 
       // Should only return workflows in the range (mid and recurring)
-      expect(result.docs).toHaveLength(2);
-      const ids = result.docs.map((d: any) => d._id);
+      expect(result.data).toHaveLength(2);
+      const ids = result.data.map((d: any) => d._id);
       expect(ids).toContain('scheduled-mid');
       expect(ids).toContain('scheduled-recurring');
       expect(ids).not.toContain('scheduled-early');
@@ -299,8 +299,8 @@ describe('Critical Engine Fixes', () => {
       });
 
       // Should only return recurring workflows
-      expect(result.docs).toHaveLength(1);
-      expect(result.docs[0]._id).toBe('scheduled-recurring');
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0]._id).toBe('scheduled-recurring');
     });
 
     it('should filter by recurring=false', async () => {
@@ -311,8 +311,8 @@ describe('Critical Engine Fixes', () => {
       });
 
       // Should only return non-recurring workflows
-      expect(result.docs).toHaveLength(3);
-      const ids = result.docs.map((d: any) => d._id);
+      expect(result.data).toHaveLength(3);
+      const ids = result.data.map((d: any) => d._id);
       expect(ids).not.toContain('scheduled-recurring');
     });
   });

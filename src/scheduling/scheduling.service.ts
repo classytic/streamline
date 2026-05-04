@@ -49,6 +49,10 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type {
+  KeysetPaginationResult,
+  OffsetPaginationResult,
+} from '@classytic/repo-core/pagination';
 import type { SortOrder } from 'mongoose';
 import { SCHEDULING } from '../config/constants.js';
 import {
@@ -84,16 +88,32 @@ type ScheduledWorkflowInput<TContext> = Omit<
 type WorkflowSort = Record<string, SortOrder>;
 
 /**
- * Paginated result type for scheduled workflows
+ * Paginated result type for scheduled workflows.
+ *
+ * Composed from repo-core's `OffsetPaginationResult` and
+ * `KeysetPaginationResult` — the only two shapes mongokit's `getAll`
+ * returns for this query. We deliberately do NOT use
+ * `AnyPaginationResult` (which also unions in
+ * `AggregatePaginationResult`) because `getAll` never produces aggregate
+ * results here, and including that branch forces call sites to handle a
+ * case that can't actually occur.
+ *
+ * Mongokit decides which shape based on the caller's pagination args:
+ *   - `cursor` / `after`  → keyset (`{ method: 'keyset', next, hasMore }`)
+ *   - `page` / `pagination` (or default) → offset (`{ method: 'offset',
+ *      page, total, pages, hasNext, hasPrev }`)
+ *
+ * Narrow on the `method` discriminant when you need shape-specific
+ * fields. The shared `data: TDoc[]` reads without narrowing.
+ *
+ * Locking the shape on repo-core means a host installing
+ * `arc + mongokit + repo-core + streamline` shares ONE pagination
+ * contract across every package. See mongokit v3.12 changelog ("Breaking
+ * — mongokit no longer re-declares pagination shapes") for the rule.
  */
-export interface ScheduledWorkflowsResult<TContext = unknown> {
-  docs: WorkflowRun<TContext>[];
-  page?: number;
-  limit?: number;
-  total?: number;
-  hasMore?: boolean;
-  next?: string;
-}
+export type ScheduledWorkflowsResult<TContext = unknown> =
+  | OffsetPaginationResult<WorkflowRun<TContext>>
+  | KeysetPaginationResult<WorkflowRun<TContext>>;
 
 /**
  * Options for scheduling a workflow

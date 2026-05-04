@@ -100,7 +100,11 @@ describe('Telemetry and Scheduled Hooks Fixes', () => {
         request: async (ctx) => {
           const hook = createHook(ctx, 'approval');
           hookToken = hook.token;
-          await ctx.wait(hook.token);
+          // ctx.wait(reason, { hookToken }) — the two-arg form the
+          // fail-closed validator requires (streamline 2.3 hardening).
+          // The validator reads waitingFor.data.hookToken; if not stored,
+          // resume is rejected even with a matching token.
+          await ctx.wait('Awaiting approval', { hookToken: hook.token });
         },
         process: async (ctx) => {
           const approval = ctx.getOutput<{ approved: boolean }>('request');

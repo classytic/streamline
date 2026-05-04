@@ -421,6 +421,7 @@ export class SmartScheduler {
       const staleWorkflows = await this.repository.getStaleRunningWorkflows(
         this.config.staleThreshold,
         1,
+        { bypassTenant: true },
       );
 
       if (staleWorkflows.length > 0 && !this.isPolling) {
@@ -452,9 +453,11 @@ export class SmartScheduler {
       const now = new Date();
       let limit = this.config.maxWorkflowsPerPoll;
 
-      // Concurrency gating: check how many slots are available
+      // Concurrency gating: check how many slots are available.
+      // Cross-tenant — `maxConcurrentExecutions` is a global cap across all
+      // tenants this scheduler serves.
       if (this.config.maxConcurrentExecutions !== Infinity) {
-        const activeCount = await this.repository.countRunning();
+        const activeCount = await this.repository.countRunning({ bypassTenant: true });
         if (activeCount >= this.config.maxConcurrentExecutions) {
           // All slots full — skip this poll cycle
           const duration = Date.now() - startTime;
@@ -465,11 +468,12 @@ export class SmartScheduler {
         limit = Math.min(limit, availableSlots);
       }
 
-      // Query workflows ready to resume (timer-based) - PAGINATED
-      const waiting = await this.repository.getReadyToResume(now, limit);
+      // Query workflows ready to resume (timer-based) - PAGINATED.
+      // Cross-tenant sweep — bypass scope; per-row writes downstream are id-scoped.
+      const waiting = await this.repository.getReadyToResume(now, limit, { bypassTenant: true });
 
-      // Query workflows ready for retry (exponential backoff) - PAGINATED
-      const retrying = await this.repository.getReadyForRetry(now, limit);
+      // Query workflows ready for retry (exponential backoff) - PAGINATED.
+      const retrying = await this.repository.getReadyForRetry(now, limit, { bypassTenant: true });
 
       let resumedCount = 0;
 
@@ -499,11 +503,13 @@ export class SmartScheduler {
       }
 
       // Execute scheduled workflows (timezone-aware scheduling) - PAGINATED
-      // Query: status='draft' AND executionTime <= now AND paused != true
+      // Query: status='draft' AND executionTime <= now AND paused != true.
+      // Cross-tenant sweep — bypass scope; per-row writes downstream are id-scoped.
       const scheduledResult = await this.repository.getScheduledWorkflowsReadyToExecute(now, {
         limit,
+        bypassTenant: true,
       });
-      const scheduled = scheduledResult.docs || [];
+      const scheduled = scheduledResult.data || [];
 
       for (const run of scheduled) {
         if (this.retryCallback) {
@@ -526,7 +532,12 @@ export class SmartScheduler {
 
       // Promote concurrency-queued drafts (status='draft', no scheduling, has concurrencyKey)
       // These are runs that were queued because the concurrency limit was reached at start time.
-      const concurrencyDrafts = await this.repository.getConcurrencyDrafts(limit);
+      // Cross-tenant sweep — one scheduler serves every tenant's queue, so
+      // bypass tenant scope on the read. Per-row promotion writes downstream
+      // are `_id`-scoped.
+      const concurrencyDrafts = await this.repository.getConcurrencyDrafts(limit, {
+        bypassTenant: true,
+      });
 
       for (const draft of concurrencyDrafts) {
         if (this.retryCallback) {
@@ -539,15 +550,20 @@ export class SmartScheduler {
         }
       }
 
-      // Recover stale running workflows (no heartbeat threshold) - PAGINATED
-      const stale = await this.repository.getStaleRunningWorkflows(
-        this.config.staleThreshold,
-        limit,
-      );
-
-      for (const run of stale) {
-        // Use dedicated stale recovery callback if available
-        // This uses atomic claim on 'running' status with stale heartbeat check
+      // Recover stale running workflows — STREAMING via mongokit's cursor().
+      // Cross-tenant sweep; per-row recovery writes are id-scoped.
+      //
+      // Why cursor instead of buffered findAll: a cluster crash can leave
+      // thousands of stale runs. Buffering the full page peaks memory at
+      // `limit × runDocSize` (potentially MBs); streaming holds one doc.
+      // The consumer breaks at `limit` for the per-poll budget, so wire
+      // cost is identical to the bounded read.
+      let staleCount = 0;
+      for await (const run of this.repository.cursorStaleRunning(this.config.staleThreshold, {
+        bypassTenant: true,
+      })) {
+        if (staleCount >= limit) break;
+        staleCount++;
         if (this.staleRecoveryCallback) {
           try {
             await this.staleRecoveryCallback(run._id, this.config.staleThreshold);
@@ -562,7 +578,7 @@ export class SmartScheduler {
 
       // Record successful poll
       const duration = Date.now() - startTime;
-      const totalWorkflows = waiting.length + retrying.length + scheduled.length + stale.length;
+      const totalWorkflows = waiting.length + retrying.length + scheduled.length + staleCount;
       this.metrics.recordPoll(duration, true, totalWorkflows);
       this.consecutiveFailures = 0;
 
@@ -620,7 +636,7 @@ export class SmartScheduler {
 
   private async hasWaitingWorkflows(): Promise<boolean> {
     try {
-      return await this.repository.hasWaitingWorkflows();
+      return await this.repository.hasWaitingWorkflows({ bypassTenant: true });
     } catch (error) {
       this.emitError('check-waiting', error);
       return false;
@@ -634,23 +650,30 @@ export class SmartScheduler {
    */
   private async hasActiveWorkflows(): Promise<boolean> {
     try {
-      // Check for waiting workflows (need resume/retry)
-      if (await this.repository.hasWaitingWorkflows()) return true;
+      // Cross-tenant wake-up probes — scheduler activates when ANY tenant
+      // has work pending. Bypass tenant scope on every read; per-row writes
+      // downstream are id-scoped.
+      if (await this.repository.hasWaitingWorkflows({ bypassTenant: true })) return true;
 
       // Check for scheduled workflows ready to execute (timezone-aware)
       const scheduled = await this.repository.getScheduledWorkflowsReadyToExecute(new Date(), {
         limit: 1,
+        bypassTenant: true,
       });
-      if (scheduled.docs && scheduled.docs.length > 0) return true;
+      if (scheduled.data && scheduled.data.length > 0) return true;
 
       // Check for STALE running workflows (might need recovery after crashes)
       // Don't start scheduler for healthy running workflows
-      const stale = await this.repository.getStaleRunningWorkflows(this.config.staleThreshold, 1);
+      const stale = await this.repository.getStaleRunningWorkflows(this.config.staleThreshold, 1, {
+        bypassTenant: true,
+      });
       if (stale.length > 0) return true;
 
       // Check for concurrency-queued drafts waiting for promotion (bounded
-      // exists-query — short-circuits on the first match).
-      if (await this.repository.hasConcurrencyDrafts()) return true;
+      // exists-query — short-circuits on the first match). Cross-tenant
+      // probe — the scheduler decides whether to wake based on global
+      // queue depth across all tenants.
+      if (await this.repository.hasConcurrencyDrafts({ bypassTenant: true })) return true;
 
       return false;
     } catch (error) {

@@ -50,9 +50,9 @@ describe('Scheduled Workflows Lean Query', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(1);
+      expect(result.data).toHaveLength(1);
 
-      const doc = result.docs[0];
+      const doc = result.data[0];
 
       // Should be plain object (no Mongoose methods)
       expect(typeof doc.toObject).toBe('undefined');
@@ -97,9 +97,9 @@ describe('Scheduled Workflows Lean Query', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(1);
+      expect(result.data).toHaveLength(1);
 
-      const doc = result.docs[0];
+      const doc = result.data[0];
 
       // Context should be preserved with all nested fields
       expect(doc.context).toBeDefined();
@@ -138,9 +138,9 @@ describe('Scheduled Workflows Lean Query', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(1);
+      expect(result.data).toHaveLength(1);
 
-      const doc = result.docs[0];
+      const doc = result.data[0];
 
       // Empty context might be undefined with lean queries (MongoDB behavior)
       // This is acceptable - the important thing is it doesn't cause errors
@@ -185,10 +185,10 @@ describe('Scheduled Workflows Lean Query', () => {
       const memAfter = process.memoryUsage().heapUsed;
       const memDiff = (memAfter - memBefore) / 1024 / 1024; // MB
 
-      expect(result.docs).toHaveLength(100);
+      expect(result.data).toHaveLength(100);
 
       // Verify all documents are plain objects
-      result.docs.forEach((doc, index) => {
+      result.data.forEach((doc, index) => {
         expect(typeof doc.toObject).toBe('undefined');
         expect(doc.context.index).toBe(index);
       });
@@ -266,8 +266,8 @@ describe('Scheduled Workflows Lean Query', () => {
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(now);
 
       // Should only return the 2 ready workflows
-      expect(result.docs).toHaveLength(2);
-      expect(result.docs.map(d => d._id).sort()).toEqual(['scheduled-ready-1', 'scheduled-ready-2']);
+      expect(result.data).toHaveLength(2);
+      expect(result.data.map(d => d._id).sort()).toEqual(['scheduled-ready-1', 'scheduled-ready-2']);
     });
 
     it('should exclude paused workflows', async () => {
@@ -317,8 +317,8 @@ describe('Scheduled Workflows Lean Query', () => {
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
       // Should only return non-paused workflow
-      expect(result.docs).toHaveLength(1);
-      expect(result.docs[0]._id).toBe('scheduled-active');
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0]._id).toBe('scheduled-active');
     });
   });
 
@@ -356,7 +356,7 @@ describe('Scheduled Workflows Lean Query', () => {
         limit: 10,
       });
 
-      expect(page1.docs).toHaveLength(10);
+      expect(page1.data).toHaveLength(10);
       expect(page1.page).toBe(1);
       expect(page1.limit).toBe(10);
       expect(page1.total).toBe(25);
@@ -367,7 +367,7 @@ describe('Scheduled Workflows Lean Query', () => {
         limit: 10,
       });
 
-      expect(page2.docs).toHaveLength(10);
+      expect(page2.data).toHaveLength(10);
       expect(page2.page).toBe(2);
 
       // Page 3 (last page)
@@ -376,7 +376,7 @@ describe('Scheduled Workflows Lean Query', () => {
         limit: 10,
       });
 
-      expect(page3.docs).toHaveLength(5);
+      expect(page3.data).toHaveLength(5);
       expect(page3.page).toBe(3);
     });
   });
@@ -404,7 +404,7 @@ describe('Scheduled Workflows Lean Query', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      const doc = result.docs[0];
+      const doc = result.data[0];
 
       // Should have all WorkflowRun fields
       expect(doc._id).toBeDefined();

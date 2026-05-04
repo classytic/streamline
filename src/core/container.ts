@@ -10,6 +10,10 @@ import { bridgeBusToTransport } from '../events/bridge.js';
 import { InProcessStreamlineBus } from '../events/in-process-bus.js';
 import { WorkflowCache } from '../storage/cache.js';
 import {
+  type WorkflowConcurrencyCounterRepository,
+  workflowConcurrencyCounterRepository,
+} from '../storage/concurrency-counter.repository.js';
+import {
   createWorkflowRepository,
   type WorkflowRepositoryConfig,
   type WorkflowRunRepository,
@@ -93,6 +97,13 @@ class InMemorySignalStore implements SignalStore {
 export interface StreamlineContainer {
   /** MongoDB repository for workflow runs */
   readonly repository: WorkflowRunRepository;
+  /**
+   * Strict-concurrency counter repository — only used when a workflow
+   * declares `concurrency.strict: true`. Best-effort `concurrency.limit`
+   * doesn't touch this collection. The default singleton works for every
+   * deployment; override for testing or to swap the counter collection.
+   */
+  readonly concurrencyCounterRepository: WorkflowConcurrencyCounterRepository;
   /** Event bus for workflow lifecycle events (internal, legacy shape) */
   readonly eventBus: WorkflowEventBus;
   /**
@@ -140,6 +151,15 @@ export interface ContainerOptions {
    * - If undefined: uses default in-memory store (process-local)
    */
   signalStore?: SignalStore;
+
+  /**
+   * Custom strict-concurrency counter repository — only consulted when a
+   * workflow declares `concurrency.strict: true`. Default is the singleton
+   * from `concurrency-counter.repository.ts` (one shared collection,
+   * `workflow_concurrency_counters`). Override for tests or to point at
+   * a custom collection.
+   */
+  concurrencyCounterRepository?: WorkflowConcurrencyCounterRepository;
 
   /**
    * Arc-compatible event transport (from `@classytic/arc/events` or any
@@ -228,7 +248,21 @@ export function createContainer(options: ContainerOptions = {}): StreamlineConta
   // lifetime of the container — no explicit teardown needed in normal use.
   bridgeBusToTransport(eventBus, eventTransport);
 
-  return { repository, eventBus, eventTransport, cache, signalStore };
+  // Strict-concurrency counter — singleton; the counter collection is
+  // global per `(workflowId, key)` and the same scheduler / engine
+  // serves every container. Override via `options.concurrencyCounterRepository`
+  // for tests or custom collections.
+  const concurrencyCounterRepository =
+    options.concurrencyCounterRepository ?? workflowConcurrencyCounterRepository;
+
+  return {
+    repository,
+    concurrencyCounterRepository,
+    eventBus,
+    eventTransport,
+    cache,
+    signalStore,
+  };
 }
 
 /**

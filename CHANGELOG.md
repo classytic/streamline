@@ -5,6 +5,227 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-05-02 — start-rate gates · strict concurrency · HttpError · mongokit 3.13 / repo-core 0.4 alignment · security + correctness hardening
+
+> **Why this release.** Three gaps closed at once: (1) start-rate gates
+> (debounce / throttle / strict concurrency) for callers that can't afford to
+> overload downstream APIs; (2) tenant + race-safety closure across every
+> persistence path the engine touches (idempotency, scheduler probes,
+> debounce bumps, child-workflow events); (3) source-of-truth alignment with
+> `@classytic/repo-core` 0.4 + `@classytic/primitives` so a host installing
+> `arc + mongokit + repo-core + primitives + streamline` shares one set of
+> contracts — no dedup-induced drift.
+
+### ⚠️ Breaking — requires action
+
+1. **Peer dep bump:** `@classytic/mongokit` `>=3.11` → `>=3.13.0`.
+   `@classytic/repo-core` `>=0.4.0` is now a direct peer dep (was reached
+   through mongokit). Hosts must install repo-core in the same `node_modules`
+   so all packages share the same instance.
+2. **Webhook security — fail-closed token validation.** `resumeHook()` now
+   rejects when `ctx.wait` was called without `{ hookToken: hook.token }`
+   stored. Pre-fix any token starting with a valid runId would resume the
+   workflow (the README example was the canonical misuse). Workflows using
+   `createHook` MUST update `ctx.wait('reason', { hookToken: hook.token })`.
+3. **Idempotency unique partial index** on `{ idempotencyKey: 1 }` filtered
+   to non-terminal statuses. Existing deployments with duplicate active
+   `idempotencyKey` values (possible under the pre-fix race) MUST run the
+   pre-deploy migration script in [`run.model.ts:142`](./src/storage/run.model.ts)
+   to terminate duplicates before deploying — Mongo refuses to build the
+   index otherwise.
+4. **`WorkflowError.code` shape change.** Now the hierarchical
+   `'workflow.not_found'` form (HttpError-canonical). The legacy
+   screaming-snake value lives on `err.legacyCode` for backwards compat.
+   Consumers comparing `err.code === ErrorCode.X` must switch to either
+   `err.legacyCode === ErrorCode.X` or `err.code === ErrorCodeHierarchical.X`.
+   Three migration paths documented in the README error-handling section.
+
+### 🚀 New — start-rate gates
+
+- **`concurrency.throttle: { limit, windowMs }`** — best-effort smoothing.
+  First `limit` starts per window per key fire immediately; excess starts
+  queue as scheduled drafts spread across the window
+  (`tail.executionTime + windowMs / limit`). Sequential bursts strictly
+  smooth; parallel callers may collide on the same slot — this is documented
+  in code + README + a contract test. Use for "don't overload an embedding
+  API," NOT for "exactly N per window."
+- **`concurrency.debounce: { windowMs }`** — trailing-edge collapse.
+  Repeated starts within `windowMs` atomically push the pending draft's
+  `executionTime` and overwrite `input` / `context` with the latest values.
+  Lodash semantics. Tenant scope preserved on bumps.
+- **`concurrency.strict: true`** — atomic per-bucket counter via
+  `WorkflowConcurrencyCounterRepository`. Race-safe across parallel workers
+  and processes. Rejects starts past the limit with
+  `ConcurrencyLimitReachedError` (status 429). Use for payment captures,
+  SLA-bound work, partner-API quotas. Requires `limit` + `key`. Drift
+  recovery via the leaky-counter reconciliation pattern documented on the
+  repo. Validation throws at `createWorkflow()` if misconfigured.
+- **`config.trigger`** now accepts `tenantId` extractor /
+  `staticTenantId` / `bypassTenant` so triggered workflows propagate tenant
+  context end-to-end. Pre-fix triggered firings called `engine.start(data)`
+  bare and bypassed both tenant scope AND every concurrency gate
+  (debounce / throttle / limit). They now flow through the wrapped `start()`
+  with the full gate stack. Trigger errors surface via `engine:error`
+  instead of being silently swallowed.
+
+### 🚀 New — repository surface (mongokit 3.13 alignment)
+
+- **`Repository.claim()` migration.** Streamline's atomic state-transition
+  CAS sites (scheduler claim, stale recovery, draft promotion, paused
+  resume) now use `super.claim(id, { from, to, where? }, patch, options)`
+  from mongokit 3.13. 6/21 atomic-write sites are claim — every true
+  state-machine transition; the remaining 15 are non-CAS field updates that
+  correctly stay on `findOneAndUpdate`. Full plugin chain (audit, cache,
+  observability, multi-tenant) fires on every claim because `claim` is in
+  `OP_REGISTRY` with `policyKey: 'query'`.
+- **`MongoOperatorUpdate` typed update**. Streamline's local `MongoUpdate`
+  type is now an alias to mongokit's exported `MongoOperatorUpdate` (typed
+  operator keys + index signature). The historic
+  `as unknown as Record<string, unknown>` cast is gone. Callers building
+  typed update docs get full IntelliSense.
+
+### 🚀 New — error contracts (repo-core alignment)
+
+- **`WorkflowError implements HttpError`** from `@classytic/repo-core/errors`.
+  Three new fields per error: `status: number`, hierarchical `code: string`,
+  `meta: Record<string, unknown>`. Arc handlers and any HTTP-layer host
+  auto-map to the canonical wire envelope without translation tables. New
+  exports: `ErrorCodeHierarchical`, `ERROR_STATUS_MAP`. New error class:
+  `ConcurrencyLimitReachedError` (429).
+
+### 🛠 Tenant correctness — every persistence path now scoped
+
+- **`StartOptions.tenantId` / `bypassTenant`** added; threaded through
+  `engine.start` → `repository.create`, the idempotency lookup,
+  `bumpDebounceDraft` (with explicit re-stamping of the tenant subpath
+  when `context` is overwritten), and every throttle/concurrency probe
+  (`countStartsInWindow`, `nextThrottleFireAt`, `oldestStartInWindow`,
+  `countActiveByConcurrencyKey`).
+- **Scheduler-side reads** (`getReadyToResume`, `getReadyForRetry`,
+  `getStaleRunningWorkflows`, `getScheduledWorkflowsReadyToExecute`,
+  `getConcurrencyDrafts`, `hasConcurrencyDrafts`, `countRunning`,
+  `hasWaitingWorkflows`, `countConcurrencyDrafts`) now accept
+  `AtomicUpdateOptions`. Scheduler/engine sweep callers pass
+  `{ bypassTenant: true }` since one scheduler serves every tenant.
+- **`tenantFilterPlugin`** now hooks `before:claim`, `before:findOneAndUpdate`,
+  `before:getOne`, `before:findAll`, `before:count`, `before:exists` —
+  closes the silent-gap bug class on cross-cutting plugin hook coverage.
+
+### 🛡 Security + correctness fixes
+
+- **Webhook token fail-closed validation** (see breaking changes).
+- **Idempotency race-safety** via partial unique index (see breaking
+  changes). `repository.create()` catches E11000 and returns the winning run.
+- **Child workflow cross-container events.** Parent now subscribes to BOTH
+  its own and the child engine's container event bus when they differ
+  (deduped via `resumed` flag). Pre-fix the parent listened only on its own
+  bus and missed cross-container completion events.
+- **Heartbeat backpressure** unchanged from 2.2 — but the new strict-concurrency
+  counter release listener is registered on every engine for free.
+
+### 📦 Source-of-truth alignment
+
+| Type / shape | Source of truth | Was |
+|---|---|---|
+| `OffsetPaginationResult` / `KeysetPaginationResult` | `@classytic/repo-core/pagination` | Hand-rolled local interface |
+| `MongoOperatorUpdate` | `@classytic/mongokit` | Hand-rolled local `MongoUpdate` |
+| `HttpError` | `@classytic/repo-core/errors` | Custom `WorkflowError` shape with no `status` |
+| `EventTransport` / `DomainEvent` / `OperationContext` | `@classytic/primitives/events` + `@classytic/primitives/context` | Already aligned in 2.2; documented for completeness |
+
+### 🧪 Tests added
+
+- **`test/integration/throttle-debounce-scenarios.test.ts`** — 11 scenarios
+  pinning the throttle staggering (deep-burst), debounce trailing-edge
+  collapse, key isolation, tenant propagation in strict mode, and the
+  cross-tenant scheduler probe bypass.
+- **`test/integration/strict-concurrency-scenarios.test.ts`** — 10 scenarios
+  pinning admit/reject behavior, counter lifecycle (completed / failed /
+  cancelled), `releaseSlot` idempotency, parallel race safety, and config
+  validation.
+- **`test/integration/contract-scenarios.test.ts`** — 11 scenarios pinning
+  webhook token fail-closed (3 tests including attacker-guess case),
+  abort/timeout honest contract (engine delivers + releases, can't kill
+  unaware handler), child-workflow cross-container completion, concurrency
+  best-effort vs strict contract, trigger-event tenant propagation
+  (extractor + static).
+- **`test/unit/errors.test.ts`** — 23 tests covering `HttpError` conformance
+  on every error subclass via `it.each` matrix, hierarchical-code parity,
+  `ERROR_STATUS_MAP` validation, legacy-field preservation.
+
+- **`test/integration/state-machine-cursor-scenarios.test.ts`** — 9
+  scenarios pinning `RUN_MACHINE` / `STEP_MACHINE` transition tables,
+  the deliberate `isTerminalState`-vs-`RUN_MACHINE.isTerminal` semantic
+  divergence (caught a regression mid-implementation), and
+  `cursorStaleRunning` streaming behavior (yields one-at-a-time, respects
+  consumer break, excludes paused runs).
+
+Total test count: **298 passing** (was 254 — 44 added).
+
+### 🚀 New — internal upgrades (best-practice adoption)
+
+- **`defineStateMachine()` from `@classytic/primitives/state-machine`** for
+  workflow-run + step status. Replaces `core/status.ts`'s previously-dead
+  `isValidStepTransition` / `isValidRunTransition` validators with live
+  `RUN_MACHINE` and `STEP_MACHINE` instances. Engine's atomic claim sites
+  use `assertAndClaim(RUN_MACHINE, repo, runId, { from, to, ... })` —
+  pairs sync `assertTransition` (catches programmer bugs as
+  `IllegalTransitionError` before the round-trip) with the existing
+  Mongo CAS (catches concurrent writers via `null`). Two layers, both
+  load-bearing. The legacy validator functions stay as `@deprecated`
+  back-compat shims.
+- **`cursor()` for stale-workflow scanner.** New
+  `WorkflowRunRepository.cursorStaleRunning()` streams stale runs one at
+  a time via mongokit's `cursor()` instead of buffering the full page.
+  Lower memory peak when cluster crashes leave thousands of stale runs;
+  same wire cost since the consumer breaks at the per-poll budget.
+
+### 🚫 Deliberately not done (recorded so future maintainers don't relitigate)
+
+- **`useMiddleware()` for tenant-filter plugin.** Mongokit's own CLAUDE.md
+  rules this out: *"Don't use middleware for security policy (tenant scope,
+  soft-delete filtering, audit). Policy hooks fire BEFORE middleware sees
+  the op, so middleware can never wrap a policy failure. Use `before:*`
+  hooks for policy, `useMiddleware()` for ergonomics."* The 13 hook
+  registrations stay; the rationale is now locked in as a docstring on the
+  plugin so this doesn't get relitigated. **Note:** `isTerminalState()`
+  intentionally has a different definition than `RUN_MACHINE.isTerminal()`
+  — the helper carries the streamline domain semantic
+  (done/failed/cancelled), the machine the structural one (only cancelled,
+  since done/failed allow rewind). Both coexist by design.
+
+### 📦 Migration
+
+```diff
+- "@classytic/mongokit": ">=3.11"
++ "@classytic/mongokit": ">=3.13.0"
++ "@classytic/repo-core": ">=0.4.0"
+```
+
+```ts
+// Webhook security — REQUIRED migration:
+- await ctx.wait('Awaiting approval');
++ await ctx.wait('Awaiting approval', { hookToken: hook.token });
+
+// Error code comparison — pick one:
+- if (err.code === ErrorCode.WORKFLOW_NOT_FOUND) { ... }
++ if (err.legacyCode === ErrorCode.WORKFLOW_NOT_FOUND) { ... }     // legacy
++ if (err.code === ErrorCodeHierarchical.WORKFLOW_NOT_FOUND) { ... } // canonical
++ if (err.status === 404) { ... }                                   // HttpError
+```
+
+```js
+// Idempotency duplicates pre-deploy migration (run ONCE before rolling out 2.3):
+db.workflow_runs.aggregate([
+  { $match: { idempotencyKey: { $type: 'string' },
+              status: { $in: ['draft', 'running', 'waiting'] }}},
+  { $group: { _id: '$idempotencyKey', ids: { $push: '$_id' }, n: { $sum: 1 }}},
+  { $match: { n: { $gt: 1 }}},
+]);
+// For each duplicate group: cancel all but the oldest. See run.model.ts:142.
+```
+
+---
+
 ## [2.2.0] - 2026-04-22 — PACKAGE_RULES alignment + `@classytic/primitives` integration + mongokit 3.11 / repo-core 0.2.0 compat + durability/observability hardening
 
 ### 🛠 Additional hardening landed in the v2.2 cycle

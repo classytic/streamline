@@ -11,6 +11,7 @@
  * We keep raw-operator builders so the atomic-claim paths stay one layer
  * closer to the wire.
  */
+import type { MongoOperatorUpdate } from '@classytic/mongokit';
 import type { StepState, WorkflowRun } from '../core/types.js';
 
 // ---------------------------------------------------------------------------
@@ -23,15 +24,16 @@ import type { StepState, WorkflowRun } from '../core/types.js';
  *
  * `updateOne()` also accepts a plain field-shape object as a convenience
  * (auto-wrapped in `$set`) — that's typed as `Partial<TDoc>` at call sites.
+ *
+ * Aliased to `MongoOperatorUpdate` from `@classytic/mongokit` 3.13+ —
+ * inherits the explicit operator typing (`$set`, `$unset`, `$inc`, `$mul`,
+ * `$push`, `$pull`, `$pullAll`, `$addToSet`, `$pop`, `$min`, `$max`,
+ * `$rename`, `$currentDate`, `$bit`) plus the `[op: string]: unknown`
+ * index signature that lets a caller-built update value assign to
+ * `Record<string, unknown>` without the historic
+ * `as unknown as Record<string, unknown>` cast.
  */
-export interface MongoUpdate {
-  $set?: Record<string, unknown>;
-  $unset?: Record<string, '' | 1>;
-  $inc?: Record<string, number>;
-  $push?: Record<string, unknown>;
-  $pull?: Record<string, unknown>;
-  $addToSet?: Record<string, unknown>;
-}
+export type MongoUpdate = MongoOperatorUpdate;
 
 type UpdateDoc = MongoUpdate | Record<string, unknown>;
 

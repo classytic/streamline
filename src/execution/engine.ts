@@ -1,7 +1,8 @@
+import { assertAndClaim } from '@classytic/primitives/state-machine';
 import { TIMING } from '../config/constants.js';
 import type { StreamlineContainer } from '../core/container.js';
 import { globalEventBus, type WorkflowEventBus } from '../core/events.js';
-import { isTerminalState } from '../core/status.js';
+import { isTerminalState, RUN_MACHINE } from '../core/status.js';
 import type {
   StepState,
   WorkflowDefinition,
@@ -178,17 +179,19 @@ async function handleShortDelayOrSchedule(
   }
 
   if (delayMs <= TIMING.SHORT_DELAY_THRESHOLD_MS) {
-    const claimed = await repository.updateOne(
-      {
-        _id: runId,
-        status: 'waiting',
-        paused: { $ne: true },
-      },
-      runSet({ status: 'running', lastHeartbeat: new Date() }),
-      { bypassTenant: true },
-    );
+    // Status-transition CAS — `assertAndClaim` runs `RUN_MACHINE.assertTransition`
+    // (sync, in-memory) before the Mongo CAS. An illegal `waiting → running`
+    // would be a programmer bug; the sync throw surfaces it before the
+    // round-trip. The CAS itself still rejects concurrent writers via null.
+    const claimed = await assertAndClaim(RUN_MACHINE, repository, runId, {
+      from: 'waiting',
+      to: 'running',
+      where: { paused: { $ne: true } },
+      patch: { lastHeartbeat: new Date(), updatedAt: new Date() },
+      options: { bypassTenant: true },
+    });
 
-    if (claimed.modifiedCount > 0) {
+    if (claimed) {
       cache.delete(runId);
       return true;
     }
@@ -291,6 +294,39 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       });
     });
 
+    // Strict-concurrency slot release: when a run reaches terminal state,
+    // read its `meta.concurrencyCounterId` and decrement the counter. The
+    // listener stays for the engine's lifetime; it's a no-op for runs
+    // without the meta marker (best-effort or non-concurrency-gated runs).
+    //
+    // Why on the bus and not in the executor's terminal write paths:
+    // there are 4 distinct terminal-write sites (executor success path,
+    // executor failed path, engine.cancel, engine.failCorruption); event
+    // emission is the single fan-in. Listening here means we never miss
+    // a release no matter which path produced the terminal state.
+    const releaseSlotOnTerminal = async (payload: { runId?: string }) => {
+      if (!payload.runId) return;
+      try {
+        const run = await this.container.repository.getById(payload.runId);
+        const counterId = (run?.meta as Record<string, unknown> | undefined)
+          ?.concurrencyCounterId as string | undefined;
+        if (counterId) {
+          await this.container.concurrencyCounterRepository.releaseSlot(counterId);
+        }
+      } catch (err) {
+        // Release failures are diagnostic — the counter will drift +1 until
+        // reconciled. Don't crash the event-bus listener loop.
+        this.container.eventBus.emit('engine:error', {
+          runId: payload.runId,
+          error: err instanceof Error ? err : new Error(String(err)),
+          context: 'concurrency-counter-release',
+        });
+      }
+    };
+    this.container.eventBus.on('workflow:completed', releaseSlotOnTerminal);
+    this.container.eventBus.on('workflow:failed', releaseSlotOnTerminal);
+    this.container.eventBus.on('workflow:cancelled', releaseSlotOnTerminal);
+
     this.options = { autoExecute: true, ...options };
   }
 
@@ -314,7 +350,23 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       priority?: number;
       concurrencyKey?: string;
       startAsDraft?: boolean;
+      /**
+       * Schedule this run to fire at a future time. Forces the run to start
+       * as a draft with `scheduling.executionTime` set; the smart scheduler's
+       * scheduled-draft pickup path transitions it to running when the time
+       * passes. Used by throttle/debounce gates in `define.ts`.
+       */
+      scheduledExecutionTime?: Date;
       cancelOn?: Array<{ event: string }>;
+      /**
+       * Tenant context forwarded to `repository.create` (and the idempotency
+       * lookup). Required when the repository was constructed with
+       * `multiTenant.strict: true`; the tenant-filter plugin throws on
+       * `before:create` / `before:getOne` if missing. Single-tenant or
+       * `staticTenantId` deployments can omit.
+       */
+      tenantId?: string;
+      bypassTenant?: boolean;
     },
   ): Promise<WorkflowRun<TContext>> {
     const run = this.registry.createRun(input, options?.meta);
@@ -324,24 +376,48 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     if (options?.priority) run.priority = options.priority;
     if (options?.concurrencyKey) run.concurrencyKey = options.concurrencyKey;
 
+    const tenantOpts = {
+      ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+      ...(options?.bypassTenant ? { bypassTenant: true } : {}),
+    };
+
     // Idempotency: if a non-terminal run with this key exists, return it.
     // Terminal runs (done/failed/cancelled) don't block — the key is reusable.
+    // Tenant-scoped lookup — strict mode requires explicit context.
     if (options?.idempotencyKey) {
       const existing = await this.container.repository.findActiveByIdempotencyKey(
         options.idempotencyKey,
+        tenantOpts,
       );
       if (existing) return existing as WorkflowRun<TContext>;
     }
 
-    // Concurrency-limited: start as draft (scheduler will promote when slot opens)
-    if (options?.startAsDraft) {
+    // Scheduled execution (throttle/debounce gates): force draft with a
+    // future executionTime. SchedulingInfo's other fields are required by
+    // the schema, so we synthesize sensible UTC defaults — the only field
+    // the scheduler actually queries is executionTime.
+    if (options?.scheduledExecutionTime) {
+      const fireAt = options.scheduledExecutionTime;
+      run.status = 'draft';
+      run.scheduling = {
+        executionTime: fireAt,
+        scheduledFor: fireAt.toISOString(),
+        timezone: 'UTC',
+        localTimeDisplay: fireAt.toISOString(),
+        isDSTTransition: false,
+      };
+    } else if (options?.startAsDraft) {
+      // Concurrency-limited: start as draft (scheduler will promote when slot opens)
       run.status = 'draft';
     } else {
       run.status = 'running';
       run.startedAt = new Date();
     }
 
-    await this.container.repository.create(run);
+    // Tenant context forwarded — strict-mode `before:create` hook fires
+    // here and demands `tenantId` (or `bypassTenant: true`); single-tenant
+    // / `staticTenantId` deployments pass nothing and the plugin no-ops.
+    await this.container.repository.create(run, tenantOpts);
 
     this.container.cache.set(run);
     hookRegistry.register(run._id, this as unknown as WorkflowEngine<unknown>);
@@ -567,7 +643,15 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   private promoteConcurrencyDrafts(workflowId: string, concurrencyKey: string): void {
     setImmediate(async () => {
       try {
-        const drafts = await this.container.repository.getConcurrencyDrafts(10);
+        // Cross-tenant promotion sweep — the engine doesn't know which
+        // tenant owns the draft until it inspects each row, so we read
+        // unscoped and rely on `_id`-scoped writes downstream
+        // (`executeRetry` → `claim` is gated by id + status). In strict
+        // multi-tenant mode the read would otherwise throw before any
+        // promotion could happen.
+        const drafts = await this.container.repository.getConcurrencyDrafts(10, {
+          bypassTenant: true,
+        });
         const matching = drafts.filter(
           (d) => d.workflowId === workflowId && d.concurrencyKey === concurrencyKey,
         );
@@ -709,11 +793,31 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
             );
           }
 
-          // Listen for child completion and auto-resume parent
+          // Listen for child completion and auto-resume parent.
+          //
+          // Buses to subscribe on:
+          //   1. parent's container bus — same-container children fire here
+          //   2. child's container bus  — cross-container children fire here
+          //      (the executor calls `this.eventBus.emit` against the child
+          //      engine's own container, NOT the parent's)
+          // Subscribe to both; dedupe by `_resumed` flag so only one fires
+          // when buses are the same.
+          const sameContainer = childEngine.container.eventBus === this.container.eventBus;
+          let resumed = false;
+
+          const cleanup = () => {
+            this.container.eventBus.off('workflow:completed', childCompletionHandler);
+            this.container.eventBus.off('workflow:failed', childFailHandler);
+            if (!sameContainer) {
+              childEngine.container.eventBus.off('workflow:completed', childCompletionHandler);
+              childEngine.container.eventBus.off('workflow:failed', childFailHandler);
+            }
+          };
+
           const childCompletionHandler = async (payload: { runId?: string; data?: unknown }) => {
             if (!payload.runId || payload.runId !== childRun._id) return;
-
-            // Child completed — resume parent with child's output
+            if (resumed) return;
+            resumed = true;
             try {
               const completedChild = await childEngine.get(childRun._id);
               const output = completedChild?.output ?? completedChild?.context;
@@ -721,29 +825,28 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
             } catch {
               // Parent may have been cancelled or already resumed
             }
-
-            // Clean up listener
-            this.container.eventBus.off('workflow:completed', childCompletionHandler);
-            this.container.eventBus.off('workflow:failed', childFailHandler);
+            cleanup();
           };
 
           const childFailHandler = async (payload: { runId?: string; data?: unknown }) => {
             if (!payload.runId || payload.runId !== childRun._id) return;
-
+            if (resumed) return;
+            resumed = true;
             try {
               const failedChild = await childEngine.get(childRun._id);
               await this.resume(runId, { __childFailed: true, error: failedChild?.error });
             } catch {
               // Parent may have been cancelled
             }
-
-            this.container.eventBus.off('workflow:completed', childCompletionHandler);
-            this.container.eventBus.off('workflow:failed', childFailHandler);
+            cleanup();
           };
 
-          // Use global event bus if child uses a different container
           this.container.eventBus.on('workflow:completed', childCompletionHandler);
           this.container.eventBus.on('workflow:failed', childFailHandler);
+          if (!sameContainer) {
+            childEngine.container.eventBus.on('workflow:completed', childCompletionHandler);
+            childEngine.container.eventBus.on('workflow:failed', childFailHandler);
+          }
         } else {
           // Child engine not found — emit guidance
           this.container.eventBus.emit('engine:error', {
@@ -941,14 +1044,23 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
     // Atomic claim: clear paused flag with guard to prevent concurrent resume race.
     // Two workers calling resume() simultaneously — only one wins the atomic claim.
+    //
+    // Uses mongokit 3.13's `Repository.claim()` primitive — the canonical
+    // shape for `{ _id, [field]: from } → $set: { [field]: to, ...patch }`
+    // atomic state transitions. Goes through `_runOp` → plugin chain
+    // (audit, observability) fires; OP_REGISTRY classifies `claim` as
+    // `mutates: true / policyKey: 'query'` so multi-tenant scope auto-
+    // injects when wired. `bypassTenant: true` here because the call is
+    // already _id-scoped from a tenant-trusted caller.
     if (run.paused) {
-      const claimResult = await this.container.repository.updateOne(
-        { _id: runId, paused: true },
-        runSet({ paused: false }),
+      const claimed = await this.container.repository.claim(
+        runId,
+        { field: 'paused', from: true, to: false },
+        { updatedAt: new Date() },
         { bypassTenant: true },
       );
 
-      if (claimResult.modifiedCount === 0) {
+      if (!claimed) {
         // Another worker already resumed — refresh and return current state
         const current = await this.getOrThrow(runId);
         return current;
@@ -991,10 +1103,17 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       }
     }
 
-    // Otherwise, just continue execution (pending step or retry backoff)
+    // Otherwise, just continue execution (pending step or retry backoff).
+    // Send ONLY the narrow update fields. See `cancel()` for why spreading
+    // (or passing the whole hydrated `run`) into updateById poisons the
+    // cache via mongoose 9's update-cast subdoc coercion.
+    const updates: Partial<WorkflowRun<TContext>> = {
+      status: 'running' as WorkflowRun<TContext>['status'],
+      lastHeartbeat: new Date(),
+    };
+    await this.container.repository.updateById(runId, updates, { bypassTenant: true });
     run.status = 'running';
-    run.lastHeartbeat = new Date();
-    await this.container.repository.updateById(runId, run, { bypassTenant: true });
+    run.lastHeartbeat = updates.lastHeartbeat as Date;
     this.container.cache.set(run);
     return this.execute(runId);
   }
@@ -1009,18 +1128,25 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   ): Promise<WorkflowRun<TContext> | null> {
     const staleTime = new Date(Date.now() - staleThresholdMs);
 
-    // Atomic claim: Only recover if status is 'running' AND heartbeat is stale
-    const claimResult = await this.container.repository.updateOne(
+    // Atomic claim: Only recover if status is 'running' AND heartbeat is stale.
+    // The "stale" check goes in `where:` — `claim()` handles compound filter
+    // predicates AND-merged alongside the id+state CAS keys. Status stays
+    // 'running' (no transition), the where-guard is what makes this a safe
+    // re-claim that can't fire on a healthy worker.
+    const claimed = await this.container.repository.claim(
+      runId,
       {
-        _id: runId,
-        status: 'running',
-        $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
+        from: 'running',
+        to: 'running',
+        where: {
+          $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
+        },
       },
-      runSet({ lastHeartbeat: new Date() }),
+      { lastHeartbeat: new Date(), updatedAt: new Date() },
       { bypassTenant: true },
     );
 
-    if (claimResult.modifiedCount === 0) {
+    if (!claimed) {
       return null;
     }
 
@@ -1059,11 +1185,17 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   async executeRetry(runId: string): Promise<WorkflowRun<TContext> | null> {
     const now = new Date();
 
+    // All three claim attempts below use `assertAndClaim` — runs
+    // `RUN_MACHINE.assertTransition` (sync, in-memory) before each Mongo
+    // CAS. Catches programmer bugs (illegal source status) before the
+    // round-trip; CAS still rejects concurrent writers via null.
+
     // First, try to claim a retry workflow (status: waiting)
-    let claimResult = await this.container.repository.updateOne(
-      {
-        _id: runId,
-        status: 'waiting',
+    // — paused guard + step-level retryAfter elemMatch via `where:`.
+    let claimed = await assertAndClaim(RUN_MACHINE, this.container.repository, runId, {
+      from: 'waiting',
+      to: 'running',
+      where: {
         paused: { $ne: true },
         steps: {
           $elemMatch: {
@@ -1072,32 +1204,41 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           },
         },
       },
-      runSet({ status: 'running', lastHeartbeat: now }),
-      { bypassTenant: true },
-    );
+      patch: { lastHeartbeat: now, updatedAt: now },
+      options: { bypassTenant: true },
+    });
 
     // If no retry workflow found, try to claim a scheduled workflow (status: draft, has executionTime)
-    if (claimResult.modifiedCount === 0) {
-      claimResult = await this.container.repository.updateOne(
-        {
-          _id: runId,
-          status: 'draft',
+    if (!claimed) {
+      claimed = await assertAndClaim(RUN_MACHINE, this.container.repository, runId, {
+        from: 'draft',
+        to: 'running',
+        where: {
           'scheduling.executionTime': { $lte: now },
           paused: { $ne: true },
         },
-        runSet({ status: 'running', lastHeartbeat: now, startedAt: now }),
-        { bypassTenant: true },
-      );
+        patch: { lastHeartbeat: now, startedAt: now, updatedAt: now },
+        options: { bypassTenant: true },
+      });
     }
 
-    // If no scheduled draft found, try to claim a concurrency-queued draft
-    if (claimResult.modifiedCount === 0) {
-      const draft = await this.container.repository.getConcurrencyDraft(runId);
+    // If no scheduled draft found, try to claim a concurrency-queued draft.
+    // Cross-tenant sweep — `executeRetry(runId)` is invoked by the scheduler
+    // which doesn't know the row's tenant. The lookup is `_id`-scoped so
+    // this is safe; downstream `claim()` is also `_id`-scoped + bypassTenant.
+    if (!claimed) {
+      const draft = await this.container.repository.getConcurrencyDraft(runId, {
+        bypassTenant: true,
+      });
 
       if (draft?.concurrencyKey) {
+        // Active-count probe is GLOBAL across the (workflowId, concurrencyKey)
+        // bucket — the scheduler counts every tenant's active runs against
+        // the limit. Cross-tenant by design; bypass tenant scope.
         const activeCount = await this.container.repository.countActiveByConcurrencyKey(
           draft.workflowId,
           draft.concurrencyKey,
+          { bypassTenant: true },
         );
 
         // Only promote if under the limit (we don't know the limit here,
@@ -1107,16 +1248,18 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           ?.concurrencyLimit as number | undefined;
 
         if (concurrencyLimit === undefined || activeCount < concurrencyLimit) {
-          claimResult = await this.container.repository.updateOne(
-            { _id: runId, status: 'draft', paused: { $ne: true } },
-            runSet({ status: 'running', lastHeartbeat: now, startedAt: now }),
-            { bypassTenant: true },
-          );
+          claimed = await assertAndClaim(RUN_MACHINE, this.container.repository, runId, {
+            from: 'draft',
+            to: 'running',
+            where: { paused: { $ne: true } },
+            patch: { lastHeartbeat: now, startedAt: now, updatedAt: now },
+            options: { bypassTenant: true },
+          });
         }
       }
     }
 
-    if (claimResult.modifiedCount === 0) {
+    if (!claimed) {
       return null;
     }
 
@@ -1163,14 +1306,21 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Abort any in-flight step handlers (fulfills ctx.signal contract)
     this.executor.abortWorkflow(runId);
 
-    const cancelledRun: WorkflowRun<TContext> = {
-      ...run,
-      status: 'cancelled',
+    // Send ONLY the narrow update fields. Spreading the whole `run` into
+    // updateById causes mongoose 9's update-cast to coerce the embedded
+    // `steps[]` plain objects into Subdocument instances IN PLACE on the
+    // input. The cache then holds the polluted reference, and downstream
+    // `findStepOrThrow` on `s.stepId` fails because the spread lost the
+    // Subdocument prototype getters. Build the cancelledRun for the
+    // return / cache value AFTER the DB write.
+    const updates: Partial<WorkflowRun<TContext>> = {
+      status: 'cancelled' as WorkflowRun<TContext>['status'],
       endedAt: new Date(),
       updatedAt: new Date(),
     };
+    await this.container.repository.updateById(runId, updates, { bypassTenant: true });
 
-    await this.container.repository.updateById(runId, cancelledRun, { bypassTenant: true });
+    const cancelledRun: WorkflowRun<TContext> = { ...run, ...updates };
 
     this.scheduler.cancelSchedule(runId);
     cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
@@ -1203,13 +1353,18 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       return run;
     }
 
-    const pausedRun: WorkflowRun<TContext> = {
-      ...run,
+    // Send ONLY the changed fields. See `cancel()` above for why spreading
+    // the whole `run` into updateById poisons the cache (mongoose 9 update-
+    // cast mutates the embedded `steps[]` array in place into Subdocument
+    // instances; the cached reference loses prototype getters and breaks
+    // `findStepOrThrow` on the next execute). Build pausedRun for the
+    // return/cache after the DB write.
+    const updates: Partial<WorkflowRun<TContext>> = {
       paused: true,
       updatedAt: new Date(),
     };
-
-    await this.container.repository.updateById(runId, pausedRun, { bypassTenant: true });
+    await this.container.repository.updateById(runId, updates, { bypassTenant: true });
+    const pausedRun: WorkflowRun<TContext> = { ...run, ...updates };
     this.scheduler.cancelSchedule(runId);
     this.container.cache.set(pausedRun);
 

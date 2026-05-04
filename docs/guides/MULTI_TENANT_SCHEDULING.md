@@ -499,7 +499,7 @@ describe('Multi-Tenant Isolation', () => {
       filters: { _id: tenantB._id },
       tenantId: 'tenant-a', // Wrong tenant - won't find the document
     });
-    expect(crossTenantQuery.docs).toHaveLength(0);
+    expect(crossTenantQuery.data).toHaveLength(0);
   });
 
   it('should handle DST transitions correctly', async () => {
