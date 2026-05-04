@@ -124,6 +124,66 @@ WorkflowRunSchema.index({ status: 1, updatedAt: -1 });
 // Idempotency: compound index for "find active run by key" query
 WorkflowRunSchema.index({ idempotencyKey: 1, status: 1 }, { sparse: true });
 
+/**
+ * Idempotency race-safety (PACKAGE_RULES §32).
+ *
+ * Partial unique index closes the TOCTOU window between the lookup in
+ * `engine.start()` and the `repository.create()` call. Two concurrent
+ * workers with the same key both pass the lookup (no row yet); the second
+ * insert hits MongoDB's E11000 duplicate-key error. `WorkflowRunRepository`
+ * catches it and returns the winning run.
+ *
+ * `partialFilterExpression` excludes terminal statuses, so the key is
+ * reusable after `done` / `failed` / `cancelled` — same documented semantic
+ * as before, now actually race-safe.
+ *
+ * `idempotencyKey: { $type: 'string' }` is the standard guard against
+ * `null` collisions when other docs lack the field (PACKAGE_RULES §35).
+ *
+ * ⚠️ Production deployment — clean active duplicates first.
+ *
+ * Existing deployments may carry duplicate `idempotencyKey` values across
+ * non-terminal runs (the pre-fix race could produce them). MongoDB will
+ * REFUSE to build this index if duplicates exist:
+ *
+ *     IndexBuildFailed: E11000 duplicate key error
+ *
+ * Pre-deploy migration — run once against the production replica set
+ * BEFORE rolling out a streamline version that ships this index:
+ *
+ * ```js
+ * // 1. Find active duplicates so you can audit them.
+ * db.workflow_runs.aggregate([
+ *   { $match: {
+ *     idempotencyKey: { $type: 'string' },
+ *     status: { $in: ['draft', 'running', 'waiting'] },
+ *   }},
+ *   { $group: { _id: '$idempotencyKey', ids: { $push: '$_id' }, n: { $sum: 1 } }},
+ *   { $match: { n: { $gt: 1 } }},
+ * ]);
+ *
+ * // 2. For each duplicate group, keep the oldest run, terminate the rest:
+ * db.workflow_runs.updateMany(
+ *   { _id: { $in: [/* duplicate ids except the keeper *\/] }, status: { $ne: 'cancelled' }},
+ *   { $set: { status: 'cancelled', endTime: new Date(),
+ *             error: { message: 'Cancelled during idempotency-index migration' }}},
+ * );
+ * ```
+ *
+ * Single-tenant new deployments can skip this — no pre-existing data, no
+ * duplicates possible.
+ */
+WorkflowRunSchema.index(
+  { idempotencyKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      idempotencyKey: { $type: 'string' },
+      status: { $in: ['draft', 'running', 'waiting'] },
+    },
+  },
+);
+
 // Concurrency: count active runs per workflow + key
 WorkflowRunSchema.index({ workflowId: 1, concurrencyKey: 1, status: 1 });
 

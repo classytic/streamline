@@ -47,10 +47,16 @@ export interface HookResult {
  * Create a hook that pauses workflow until external input.
  * The token includes a crypto-random suffix for security.
  *
+ * **You MUST pass `{ hookToken: hook.token }` to `ctx.wait`.** `resumeHook`
+ * fails closed if no stored token is found on the waiting step — pre-fix
+ * (≤ v2.2) the validator silently accepted any token whose runId-prefix
+ * matched, so a forgotten `hookToken` was a security hole, not just a
+ * style nit.
+ *
  * @example
  * ```typescript
  * const hook = createHook(ctx, 'waiting-for-approval');
- * return ctx.wait(hook.token, { hookToken: hook.token });
+ * return ctx.wait(hook.token, { hookToken: hook.token }); // <-- mandatory
  * ```
  */
 export function createHook(ctx: StepContext, _reason: string, options?: HookOptions): HookResult {
@@ -241,13 +247,39 @@ async function resumeViaDb(
   return { runId, run: updated as WorkflowRun };
 }
 
-/** Validate hook token against stored token (security) */
+/**
+ * Validate hook token against stored token (security).
+ *
+ * **Fail-closed.** Pre-fix this validator silently accepted ANY token whose
+ * runId-prefix matched a waiting workflow if the step didn't store
+ * `waitingFor.data.hookToken`. The README example was the canonical
+ * misuse case (`ctx.wait('Awaiting approval')` without `{ hookToken }`),
+ * which let an attacker who guessed `<runId>:anything` resume the
+ * workflow.
+ *
+ * Now: a missing stored token is itself a rejection. The only way to
+ * resume is to have stored the exact token via
+ * `ctx.wait(reason, { hookToken: hook.token })` — which is what
+ * `createHook`'s docstring + the canonical README example now enforce.
+ *
+ * Migration: workflows using `createHook` MUST pass `hookToken` to
+ * `ctx.wait`. Workflows that need a no-token resume path (admin override,
+ * trusted in-process resume) should use `engine.resume(runId, payload)`
+ * directly — that's the unauthenticated entry point by design.
+ */
 function validateHookToken(run: WorkflowRun, token: string): void {
   const waitingStep = run.steps.find((s) => s.status === 'waiting');
   const waitingData = waitingStep?.waitingFor?.data as { hookToken?: string } | undefined;
   const storedToken = waitingData?.hookToken;
 
-  if (storedToken && storedToken !== token) {
+  if (!storedToken) {
+    throw new Error(
+      `Hook resume rejected for workflow ${run._id} — no stored hookToken. ` +
+        `Pass { hookToken: hook.token } to ctx.wait() so the validator can check it. ` +
+        `See https://github.com/classytic/streamline#webhooks for the canonical pattern.`,
+    );
+  }
+  if (storedToken !== token) {
     throw new Error(`Invalid hook token for workflow ${run._id}`);
   }
 }

@@ -6,10 +6,11 @@
  *
  * ## Why streamline ships this instead of using mongokit's `multiTenantPlugin`
  *
- * mongokit 3.11's `multiTenantPlugin` exposes `tenantField`, `required`,
- * `skipWhen`, `resolveContext`, `allowDataInjection`, and `fieldType`.
- * Streamline still ships its own plugin because of three streamline-specific
- * requirements — re-verified against mongokit 3.11 in April 2026:
+ * mongokit 3.13's `multiTenantPlugin` exposes `tenantField`, `required`,
+ * `skipWhen`, `resolveContext`, `allowDataInjection` (default flipped to
+ * `false` in 3.13), `bypassTenant` (per-call), and `fieldType`. Streamline
+ * still ships its own plugin because of three streamline-specific
+ * requirements — re-verified against mongokit 3.13 on 2026-05-04:
  *
  * 1. **Nested-field tenant injection on `create` / `createMany`.** Streamline's
  *    `WorkflowRun` stores tenant scope at `context.tenantId` (a nested path).
@@ -19,12 +20,13 @@
  *    builds the nested structure. (Reads work either way — MongoDB queries
  *    accept dotted keys natively.)
  *
- * 2. **`bypassTenant` flag for admin operations.** Streamline's scheduler
- *    runs cross-tenant background jobs (claim races, retry sweeps) that need
- *    to read every tenant's runs. mongokit's `skipWhen` could express this,
- *    but streamline's `bypassTenant` is part of the documented call-site
- *    contract — switching plugins would be a breaking API change for
- *    `getReadyToResume`, `getReadyForRetry`, etc.
+ * 2. **`bypassTenant` plugin-construction flag for admin repositories.**
+ *    Streamline's scheduler runs cross-tenant background jobs (claim races,
+ *    retry sweeps) on a separately-constructed admin repo with
+ *    `bypassTenant: true` baked in. mongokit's per-call `bypassTenant` /
+ *    `skipWhen` could express this, but the construction-time form is part
+ *    of streamline's documented contract for `getReadyToResume`,
+ *    `getReadyForRetry`, etc. — switching shape is a breaking API change.
  *
  * 3. **`staticTenantId` for single-tenant deployments.** Apps that start
  *    single-tenant and may grow multi-tenant set `staticTenantId` once at
@@ -32,11 +34,21 @@
  *    `resolveContext: () => staticTenantId` would express this, but the
  *    config shape is more discoverable as a named option here.
  *
- * **Exit criterion:** when mongokit grows a `tenantPath` option (nested-path
- * injection) alongside `tenantField`, reason (1) dissolves — at that point
- * we can migrate `bypassTenant` and `staticTenantId` to `skipWhen` +
- * `resolveContext` wrappers and delete this plugin. Tracked as a streamline
- * tech-debt item, not blocked on any consumer.
+ * **Concrete exit criterion** — migrate when ALL THREE land in mongokit:
+ *   (a) `multiTenantPlugin` accepts a `tenantPath` option (or
+ *       `tenantField` with dotted-path support that builds nested
+ *       objects on writes, not flat dotted keys) — dissolves (1).
+ *   (b) Plugin-construction-time `bypassTenant: true` flag is documented
+ *       and stable (or `skipWhen: () => true` is the canonical pattern
+ *       for cross-tenant admin repos) — dissolves (2).
+ *   (c) `staticTenantId` is a first-class option (or the `resolveContext`
+ *       wrapper pattern is documented in the mongokit README) —
+ *       dissolves (3).
+ *
+ * On the trigger: replace this file with a thin wrapper that passes
+ * `staticTenantId` / `bypassTenant` / nested-path semantics through to
+ * mongokit and delete the rest. Tracked as streamline tech debt; not
+ * blocked on any consumer.
  *
  * Design Philosophy:
  * - Zero-trust: All queries must explicitly include tenantId (or disable via bypassTenant flag)
@@ -82,6 +94,32 @@
  * const runs = await repo.getAll({ filters: { status: 'running' } });
  * // Actual query: { status: 'running', 'context.tenantId': 'default-org' }
  * ```
+ *
+ * ## Why per-method `repo.on('before:*', …)` and not `repo.useMiddleware()`
+ *
+ * mongokit 3.13+ ships `useMiddleware()` (Prisma `$extends.query` style).
+ * Tempting to collapse the 13 enumerated hooks below into one middleware
+ * closure — but mongokit's own `CLAUDE.md` rules this out for security
+ * plugins:
+ *
+ * > Don't use middleware for security policy (tenant scope, soft-delete
+ * > filtering, audit). The execution order is `_buildContext +
+ * > before:<op>` → middleware chain → driver call. Policy hooks fire
+ * > BEFORE middleware sees the op, so middleware can never wrap a policy
+ * > failure. That's by design. Use `before:*` hooks for policy,
+ * > `useMiddleware()` for ergonomics.
+ *
+ * Tenant scope IS security policy — mutating `context.query` from
+ * middleware-pre would race with mongokit's actions that capture the
+ * filter inside `_runOp` (e.g. `findAll` snapshots `resolvedFilters`
+ * before middleware can touch it). Per-method `before:*` hooks fire at
+ * the right lifecycle point and run in priority order with other
+ * security plugins (multi-tenant, soft-delete, audit) — that ordering
+ * guarantee is the load-bearing reason this plugin uses hooks.
+ *
+ * The 13 enumerations below ARE intentional. New hook names get added
+ * here as mongokit grows new ops; the silent-gap class is the trade-off
+ * we accept for correct ordering.
  */
 
 import {
@@ -209,9 +247,33 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
         // Build tenant filter
         const tenantFilter = { [tenantField]: tenantId };
 
-        // Inject filter based on operation type
-        if (context.operation === 'getAll') {
-          // For getAll: merge with existing filters
+        // Inject filter based on operation type. Every op registered as a
+        // before-hook below MUST have a matching branch here — registering
+        // a hook without a corresponding inject branch silently leaves the
+        // op unscoped (the worst kind of tenant-isolation failure: the
+        // call still succeeds, the data still leaks).
+        //
+        // The op→target mapping mirrors mongokit's `OP_REGISTRY` policyKey:
+        //   'filters' bag (paginated reads): getAll, aggregatePaginate
+        //   'query' record (everything else with a filter):
+        //     getById, getByQuery, getOne, findAll, count, exists,
+        //     update, delete, updateMany, deleteMany, findOneAndUpdate
+        const filtersBagOps = new Set(['getAll']);
+        const queryRecordOps = new Set([
+          'getById',
+          'getByQuery',
+          'getOne',
+          'findAll',
+          'count',
+          'exists',
+          'update',
+          'delete',
+          'updateMany',
+          'deleteMany',
+          'findOneAndUpdate',
+        ]);
+
+        if (filtersBagOps.has(context.operation)) {
           const existingFilters = (context as Record<string, unknown>).filters as
             | Record<string, unknown>
             | undefined;
@@ -219,19 +281,7 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
             ...existingFilters,
             ...tenantFilter,
           };
-        } else if (
-          context.operation === 'getById' ||
-          context.operation === 'getByQuery' ||
-          context.operation === 'update' ||
-          context.operation === 'delete' ||
-          context.operation === 'updateMany' ||
-          context.operation === 'deleteMany'
-        ) {
-          // For getById, getByQuery, update, delete, updateMany, deleteMany:
-          // merge tenant filter into the query. `updateMany`/`deleteMany`
-          // were promoted to class primitives in mongokit 3.11 — without
-          // these branches they'd bypass tenant scope silently, letting one
-          // tenant bulk-touch another tenant's runs.
+        } else if (queryRecordOps.has(context.operation)) {
           context.query = {
             ...(context.query || {}),
             ...tenantFilter,
@@ -263,11 +313,28 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
       repo.on('before:getAll', injectTenantFilter, policy);
       repo.on('before:getById', injectTenantFilter, policy);
       repo.on('before:getByQuery', injectTenantFilter, policy);
+      repo.on('before:getOne', injectTenantFilter, policy);
+      repo.on('before:findAll', injectTenantFilter, policy);
+      repo.on('before:count', injectTenantFilter, policy);
+      repo.on('before:exists', injectTenantFilter, policy);
       repo.on('before:update', injectTenantFilter, policy);
       repo.on('before:delete', injectTenantFilter, policy);
       repo.on('before:updateMany', injectTenantFilter, policy);
       repo.on('before:deleteMany', injectTenantFilter, policy);
       repo.on('before:aggregatePaginate', injectTenantFilter, policy);
+      // Atomic claim path: streamline's `repository.updateOne` and
+      // `bumpDebounceDraft` both delegate to `super.findOneAndUpdate`.
+      // Defense in depth — keep manual `applyTenantFilter` in `updateOne`,
+      // also hook the plugin so writes from any future helper are scoped.
+      repo.on('before:findOneAndUpdate', injectTenantFilter, policy);
+      // mongokit 3.13+ ships `Repository.claim()` as a class primitive.
+      // Streamline's scheduler/recovery paths use it for compound-filter
+      // CAS state transitions. `claim` registers with `policyKey: 'query'`
+      // in `OP_REGISTRY` and fires its own `before:claim` event — hook
+      // it here so tenant scope auto-injects when callers don't pass
+      // `bypassTenant: true` (current scheduler callers do, but any
+      // future per-tenant claim by a domain caller will be covered).
+      repo.on('before:claim', injectTenantFilter, policy);
 
       // For create operations: auto-inject tenantId into document data.
       // Same POLICY priority as the read/write hooks above.

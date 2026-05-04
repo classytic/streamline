@@ -22,7 +22,7 @@ async function getWorkflowsForPage(page: number = 1, limit: number = 20) {
   });
 
   return {
-    workflows: result.docs,
+    workflows: result.data,
     currentPage: result.page,
     totalPages: result.pages,
     total: result.total,
@@ -50,7 +50,7 @@ async function getWorkflowsForInfiniteScroll(cursor?: string, limit: number = 50
   });
 
   return {
-    workflows: result.docs,
+    workflows: result.data,
     nextCursor: result.next, // Use this for next page
     hasMore: result.hasMore,
   };
@@ -76,7 +76,7 @@ async function getUserWorkflows(userId: string, status?: string) {
     limit: 100,
   });
 
-  return result.docs;
+  return result.data;
 }
 
 // ============ Real-time Dashboard ============
@@ -107,9 +107,9 @@ async function getActiveDashboard() {
   });
 
   return {
-    active: active.docs,
-    recentCompleted: recent.docs,
-    recentFailed: failed.docs,
+    active: active.data,
+    recentCompleted: recent.data,
+    recentFailed: failed.data,
   };
 }
 
@@ -128,7 +128,7 @@ async function searchWorkflows(query: string) {
     limit: 50,
   });
 
-  return result.docs;
+  return result.data;
 }
 
 // ============ Multi-Tenant Queries ============
@@ -145,7 +145,7 @@ async function getTenantWorkflows(tenantId: string, page: number = 1) {
   });
 
   return {
-    workflows: result.docs,
+    workflows: result.data,
     total: result.total,
     page: result.page,
     pages: result.pages,
@@ -216,7 +216,7 @@ export async function GET(request: Request) {
   });
 
   return Response.json({
-    data: result.docs,
+    data: result.data,
     pagination: {
       page: result.page,
       limit: result.limit,

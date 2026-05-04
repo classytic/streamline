@@ -83,9 +83,9 @@ describe('TenantFilterPlugin', () => {
         tenantId: 'tenant-a',
       } as any);
 
-      expect(tenantAResults.docs).toHaveLength(1);
-      expect(tenantAResults.docs[0]._id).toBe('run-tenant-a-1');
-      expect(tenantAResults.docs[0].context.tenantId).toBe('tenant-a');
+      expect(tenantAResults.data).toHaveLength(1);
+      expect(tenantAResults.data[0]._id).toBe('run-tenant-a-1');
+      expect(tenantAResults.data[0].context.tenantId).toBe('tenant-a');
 
       // Query as tenant B - should only see tenant B's workflow
       const tenantBResults = await repo.getAll({
@@ -93,9 +93,9 @@ describe('TenantFilterPlugin', () => {
         tenantId: 'tenant-b',
       } as any);
 
-      expect(tenantBResults.docs).toHaveLength(1);
-      expect(tenantBResults.docs[0]._id).toBe('run-tenant-b-1');
-      expect(tenantBResults.docs[0].context.tenantId).toBe('tenant-b');
+      expect(tenantBResults.data).toHaveLength(1);
+      expect(tenantBResults.data[0]._id).toBe('run-tenant-b-1');
+      expect(tenantBResults.data[0].context.tenantId).toBe('tenant-b');
     });
 
     it('should prevent cross-tenant access in getByQuery for string IDs', async () => {
@@ -166,7 +166,7 @@ describe('TenantFilterPlugin', () => {
 
       // Should not throw, returns all workflows
       const results = await repo.getAll({ filters: { status: 'done' } });
-      expect(results.docs.length).toBeGreaterThanOrEqual(1);
+      expect(results.data.length).toBeGreaterThanOrEqual(1);
     });
 
     it('should still filter by tenantId when provided in non-strict mode', async () => {
@@ -207,8 +207,8 @@ describe('TenantFilterPlugin', () => {
         tenantId: 'ns-tenant-a',
       } as any);
 
-      expect(results.docs).toHaveLength(1);
-      expect(results.docs[0].context.tenantId).toBe('ns-tenant-a');
+      expect(results.data).toHaveLength(1);
+      expect(results.data[0].context.tenantId).toBe('ns-tenant-a');
     });
   });
 
@@ -240,7 +240,7 @@ describe('TenantFilterPlugin', () => {
         bypassTenant: true,
       } as any);
 
-      expect(results.docs.length).toBeGreaterThanOrEqual(1);
+      expect(results.data.length).toBeGreaterThanOrEqual(1);
     });
 
     it('should throw error when bypass attempted but allowBypass is false', async () => {
@@ -298,9 +298,9 @@ describe('TenantFilterPlugin', () => {
       // No tenantId needed - uses static config
       const results = await repo.getAll({ filters: { status: 'done' } });
 
-      expect(results.docs).toHaveLength(1);
-      expect(results.docs[0]._id).toBe('run-static-1');
-      expect(results.docs[0].context.tenantId).toBe('static-org-123');
+      expect(results.data).toHaveLength(1);
+      expect(results.data[0]._id).toBe('run-static-1');
+      expect(results.data[0].context.tenantId).toBe('static-org-123');
     });
 
     it('should use singleTenantPlugin helper correctly', async () => {
@@ -334,8 +334,8 @@ describe('TenantFilterPlugin', () => {
 
       const results = await repo.getAll({ filters: { status: 'running' } });
 
-      expect(results.docs).toHaveLength(1);
-      expect(results.docs[0].context.tenantId).toBe('single-tenant-org');
+      expect(results.data).toHaveLength(1);
+      expect(results.data[0].context.tenantId).toBe('single-tenant-org');
     });
   });
 
@@ -365,7 +365,7 @@ describe('TenantFilterPlugin', () => {
         tenantId: 'nested-tenant',
       } as any);
 
-      expect(results.docs).toHaveLength(1);
+      expect(results.data).toHaveLength(1);
     });
 
     it('should support meta field (meta.orgId)', async () => {
@@ -394,7 +394,7 @@ describe('TenantFilterPlugin', () => {
         tenantId: 'meta-org-123',
       } as any);
 
-      expect(results.docs).toHaveLength(1);
+      expect(results.data).toHaveLength(1);
     });
   });
 
@@ -551,7 +551,7 @@ describe('TenantFilterPlugin', () => {
         tenantId: 'some-tenant',
       } as any);
 
-      expect(results.docs).toHaveLength(0);
+      expect(results.data).toHaveLength(0);
     });
 
     it('should work with pagination', async () => {
@@ -585,7 +585,7 @@ describe('TenantFilterPlugin', () => {
         limit: 10,
       } as any);
 
-      expect(page1.docs.length).toBe(10);
+      expect(page1.data.length).toBe(10);
       expect(page1.total).toBe(15);
 
       // Get second page
@@ -596,7 +596,7 @@ describe('TenantFilterPlugin', () => {
         limit: 10,
       } as any);
 
-      expect(page2.docs.length).toBe(5);
+      expect(page2.data.length).toBe(5);
     });
 
     it('should handle concurrent requests from different tenants', async () => {
@@ -639,11 +639,11 @@ describe('TenantFilterPlugin', () => {
         repo.getAll({ filters: { status: 'running' }, tenantId: 'concurrent-b' } as any),
       ]);
 
-      expect(resultsA.docs).toHaveLength(1);
-      expect(resultsA.docs[0].context.tenantId).toBe('concurrent-a');
+      expect(resultsA.data).toHaveLength(1);
+      expect(resultsA.data[0].context.tenantId).toBe('concurrent-a');
 
-      expect(resultsB.docs).toHaveLength(1);
-      expect(resultsB.docs[0].context.tenantId).toBe('concurrent-b');
+      expect(resultsB.data).toHaveLength(1);
+      expect(resultsB.data[0].context.tenantId).toBe('concurrent-b');
     });
   });
 });

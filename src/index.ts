@@ -273,24 +273,38 @@ export {
 export type { ErrorCode as ErrorCodeType } from './utils/errors.js';
 /**
  * Custom error classes with rich context for debugging.
- * Includes standardized error codes for programmatic error handling.
+ *
+ * **Implements `HttpError` from `@classytic/repo-core/errors`** —
+ * `WorkflowError` and every subclass carry `status`, hierarchical `code`,
+ * and `meta` so arc handlers and host HTTP layers map to the canonical
+ * wire envelope without translation. The legacy screaming-snake
+ * `ErrorCode` enum still works via the `legacyCode` slot for backwards
+ * compat.
  *
  * @example
  * ```typescript
- * import { ErrorCode, WorkflowNotFoundError } from '@classytic/streamline';
+ * import {
+ *   ErrorCode,                // legacy SCREAMING_SNAKE constants
+ *   ErrorCodeHierarchical,    // new hierarchical 'workflow.not_found' constants
+ *   WorkflowNotFoundError,
+ * } from '@classytic/streamline';
  *
  * try {
  *   await workflow.resume(runId);
  * } catch (err) {
- *   if (err.code === ErrorCode.WORKFLOW_NOT_FOUND) {
- *     console.log('Workflow not found');
- *   }
+ *   // Three equivalent ways to identify the error — pick one:
+ *   if (err.status === 404) { ... }                                       // HttpError
+ *   if (err.code === ErrorCodeHierarchical.WORKFLOW_NOT_FOUND) { ... }    // canonical
+ *   if (err.legacyCode === ErrorCode.WORKFLOW_NOT_FOUND) { ... }          // legacy
  * }
  * ```
  */
 export {
+  ConcurrencyLimitReachedError,
   DataCorruptionError,
+  ERROR_STATUS_MAP,
   ErrorCode,
+  ErrorCodeHierarchical,
   InvalidStateError,
   MaxRetriesExceededError,
   NonRetriableError,

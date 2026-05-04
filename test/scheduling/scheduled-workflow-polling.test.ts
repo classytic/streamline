@@ -77,8 +77,8 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(1);
-      expect(result.docs[0]._id).toBe('scheduled-past-1');
+      expect(result.data).toHaveLength(1);
+      expect(result.data[0]._id).toBe('scheduled-past-1');
     });
 
     it('should NOT return scheduled workflows with executionTime > now', async () => {
@@ -105,7 +105,7 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(0);
+      expect(result.data).toHaveLength(0);
     });
 
     it('should NOT return paused scheduled workflows', async () => {
@@ -133,7 +133,7 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(0);
+      expect(result.data).toHaveLength(0);
     });
 
     it('should NOT return non-draft status workflows', async () => {
@@ -160,7 +160,7 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(0);
+      expect(result.data).toHaveLength(0);
     });
 
     it('should respect limit parameter', async () => {
@@ -192,7 +192,7 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
         limit: 5,
       });
 
-      expect(result.docs).toHaveLength(5);
+      expect(result.data).toHaveLength(5);
     });
 
     it('should return workflows sorted by executionTime (oldest first)', async () => {
@@ -258,10 +258,10 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
 
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
 
-      expect(result.docs).toHaveLength(3);
-      expect(result.docs[0]._id).toBe('scheduled-sort-1'); // Oldest first
-      expect(result.docs[1]._id).toBe('scheduled-sort-2');
-      expect(result.docs[2]._id).toBe('scheduled-sort-3'); // Newest last
+      expect(result.data).toHaveLength(3);
+      expect(result.data[0]._id).toBe('scheduled-sort-1'); // Oldest first
+      expect(result.data[1]._id).toBe('scheduled-sort-2');
+      expect(result.data[2]._id).toBe('scheduled-sort-3'); // Newest last
     });
   });
 
@@ -352,7 +352,7 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
 
       // Query should not return paused workflow
       const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
-      expect(result.docs).toHaveLength(0);
+      expect(result.data).toHaveLength(0);
     });
   });
 
@@ -393,8 +393,8 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
 
       // Result should have data property with workflows
       expect(result).toBeDefined();
-      expect(result.docs).toBeDefined();
-      expect(result.docs.length).toBeLessThanOrEqual(100);
+      expect(result.data).toBeDefined();
+      expect(result.data.length).toBeLessThanOrEqual(100);
     });
   });
 });

@@ -29,7 +29,8 @@ export default defineConfig({
           include: ['test/unit/**/*.test.ts'],
           testTimeout: 10_000,
           hookTimeout: 10_000,
-          // Pure functions — parallel-safe.
+          // Pure functions — parallel-safe. Group 0 runs first.
+          sequence: { groupOrder: 0 },
         },
       },
       {
@@ -46,7 +47,14 @@ export default defineConfig({
           testTimeout: 30_000,
           hookTimeout: 60_000, // mongodb-memory-server first-download tax
           // mongoose + mongodb-memory-server share a connection — fork once.
-          poolOptions: { forks: { singleFork: true } },
+          // Vitest 4 — `poolOptions.forks.singleFork: true` migrated to
+          // `maxWorkers: 1` (single worker) + `isolate: false` (no fresh
+          // module state between files). mongoose + mongodb-memory-server
+          // share a connection; running them in one worker avoids races.
+          // Different `maxWorkers` than `unit` requires unique groupOrder.
+          maxWorkers: 1,
+          isolate: false,
+          sequence: { groupOrder: 1 },
         },
       },
       {
@@ -62,7 +70,10 @@ export default defineConfig({
           ],
           testTimeout: 120_000,
           hookTimeout: 60_000,
-          poolOptions: { forks: { singleFork: true } },
+          // See `integration` — same single-worker rationale.
+          maxWorkers: 1,
+          isolate: false,
+          sequence: { groupOrder: 2 },
         },
       },
     ],
