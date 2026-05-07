@@ -1,6 +1,6 @@
 {
   "name": "@classytic/streamline",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "MongoDB-native durable workflow orchestration engine. Like Temporal but simpler - supports sleep, wait, retry, parallel execution, human-in-the-loop, and crash recovery. Perfect for payment gateways, approval flows, and scheduled tasks.",
   "type": "module",
   "sideEffects": false,

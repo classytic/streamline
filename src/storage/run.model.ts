@@ -229,6 +229,17 @@ WorkflowRunSchema.index({
 WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: -1, _id: -1 });
 WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: 1, _id: 1 });
 
+// Same prefix + the `steps` multikey position. Used by `readyForRetry` /
+// `readyToResume` (CommonQueries.readyForRetry / readyToResume in
+// `query-builder.ts`) — both add a `steps.$elemMatch` clause on top of
+// `{ status, paused }` and sort by `updatedAt`. Mongokit's keyset
+// detector emits a "no matching compound index" warning without this;
+// the multikey index lets the planner use a single bounded scan
+// instead of fetching every status='waiting' & paused=false doc and
+// filtering steps in-memory. The trailing `_id` matches the cursor
+// shape mongokit's keyset cursor encodes.
+WorkflowRunSchema.index({ status: 1, paused: 1, steps: 1, updatedAt: 1, _id: 1 });
+
 /**
  * MULTI-TENANCY & SCHEDULED WORKFLOWS - COMPOSITE INDEXES
  *
