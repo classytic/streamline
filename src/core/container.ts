@@ -14,6 +14,12 @@ import {
   workflowConcurrencyCounterRepository,
 } from '../storage/concurrency-counter.repository.js';
 import {
+  type RetentionOptions,
+  resolveSweeperConfig,
+  StaleRunSweeper,
+  syncRetentionIndexes as syncRetentionIndexesImpl,
+} from '../storage/retention.js';
+import {
   createWorkflowRepository,
   type WorkflowRepositoryConfig,
   type WorkflowRunRepository,
@@ -117,6 +123,39 @@ export interface StreamlineContainer {
   readonly cache: WorkflowCache;
   /** Pluggable signal store for durable cross-process event delivery */
   readonly signalStore: SignalStore;
+  /**
+   * Stale-run sweeper. Present iff `retention.staleHeartbeatThresholdMs`
+   * was set on this container. The container starts it on construction
+   * and stops it on `dispose()` — the host normally never touches it,
+   * but it's exposed for tests + manual sweep triggers.
+   */
+  readonly staleRunSweeper?: StaleRunSweeper;
+  /**
+   * Build retention indexes (TTL on terminal runs + tenant-prefixed
+   * compound) idempotently against the live mongoose connection.
+   *
+   * No-op when `retention` was not configured on this container — safe
+   * to call unconditionally from a deploy script. Must be called AFTER
+   * `mongoose.connect(...)`. Honours PACKAGE_RULES §32 — explicit,
+   * deploy-time, never auto-run on every boot.
+   *
+   * @example
+   * ```ts
+   * const container = createContainer({
+   *   retention: { terminalRunsTtlSeconds: 30 * 86400 },
+   * });
+   * await mongoose.connect(uri);
+   * await container.syncRetentionIndexes();
+   * ```
+   */
+  syncRetentionIndexes(): Promise<void>;
+  /**
+   * Stop background sweepers and release timers. Idempotent.
+   * Hosts that gracefully shut down (test teardown, SIGTERM) should
+   * call this — the underlying timers are `unref()`'d so omitting it
+   * won't block process exit.
+   */
+  dispose(): void;
 }
 
 /**
@@ -175,6 +214,19 @@ export interface ContainerOptions {
    * `MemoryEventTransport` semantics.
    */
   eventTransport?: EventTransport;
+
+  /**
+   * Retention block — TTL on terminal runs, tenant-prefixed compound
+   * indexes, and the stale-run sweeper. See `RetentionOptions` for each
+   * knob's semantics.
+   *
+   * Setting `staleHeartbeatThresholdMs` AUTO-STARTS the sweeper on
+   * `createContainer` (timer is `unref()`'d, won't block process exit).
+   * Setting `terminalRunsTtlSeconds` or `multiTenantIndexes` does NOT —
+   * call `container.syncRetentionIndexes()` from a deploy script after
+   * mongoose connects (PACKAGE_RULES §32).
+   */
+  retention?: RetentionOptions;
 }
 
 /**
@@ -255,18 +307,45 @@ export function createContainer(options: ContainerOptions = {}): StreamlineConta
   const concurrencyCounterRepository =
     options.concurrencyCounterRepository ?? workflowConcurrencyCounterRepository;
 
-  return {
+  // Retention — TTL/index sync stays explicit (PACKAGE_RULES §32) but the
+  // stale-run sweeper auto-starts when the host configured a threshold.
+  // Wiring the sweeper here means the host gets terminator semantics
+  // out-of-the-box without an additional .start() call. Timer is
+  // `unref()`'d in StaleRunSweeper so process exit isn't blocked.
+  const retention = options.retention;
+  const sweeper =
+    retention?.staleHeartbeatThresholdMs !== undefined
+      ? new StaleRunSweeper(repository, resolveSweeperConfig(retention), eventBus)
+      : undefined;
+  if (sweeper) sweeper.start();
+
+  const container: StreamlineContainer = {
     repository,
     concurrencyCounterRepository,
     eventBus,
     eventTransport,
     cache,
     signalStore,
+    staleRunSweeper: sweeper,
+    syncRetentionIndexes: async () => {
+      if (!retention) return;
+      await syncRetentionIndexesImpl(repository, retention);
+    },
+    dispose: () => {
+      sweeper?.stop();
+    },
   };
+
+  return container;
 }
 
 /**
- * Type guard to check if an object is a valid StreamlineContainer
+ * Type guard to check if an object is a valid StreamlineContainer.
+ *
+ * Only checks the load-bearing structural fields. Newer surface (e.g.
+ * `dispose`, `syncRetentionIndexes`) is intentionally NOT in the guard
+ * so test fixtures and partial mocks built before those methods existed
+ * still satisfy the guard.
  */
 export function isStreamlineContainer(obj: unknown): obj is StreamlineContainer {
   if (obj == null || typeof obj !== 'object') return false;
@@ -279,3 +358,6 @@ export function isStreamlineContainer(obj: unknown): obj is StreamlineContainer 
     (obj as StreamlineContainer).cache instanceof WorkflowCache
   );
 }
+
+export type { RetentionOptions } from '../storage/retention.js';
+export { StaleRunSweeper } from '../storage/retention.js';

@@ -233,6 +233,29 @@ export interface WorkflowRun<TContext = Record<string, unknown>> {
   userId?: string;
   tags?: string[];
   meta?: Record<string, unknown>;
+  /**
+   * Snapshot of the workflow definition's `version` at the time the run
+   * was created. Required for in-flight runs to resume on the version
+   * they started under, even after the host has registered a newer
+   * definition. Set by `WorkflowRegistry.createRun()`; never mutated.
+   *
+   * Optional in the type to keep historical runs (created before v2.3.3)
+   * loadable — the engine falls back to the active registry when this
+   * field is missing.
+   */
+  definitionVersion?: string;
+  /**
+   * Number of times the stale-recovery / sweeper paths have terminated
+   * this run. Bounded by `RetentionOptions.maxStaleRecoveries`; the
+   * sweeper marks the run permanently failed (`error.code === 'dead_lettered'`)
+   * once the limit is reached so it stops cycling through the recovery
+   * loop forever.
+   *
+   * Incremented by `engine.recoverStale()` and `repository.markStaleAsFailed()`.
+   * Hosts inspecting this field can build their own dashboards for
+   * "runs that have crashed N+ times" without re-deriving from logs.
+   */
+  recoveryAttempts?: number;
 }
 
 export interface WorkflowDefinition<TContext = Record<string, unknown>> {

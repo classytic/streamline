@@ -92,15 +92,31 @@ export const hookRegistry = new HookRegistry();
 // ============================================================================
 
 /**
- * Global registry mapping workflowId → engine.
- * Populated by createWorkflow(). Enables ctx.startChildWorkflow() to find
- * and start child workflows by ID without the caller needing a reference.
+ * Global registry mapping workflowId → engine, with optional
+ * `(workflowId, version)` keying for in-flight version pinning.
+ *
+ * Two parallel maps:
+ *   - `engines` — single "active" engine per workflowId. Backwards-compat
+ *     for ctx.startChildWorkflow() and resumeHook(); always points at
+ *     the most recently registered engine.
+ *   - `versionedEngines` — `(workflowId, version)` → engine. Populated
+ *     when the engine registers; consulted by `lookupVersion()` so a
+ *     run started under v1 can be resumed by v1's engine even after v2
+ *     has registered for the same workflowId.
+ *
+ * `WeakRef` lets engines GC normally — a stale entry just resolves to
+ * `undefined`, mirroring "engine not registered."
  */
 class WorkflowRegistryGlobal {
   private engines = new Map<string, WeakRef<WorkflowEngine<unknown>>>();
+  private versionedEngines = new Map<string, WeakRef<WorkflowEngine<unknown>>>();
 
   register(workflowId: string, engine: WorkflowEngine<unknown>): void {
     this.engines.set(workflowId, new WeakRef(engine));
+    const version = engine.definition.version;
+    if (version) {
+      this.versionedEngines.set(this.versionKey(workflowId, version), new WeakRef(engine));
+    }
   }
 
   getEngine(workflowId: string): WorkflowEngine<unknown> | undefined {
@@ -112,6 +128,52 @@ class WorkflowRegistryGlobal {
       return undefined;
     }
     return engine;
+  }
+
+  /**
+   * Resolve an engine pinned to a specific definition version. Returns
+   * `undefined` when no version-pinned engine is registered — callers
+   * (engine.execute / engine.resume) treat that as "fall back to active
+   * version" and fire the optional migration hook so the host can decide
+   * whether to remap the run.
+   */
+  lookupVersion(workflowId: string, version: string): WorkflowEngine<unknown> | undefined {
+    const ref = this.versionedEngines.get(this.versionKey(workflowId, version));
+    if (!ref) return undefined;
+    const engine = ref.deref();
+    if (!engine) {
+      this.versionedEngines.delete(this.versionKey(workflowId, version));
+      return undefined;
+    }
+    return engine;
+  }
+
+  /**
+   * Remove this engine from BOTH maps. Called from `engine.shutdown()`
+   * so a stopped engine no longer accepts version-pinned routing — a
+   * v2 engine resuming a v1 run shouldn't delegate execution to a v1
+   * engine the host has explicitly torn down. Last-write-wins means
+   * another engine may have already replaced us in the active map; the
+   * `ref.deref() === engine` guards prevent us from deleting that
+   * other engine's entry.
+   */
+  unregister(workflowId: string, engine: WorkflowEngine<unknown>): void {
+    const activeRef = this.engines.get(workflowId);
+    if (activeRef && activeRef.deref() === engine) {
+      this.engines.delete(workflowId);
+    }
+    const version = engine.definition.version;
+    if (version) {
+      const key = this.versionKey(workflowId, version);
+      const versionedRef = this.versionedEngines.get(key);
+      if (versionedRef && versionedRef.deref() === engine) {
+        this.versionedEngines.delete(key);
+      }
+    }
+  }
+
+  private versionKey(workflowId: string, version: string): string {
+    return `${workflowId}@${version}`;
   }
 }
 
@@ -213,6 +275,43 @@ export interface WorkflowEngineOptions {
    * Keyed by stepId. Called in reverse order when a later step fails.
    */
   compensationHandlers?: WorkflowHandlers<unknown>;
+  /**
+   * Optional migration hook for in-flight runs whose `definitionVersion`
+   * doesn't match this engine AND whose original-version engine is not
+   * registered. The host inspects the run and returns a partial run
+   * payload that is merged into the existing document; the engine then
+   * continues executing under its own version.
+   *
+   * Return `null` / `undefined` to fall through (the engine will fail
+   * the run with `VERSION_MISMATCH` if the step graph diverged — same
+   * pre-v2.3.3 behaviour).
+   *
+   * Common patterns:
+   *   - Map a removed step's `currentStepId` onto the new step graph.
+   *   - Backfill new context fields the v2 step graph requires.
+   *   - Rewrite `steps[]` to align with the new shape.
+   *
+   * @example
+   * ```ts
+   * createWorkflow('billing', {
+   *   version: '2.0.0',
+   *   migrateRun: async (run) => {
+   *     if (run.definitionVersion === '1.0.0' && run.currentStepId === 'old-charge') {
+   *       return { currentStepId: 'charge', context: { ...run.context, currency: 'USD' } };
+   *     }
+   *     return null;
+   *   },
+   *   steps: { ... },
+   * });
+   * ```
+   */
+  migrateRun?: (
+    run: WorkflowRun<unknown>,
+  ) =>
+    | Partial<WorkflowRun<unknown>>
+    | null
+    | undefined
+    | Promise<Partial<WorkflowRun<unknown>> | null | undefined>;
 }
 
 /**
@@ -492,6 +591,46 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    */
   async execute(runId: string): Promise<WorkflowRun<TContext>> {
     let run = await this.getOrThrow(runId);
+
+    // Version pinning — if the run was created against a different
+    // definition version that's also registered, route execution to that
+    // engine instead. The host can swap engines at deploy time without
+    // breaking in-flight runs (the canonical "deployed v2 while v1 runs
+    // are still walking the step graph" hazard).
+    //
+    // Resolution order:
+    //   1. exact-version pinned engine via `workflowRegistry.lookupVersion`
+    //   2. host-supplied `migrateRun(run)` hook (returns a fresh run shape
+    //      to apply, OR a workflowId+version to redirect to)
+    //   3. fall through to this engine — same back-compat behaviour as
+    //      pre-v2.3.3 runs (they have no `definitionVersion` field).
+    if (run.definitionVersion && run.definitionVersion !== this.definition.version) {
+      const pinned = workflowRegistry.lookupVersion(run.workflowId, run.definitionVersion);
+      if (pinned && pinned !== (this as unknown as WorkflowEngine<unknown>)) {
+        return (await pinned.execute(runId)) as unknown as WorkflowRun<TContext>;
+      }
+
+      const migrated = await this.options.migrateRun?.(run);
+      if (migrated) {
+        // Migrate-in-place: persist the new shape, then continue with this engine.
+        const now = new Date();
+        await this.container.repository.updateOne(
+          { _id: runId },
+          runSet({
+            ...migrated,
+            definitionVersion: this.definition.version,
+            updatedAt: now,
+          } as Record<string, unknown>),
+          { bypassTenant: true },
+        );
+        this.container.cache.delete(runId);
+        const refreshed = await this.getOrThrow(runId);
+        run = refreshed;
+      }
+      // Else: fall through. The version-mismatch StepNotFoundError catch
+      // below already handles "step not in this engine" by failing the
+      // run — same behaviour as before this block existed.
+    }
 
     try {
       while (this.shouldContinueExecution(run)) {
@@ -1142,7 +1281,10 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
         },
       },
-      { lastHeartbeat: new Date(), updatedAt: new Date() },
+      {
+        $set: { lastHeartbeat: new Date(), updatedAt: new Date() },
+        $inc: { recoveryAttempts: 1 },
+      },
       { bypassTenant: true },
     );
 
@@ -1424,6 +1566,13 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       }
     }
     this.eventListeners.clear();
+
+    // Remove from the global registry — without this, a v2 engine resuming
+    // a v1 run would still route execution to a v1 engine the host has
+    // explicitly torn down. The unregister method `ref.deref() === this`
+    // guards the active-map slot so we don't accidentally evict a newer
+    // engine that took our place under the same workflowId.
+    workflowRegistry.unregister(this.definition.id, this as unknown as WorkflowEngine<unknown>);
   }
 
   /**

@@ -310,6 +310,26 @@ export interface WorkflowConfig<TContext, TInput = unknown> {
     /** Bypass tenant scoping (admin/cross-tenant triggers). */
     bypassTenant?: boolean;
   };
+
+  /**
+   * Migration hook for in-flight runs whose `definitionVersion` is older
+   * than this engine's `version` AND whose original-version engine is not
+   * registered. See `WorkflowEngineOptions.migrateRun` for the full
+   * contract — this field is the surface hosts use through `createWorkflow`.
+   *
+   * The host inspects the run, returns a partial `WorkflowRun` shape (e.g.
+   * a remapped `currentStepId`, backfilled `context`, rewritten `steps[]`),
+   * and the engine merges + re-pins the run to its own version. Return
+   * `null`/`undefined` to fall through (the engine will fail the run with
+   * `VERSION_MISMATCH` if the step graph diverged).
+   */
+  migrateRun?: (
+    run: import('../core/types.js').WorkflowRun<unknown>,
+  ) =>
+    | Partial<import('../core/types.js').WorkflowRun<unknown>>
+    | null
+    | undefined
+    | Promise<Partial<import('../core/types.js').WorkflowRun<unknown>> | null | undefined>;
 }
 
 /** Options for `Workflow.start()` */
@@ -514,6 +534,7 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
             import('../core/types.js').StepHandler<unknown, unknown>
           >)
         : undefined,
+    ...(config.migrateRun !== undefined && { migrateRun: config.migrateRun }),
   });
 
   const waitFor = async (

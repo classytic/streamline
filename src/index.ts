@@ -157,6 +157,19 @@ export type { CacheHealthStatus } from './storage/cache.js';
  * Cache health monitoring for operational dashboards.
  */
 export { WorkflowCache } from './storage/cache.js';
+/**
+ * Retention — TTL on terminal runs, tenant-prefixed compound indexes,
+ * and the stale-run sweeper. Configure via `createContainer({ retention })`;
+ * the lower-level `syncRetentionIndexes` + `StaleRunSweeper` exports are
+ * for hosts driving retention from a deploy script directly.
+ */
+export type { RetentionOptions } from './storage/retention.js';
+export {
+  RETENTION_DEFAULTS,
+  resolveSweeperConfig,
+  StaleRunSweeper,
+  syncRetentionIndexes,
+} from './storage/retention.js';
 export type { LogLevel, LogTransport } from './utils/logger.js';
 /**
  * Centralized logger configuration.

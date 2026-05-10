@@ -267,6 +267,106 @@ await WorkflowRunModel.collection.createIndexes([
 ]);
 ```
 
+## Retention — TTL, tenant compounds, stale sweeper
+
+`createContainer({ retention })` consolidates the three operational knobs
+hosts previously had to wire by hand: a TTL on terminal runs, the
+tenant-prefixed compound multi-tenant deployments need, and a sweep that
+terminates runs whose worker crashed.
+
+```typescript
+import { createContainer } from '@classytic/streamline';
+
+const container = createContainer({
+  repository: { multiTenant: { tenantField: 'context.organizationId', strict: true } },
+  retention: {
+    terminalRunsTtlSeconds: 30 * 24 * 60 * 60,   // GC done/failed/cancelled after 30d
+    staleHeartbeatThresholdMs: 30 * 60 * 1000,   // mark as failed after 30 min no heartbeat
+    staleRunSweepIntervalMs: 60_000,             // sweep every minute
+    staleRunAction: 'fail',                      // or 'cancel'
+  },
+});
+
+// Deploy-time — call ONCE after mongoose connects (PACKAGE_RULES §32):
+await mongoose.connect(uri);
+await container.syncRetentionIndexes();          // idempotent, drop+rebuild on TTL change
+
+// Graceful shutdown — sweeper timer is unref()'d, so this is optional:
+container.dispose();
+```
+
+| Knob                          | Default | Effect                                                                                         |
+| ----------------------------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `terminalRunsTtlSeconds`      | off     | TTL index `{endedAt:1}` with `partialFilterExpression: {endedAt:{$exists:true}, status:{$in:[done,failed,cancelled]}}`. |
+| `multiTenantIndexes`          | `true` when repo is multi-tenant | Builds `{<tenantField>:1, workflowId:1, createdAt:-1}` so org-scoped lists hit a covering index. |
+| `staleHeartbeatThresholdMs`   | off     | Setting this auto-starts `StaleRunSweeper`. Pick well above the engine heartbeat AND any step's max execution time. |
+| `staleRunSweepIntervalMs`     | 60_000  | Self-rescheduling `setTimeout` (no overlap), `unref()`'d.                                       |
+| `staleRunAction`              | `'fail'`| `'fail'` ⇒ status `failed` + `error.code === 'stale_heartbeat'`; `'cancel'` ⇒ status `cancelled`. |
+| `staleRunBatchSize`           | 100     | Cap per sweep cycle.                                                                           |
+| `maxStaleRecoveries`          | 5       | After N recoveries, sweeper marks the run `failed` with `error.code === 'dead_lettered'` instead of recycling it. |
+
+The sweeper terminates via the repository's atomic `markStaleAsFailed()`
+CAS, so it can't race the engine's `recoverStale()` (which re-executes
+from the last heartbeat). Run both with different thresholds — recover at
+5 min for transient crashes, terminate at 30 min as a backstop — and the
+longer threshold acts as a give-up signal so the scheduler can move on.
+
+Both paths bump `WorkflowRun.recoveryAttempts` atomically. Once it hits
+`maxStaleRecoveries`, the next sweep cycle dead-letters the run with
+`error.code === 'dead_lettered'` instead of recycling it — closes the
+crash-recover-crash-recover loop bug for permanently broken runs. Hosts
+build their "stuck runs" dashboard off this field directly.
+
+## In-flight version pinning
+
+Long-running workflows survive engine deploys. Every run carries
+`definitionVersion` (snapshotted from `WorkflowDefinition.version` at
+create-time); on resume the engine routes execution to the version-pinned
+engine via `workflowRegistry.lookupVersion(workflowId, version)`.
+
+```typescript
+// Deploy v1 — registers automatically.
+const v1 = createWorkflow('billing', {
+  version: '1.0.0',
+  steps: { charge: chargeV1 },
+});
+
+const run = await v1.start({ orderId: '123' });   // run.definitionVersion === '1.0.0'
+
+// Later: deploy v2 in the SAME process (rolling node).
+const v2 = createWorkflow('billing', {
+  version: '2.0.0',
+  steps: { charge: chargeV2, refund: refundV2 },
+});
+
+await v1.engine.execute(run._id);   // routes to v1 — chargeV1 runs
+await v2.start({ orderId: '456' }); // run.definitionVersion === '2.0.0'
+```
+
+When the original engine isn't registered (you stopped registering v1
+because no v1 runs *should* exist), provide `migrateRun`:
+
+```typescript
+createWorkflow('billing', {
+  version: '2.0.0',
+  steps: { charge: chargeV2 },
+  migrateRun: async (run) => {
+    if (run.definitionVersion === '1.0.0' && run.currentStepId === 'oldCharge') {
+      return {
+        currentStepId: 'charge',
+        steps: run.steps.map((s) =>
+          s.stepId === 'oldCharge' ? { ...s, stepId: 'charge' } : s,
+        ),
+      };
+    }
+    return null; // fall through — engine fails the run with VERSION_MISMATCH
+  },
+});
+```
+
+Runs created before v2.3.3 have no `definitionVersion`; the engine falls
+through to the active definition (back-compat preserved).
+
 ## Query & cleanup
 
 ```typescript
