@@ -105,7 +105,12 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
    * Defaults to `'context.tenantId'`.
    */
   readonly tenantField: string;
-  private readonly isMultiTenant: boolean;
+  /**
+   * Public so retention helpers (`syncRetentionIndexes`) can decide
+   * whether to build the tenant-prefixed compound index without rerouting
+   * through the original config.
+   */
+  readonly isMultiTenant: boolean;
   private readonly isStrictTenant: boolean;
 
   constructor(config: WorkflowRepositoryConfig = {}) {
@@ -325,6 +330,100 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     } as Parameters<
       Repository<WorkflowRun>['cursor']
     >[1]) as AsyncIterableIterator<LeanWorkflowRun>;
+  }
+
+  /**
+   * Atomic give-up: mark a stale `running` run as `failed` (or
+   * `cancelled`) iff its heartbeat is older than `staleThresholdMs`.
+   *
+   * Distinct from `engine.recoverStale()` — recovery RE-EXECUTES from the
+   * last heartbeat, suitable for transient worker crashes; this terminates,
+   * suitable for "the run is wedged, give up and let the scheduler move on."
+   * The two can coexist: pick different thresholds (recover at 5min,
+   * terminate at 30min) and the longer threshold acts as a backstop.
+   *
+   * Routes through `claim()` so plugins (audit, cache invalidation,
+   * observability) fire and the CAS prevents a race against a worker that
+   * is mid-recovery. Returns `true` when the row was claimed and marked,
+   * `false` when another writer won (worker rebooted, recovery already
+   * promoted the run, etc.) — the caller treats `false` as "not my problem
+   * anymore," not as an error.
+   */
+  async markStaleAsFailed(
+    runId: string,
+    staleThresholdMs: number,
+    action: 'fail' | 'cancel' = 'fail',
+  ): Promise<boolean> {
+    const now = new Date();
+    const staleTime = new Date(now.getTime() - staleThresholdMs);
+    const targetStatus = action === 'cancel' ? 'cancelled' : 'failed';
+
+    const claimed = await this.claim(
+      runId,
+      {
+        from: 'running',
+        to: targetStatus,
+        where: {
+          $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
+        },
+      },
+      {
+        $set: {
+          endedAt: now,
+          updatedAt: now,
+          error: {
+            code: 'stale_heartbeat',
+            message: `Worker heartbeat older than ${staleThresholdMs}ms — terminated by retention sweep`,
+            terminatedAt: now,
+          },
+        },
+        $inc: { recoveryAttempts: 1 },
+      },
+      { bypassTenant: true } as Parameters<Repository<WorkflowRun>['claim']>[3],
+    );
+
+    return claimed !== null;
+  }
+
+  /**
+   * Dead-letter a run that has exceeded `maxStaleRecoveries`. Routes
+   * through `claim()` so the transition is plugin-observed; CAS guards
+   * against marking a run that has since transitioned out of `running`
+   * (a healthy worker recovered between sweep cycles).
+   *
+   * Sets `error.code === 'dead_lettered'` so hosts can build dashboards
+   * + alerts on permanent failures distinct from transient `stale_heartbeat`
+   * recoveries. The run stays in the collection so the host can inspect
+   * it (subject to `terminalRunsTtlSeconds` GC).
+   */
+  async markAsDeadLettered(
+    runId: string,
+    recoveryCount: number,
+    maxStaleRecoveries: number,
+  ): Promise<boolean> {
+    const now = new Date();
+    const claimed = await this.claim(
+      runId,
+      {
+        from: 'running',
+        to: 'failed',
+        where: { recoveryAttempts: { $gte: maxStaleRecoveries } },
+      },
+      {
+        $set: {
+          endedAt: now,
+          updatedAt: now,
+          error: {
+            code: 'dead_lettered',
+            message: `Run exceeded maxStaleRecoveries (${recoveryCount}/${maxStaleRecoveries}) — moved to dead-letter`,
+            recoveryAttempts: recoveryCount,
+            terminatedAt: now,
+          },
+        },
+      },
+      { bypassTenant: true } as Parameters<Repository<WorkflowRun>['claim']>[3],
+    );
+    return claimed !== null;
   }
 
   async getScheduledWorkflowsReadyToExecute(

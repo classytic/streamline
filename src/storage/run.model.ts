@@ -100,6 +100,21 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
     userId: { type: String, index: true },
     tags: [String],
     meta: Schema.Types.Mixed,
+    /**
+     * Pinned definition version (semver). The engine snapshots
+     * `WorkflowDefinition.version` at create-time so a run resumed weeks
+     * later still uses the step graph it started under. The engine
+     * resolves this through a version-keyed registry (`workflowRegistry.lookupVersion`)
+     * before re-execution; missing → falls back to the active definition.
+     */
+    definitionVersion: String,
+    /**
+     * How many times the stale-recovery / sweeper paths have touched this
+     * run. Once it hits `RetentionOptions.maxStaleRecoveries`, the next
+     * sweep marks the run failed with `error.code === 'dead_lettered'`
+     * instead of recycling it forever.
+     */
+    recoveryAttempts: { type: Number, default: 0 },
   },
   {
     collection: 'workflow_runs',

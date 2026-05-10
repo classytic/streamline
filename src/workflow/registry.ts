@@ -70,6 +70,15 @@ export class WorkflowRegistry<TContext = Record<string, unknown>> {
       input,
       createdAt: now,
       updatedAt: now,
+      // Pin the run to its starting definition version. The engine consults
+      // `versionRegistry.lookupVersion(workflowId, definitionVersion)` on
+      // resume so a run started under v1 keeps executing v1's step graph
+      // even after v2 is registered. Required for safe long-running
+      // workflows; the resume path falls back to the active definition
+      // when this field is missing (back-compat for runs created before
+      // v2.3.3).
+      definitionVersion: this.definition.version,
+      recoveryAttempts: 0,
       meta,
     };
   }

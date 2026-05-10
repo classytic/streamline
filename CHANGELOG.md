@@ -5,6 +5,145 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.3] - 2026-05-10 — dead-letter cap · in-flight version pinning · migrateRun
+
+> **Why this release.** Two production gaps the 2.3.2 retention block left
+> open: (1) a wedged run that crashes-recovers-crashes-recovers forever
+> still wedged the scheduler, because the sweep kept terminating it with
+> `stale_heartbeat` and the engine kept recovering it; (2) deploying a new
+> workflow version while v1 runs were still in-flight either failed them
+> with `VERSION_MISMATCH` or required the host to manually keep both
+> engines registered without any framework support. Both close in this
+> release without breaking 2.3.2's API surface.
+
+### 🚀 New — dead-letter cap
+
+- **`RetentionOptions.maxStaleRecoveries`** (default 5) — bound on how
+  many times the recovery + sweep paths may touch a single run. Once
+  exceeded, the next sweep cycle calls
+  `repository.markAsDeadLettered(...)` (atomic CAS), marks the run
+  `failed` with `error.code === 'dead_lettered'`, and emits
+  `workflow:failed` with that distinct code. The crash-recover-crash-recover
+  loop now terminates after a bounded number of attempts.
+- **`WorkflowRun.recoveryAttempts: number`** — incremented atomically by
+  both `engine.recoverStale()` (`$inc: { recoveryAttempts: 1 }` inside
+  the `claim()` patch) and `repository.markStaleAsFailed()`. Hosts can
+  build "stuck runs" dashboards off this field directly without
+  re-deriving from logs.
+- **`repository.markAsDeadLettered(runId, attempts, max)`** — typed CAS
+  method, returned `boolean` for "did we win the race." Plugin pipeline
+  fires (audit / cache invalidation / observability) — the dead-letter
+  transition is observable like any other.
+
+### 🚀 New — in-flight version pinning
+
+- **`WorkflowRun.definitionVersion: string`** — every run snapshots its
+  starting definition's `version` at create-time
+  (`WorkflowRegistry.createRun`). Required for safe rolling deploys.
+- **`workflowRegistry.lookupVersion(workflowId, version)`** — returns
+  the engine pinned to a specific `(workflowId, version)`. Populated
+  automatically when each `createWorkflow` registers; coexists with the
+  existing single-engine-per-workflowId map for back-compat.
+- **Engine routing on resume** — `engine.execute(runId)` checks the run's
+  `definitionVersion` against its own. When they differ AND a pinned
+  engine is registered, it delegates execution to the pinned engine. The
+  host can run two engine versions in the same process during a rolling
+  deploy without `VERSION_MISMATCH` failures.
+- **`WorkflowConfig.migrateRun(run) → Partial<WorkflowRun> | null`** —
+  optional migration hook called when the pinned engine isn't available.
+  Returns a partial run shape (remapped `currentStepId`, backfilled
+  `context`, rewritten `steps[]`); the engine merges + re-pins the run
+  to its own version, then continues. Returning `null` falls through
+  (engine fails the run with `VERSION_MISMATCH`, same pre-2.3.3
+  behaviour).
+
+### 📋 Migration
+
+- **No breaking changes.** Runs created before 2.3.3 have no
+  `definitionVersion` and `recoveryAttempts: undefined`; both code paths
+  treat that as the "back-compat" case. The new fields are added to the
+  Mongoose schema with safe defaults so existing collections don't need
+  a migration.
+- **Hosts that already wire `recoverStale` callbacks** — no change. The
+  `$inc: { recoveryAttempts: 1 }` is added inside `engine.recoverStale`
+  itself, so hosts using the engine's own recovery path get the counter
+  bumped automatically.
+- **Hosts using `WorkflowDefinitionModel`** — unrelated; the doc-store
+  is untouched. The version pinning above keys off the in-process
+  `workflowRegistry`, not the persisted definition.
+
+## [2.3.2] - 2026-05-10 — retention block: TTL · tenant compounds · stale-run sweeper
+
+> **Why this release.** Three operational gaps that the host had to wire by
+> hand on every fresh deploy — a TTL on terminal runs, the tenant-prefixed
+> compound multi-tenant deployments need, and a give-up sweeper for runs
+> whose worker crashed and never came back. All three are now first-class
+> on `createContainer({ retention })`. The package previously documented
+> the patterns in code comments + README snippets and trusted the host to
+> remember them; this release moves them into the container surface so
+> "forgot to add the index" stops being a footgun.
+
+### 🚀 New — `ContainerOptions.retention`
+
+- **`retention.terminalRunsTtlSeconds`** — TTL on terminal runs
+  (`done` / `failed` / `cancelled`). Index spec is
+  `{endedAt:1}` with `partialFilterExpression: {endedAt:{$exists:true},
+  status:{$in:[done,failed,cancelled]}}` so fresh `running` runs aren't in
+  the index at all (no TTL eligibility). `container.syncRetentionIndexes()`
+  is idempotent on repeat calls and drops + recreates when the TTL value
+  changes (closes `IndexOptionsConflict`).
+- **`retention.multiTenantIndexes`** (default: `true` when the repository
+  is multi-tenant) — auto-builds `{<tenantField>:1, workflowId:1,
+  createdAt:-1}`. PACKAGE_RULES §33 (scope-field prefix on compound
+  indexes) made literal — without this index, every org-scoped list
+  fanned out across every tenant's runs.
+- **`retention.staleHeartbeatThresholdMs`** — setting this AUTO-STARTS
+  `StaleRunSweeper`. Self-rescheduling `setTimeout` (no overlap),
+  `unref()`'d so it never blocks process exit. Sweeper terminates each
+  stale run via the new repository CAS `markStaleAsFailed()` and emits
+  `workflow:failed` with `error.code === 'stale_heartbeat'`.
+- **`retention.staleRunAction`** (`'fail'` | `'cancel'`, default `'fail'`)
+  — pick the terminal status the sweeper writes.
+- **`retention.staleRunSweepIntervalMs`** (default 60_000) and
+  **`retention.staleRunBatchSize`** (default 100) — cap sweep frequency
+  and per-cycle Mongo round-trips.
+
+### 🚀 New — `WorkflowRunRepository.markStaleAsFailed()`
+
+Atomic give-up CAS via mongokit's `claim()`. Distinct from
+`engine.recoverStale()` (re-execute from last heartbeat) — this terminates.
+Routes through the standard plugin pipeline, so audit / cache invalidation
+/ observability all fire on each terminator. Returns `false` when another
+writer (e.g. recovery) won the race; the caller treats it as "not my
+problem anymore," not as an error. Run both paths with different
+thresholds (recover at 5 min, terminate at 30 min) and the longer
+threshold acts as a backstop.
+
+### 🚀 New — exports
+
+- `RetentionOptions`, `RETENTION_DEFAULTS`, `resolveSweeperConfig`,
+  `StaleRunSweeper`, `syncRetentionIndexes` from package root.
+- `StreamlineContainer.syncRetentionIndexes()` and
+  `StreamlineContainer.dispose()` — call the first from a deploy script
+  after `mongoose.connect`, the second on graceful shutdown (optional —
+  timer is `unref()`'d).
+- `WorkflowRunRepository.isMultiTenant` (was `private`) — promoted to
+  `public readonly` so retention helpers can decide whether to build
+  the tenant compound without rerouting through the original config.
+
+### 📋 Migration
+
+- **Existing hosts with hand-rolled `syncStreamlineIndexes()`** — replace
+  with `container.syncRetentionIndexes()`. Same indexes, slightly different
+  names (prefixed `streamline_`); on first run the new helper coexists
+  with the old hand-built ones until you drop them. Pre-existing
+  `terminal_runs_ttl` / `org_workflow_recent` indexes can stay or be
+  dropped — they're functionally redundant once the package-managed ones
+  exist.
+- **No breaking changes.** `createContainer()` with no `retention` block
+  behaves identically to 2.3.1 — sweeper not started, no indexes built,
+  `dispose()` is a no-op.
+
 ## [2.3.0] - 2026-05-02 — start-rate gates · strict concurrency · HttpError · mongokit 3.13 / repo-core 0.4 alignment · security + correctness hardening
 
 > **Why this release.** Three gaps closed at once: (1) start-rate gates
