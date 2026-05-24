@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.4] - 2026-05-24 — `Workflow.bindFailureTo` + peer dep floor bumps
+
+### Added — `Workflow.bindFailureTo({ model, key, field, value, errorField? })`
+
+Subscribe a workflow to its parent doc once at registration and have failures
+auto-patch the parent's status field — replaces the hand-rolled
+`subscribe('workflow:failed') → match by workflow id → look up parent → patch`
+boilerplate hosts otherwise repeat once per workflow. Returns an `off()`
+unsubscribe for graceful shutdown.
+
+```ts
+const off = renderVideo.bindFailureTo({
+  model: VideoJobModel,
+  key: 'videoJobId',        // read from run.input.videoJobId
+  field: 'status',
+  value: 'failed',
+  errorField: 'errorMessage',
+});
+```
+
+Lock-in: `test/integration/bind-failure-to.test.ts`.
+
+### Changed — peer dep floors
+
+- `@classytic/mongokit` `>=3.13.0` → `>=3.14.0` (compliance-grade `purgeByField`).
+- `@classytic/primitives` `>=0.4.0` → `>=0.6.0` (`phone`, `status-history`,
+  `condition`, `mixin`, `sla-policy` primitives + cleaner shape for
+  `BankTransaction` / `Money`).
+- `@classytic/repo-core` `>=0.4.0` → `>=0.5.0` (`PurgePort` + `runChunkedPurge`).
+
+Floor-only — no API breaks. Hosts already on these peer-dep ranges pick up
+2.3.4 transparently.
+
 ## [2.3.3] - 2026-05-10 — dead-letter cap · in-flight version pinning · migrateRun
 
 > **Why this release.** Two production gaps the 2.3.2 retention block left

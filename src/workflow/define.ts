@@ -31,6 +31,7 @@
  */
 
 import { createContainer, type StreamlineContainer } from '../core/container.js';
+import type { WorkflowFailedPayload } from '../core/events.js';
 import { isTerminalState } from '../core/status.js';
 import type {
   Step,
@@ -395,6 +396,97 @@ export interface Workflow<TContext, TInput = unknown> {
   engine: WorkflowEngine<TContext>;
   /** The container used by this workflow (for testing or custom integrations) */
   container: StreamlineContainer;
+  /**
+   * Bind workflow-level failure to a parent document on a Mongoose model.
+   *
+   * When this workflow's run transitions to `failed`, the helper looks up the
+   * parent doc id from `run.input` or `run.context` (configurable) and patches
+   * the parent doc with a status field (and optionally an error message).
+   *
+   * Replaces the hand-rolled "subscribe to `workflow:failed` → match by
+   * workflow id → look up parent → patch" boilerplate hosts otherwise repeat
+   * once per workflow.
+   *
+   * Returns an `off()` unsubscribe function — call it on graceful shutdown if
+   * the workflow's container outlives the parent-model registration.
+   *
+   * @example
+   * ```ts
+   * const off = renderVideo.bindFailureTo({
+   *   model: VideoJobModel,
+   *   key: 'videoJobId',          // run.input.videoJobId
+   *   field: 'status',
+   *   value: 'failed',
+   *   errorField: 'errorMessage',
+   * });
+   * ```
+   */
+  bindFailureTo: (options: BindFailureToOptions<TContext>) => () => void;
+}
+
+/**
+ * Configuration for {@link Workflow.bindFailureTo}.
+ *
+ * Designed to be hand-rolled-replacement minimal — every host-side
+ * "on workflow failure, mark the parent doc as failed" handler should
+ * collapse to one call with these fields.
+ */
+export interface BindFailureToOptions<TContext = Record<string, unknown>> {
+  /**
+   * The Mongoose model owning the parent doc. Duck-typed against
+   * `findByIdAndUpdate(id, update)` so test models / custom adapters that
+   * conform to the minimal contract also work.
+   */
+  readonly model: {
+    findByIdAndUpdate: (
+      id: unknown,
+      update: Record<string, unknown>,
+    ) =>
+      | Promise<unknown>
+      | {
+          exec: () => Promise<unknown>;
+        };
+  };
+
+  /**
+   * Where to read the parent id from:
+   *   - `'input'` (default): `run.input[key]` — when the host passed the id
+   *     into `workflow.start({ videoJobId: '...' })`
+   *   - `'context'`: `run.context[key]` — when the id was assembled by the
+   *     workflow's `context: (input) => ...` builder
+   *
+   * Ignored when `key` is a function.
+   */
+  readonly source?: 'input' | 'context';
+
+  /**
+   * Either a property name (e.g. `'videoJobId'`) read from `source`, or a
+   * resolver function for shapes the simple path can't reach (nested fields,
+   * computed ids, parent-doc id stored in step output).
+   */
+  readonly key: string | ((run: WorkflowRun<TContext>) => unknown);
+
+  /**
+   * Parent-doc field to write on failure. Common: `'status'`.
+   */
+  readonly field: string;
+
+  /**
+   * Value to set at {@link field}. Defaults to `'failed'`.
+   */
+  readonly value?: unknown;
+
+  /**
+   * Optional: also write the failure error to this field. Common:
+   * `'errorMessage'` or `'lastError'`.
+   */
+  readonly errorField?: string;
+
+  /**
+   * Optional: shape the error before writing to {@link errorField}. By default
+   * we store `error.message ?? String(error)`.
+   */
+  readonly errorTransform?: (error: WorkflowFailedPayload['error']) => unknown;
 }
 
 // ============================================================================
@@ -769,6 +861,71 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     container.eventBus.on(config.trigger.event, triggerListener);
   }
 
+  // ============ bindFailureTo ============
+  //
+  // Subscribes to `workflow:failed` on the container's event bus and patches
+  // a parent doc when a failure for THIS workflow's runs lands. Hand-rolled
+  // versions of this typically: (1) listen on the same shared bus, (2) call
+  // `engine.get(runId)` to read the run, (3) filter by `workflowId`, (4) walk
+  // input/context for the parent id, (5) call `Model.findByIdAndUpdate`. Now
+  // one call.
+  const bindFailureTo = (options: BindFailureToOptions<TContext>): (() => void) => {
+    const source = options.source ?? 'input';
+    const errorField = options.errorField;
+    const targetValue = options.value ?? 'failed';
+    const errorTransform =
+      options.errorTransform ??
+      ((err: WorkflowFailedPayload['error']) =>
+        err && typeof err === 'object' && 'message' in err
+          ? (err as { message: string }).message
+          : String(err));
+
+    const handler = async (payload: WorkflowFailedPayload): Promise<void> => {
+      try {
+        const run = await engine.get(payload.runId);
+        if (!run || run.workflowId !== definition.id) return;
+
+        let parentId: unknown;
+        if (typeof options.key === 'function') {
+          parentId = options.key(run as WorkflowRun<TContext>);
+        } else {
+          const root = source === 'context' ? run.context : (run.input as unknown);
+          parentId =
+            root && typeof root === 'object'
+              ? (root as Record<string, unknown>)[options.key]
+              : undefined;
+        }
+        if (parentId == null) return;
+
+        const update: Record<string, unknown> = { [options.field]: targetValue };
+        if (errorField) update[errorField] = errorTransform(payload.error);
+
+        const result = options.model.findByIdAndUpdate(parentId, update);
+        // Mongoose returns a query that resolves on `.exec()` OR a Promise on
+        // newer versions. Handle both so duck-typed test models work too.
+        if (result && typeof (result as { exec?: unknown }).exec === 'function') {
+          await (result as { exec: () => Promise<unknown> }).exec();
+        } else {
+          await result;
+        }
+      } catch (err) {
+        // Best-effort — never let the failure-bridge itself crash the bus.
+        // Surface through `engine:error` so the host's existing engine-error
+        // sink picks it up rather than swallowing silently.
+        container.eventBus.emit('engine:error', {
+          runId: payload.runId,
+          error: err instanceof Error ? err : new Error(String(err)),
+          context: `bindFailureTo[${definition.id}]`,
+        });
+      }
+    };
+
+    container.eventBus.on('workflow:failed', handler);
+    return () => {
+      container.eventBus.off('workflow:failed', handler);
+    };
+  };
+
   return {
     start,
     get: (runId) => engine.get(runId),
@@ -788,6 +945,7 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     definition,
     engine,
     container,
+    bindFailureTo,
   };
 }
 
