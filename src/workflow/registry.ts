@@ -83,8 +83,22 @@ export class WorkflowRegistry<TContext = Record<string, unknown>> {
     };
   }
 
+  /** Resolve the opt-in output-history ring depth for a step (step > defaults). */
+  private historyKeepFor(stepId: string): number {
+    const step = this.definition.steps.find((s) => s.id === stepId);
+    const keep = step?.outputHistory?.keep ?? this.definition.defaults?.outputHistory?.keep ?? 0;
+    return keep > 0 ? keep : 0;
+  }
+
   /**
-   * Rewind a workflow run to a previous step
+   * Rewind a workflow run to a previous step.
+   *
+   * Steps from `targetIndex` onward reset to fresh `pending` state. When a
+   * reset step has output-history ENABLED, its prior committed `output` and
+   * existing `outputHistory` are PRESERVED through the reset so the re-success
+   * write archives the prior generation (the in-`updateStepState` capture
+   * keys off the prior `output` still occupying the slot). Disabled steps are
+   * byte-for-byte unchanged from v2.3.4 (output dropped).
    */
   rewindRun(run: WorkflowRun<TContext>, targetStepId: string): WorkflowRun<TContext> {
     const targetIndex = this.definition.steps.findIndex((s) => s.id === targetStepId);
@@ -94,13 +108,25 @@ export class WorkflowRegistry<TContext = Record<string, unknown>> {
 
     run.steps = run.steps.map((stepState, index) => {
       if (index >= targetIndex) {
-        // Reset to fresh state - clear ALL previous execution data
-        return {
+        const fresh: StepState = {
           stepId: stepState.stepId,
           status: 'pending' as const,
           attempts: 0,
-          // Explicitly omit: output, error, waitingFor, startedAt, endedAt
+          // Explicitly omit: error, waitingFor, startedAt, endedAt
         };
+        // History-enabled steps preserve the prior generation so it can be
+        // archived on the next success. (Only carry forward a REAL committed
+        // output, never a __checkpoint sentinel.)
+        if (this.historyKeepFor(stepState.stepId) > 0) {
+          const out = stepState.output;
+          const isSentinel =
+            out !== null &&
+            typeof out === 'object' &&
+            '__checkpoint' in (out as Record<string, unknown>);
+          if (out !== undefined && !isSentinel) fresh.output = out;
+          if (stepState.outputHistory !== undefined) fresh.outputHistory = stepState.outputHistory;
+        }
+        return fresh;
       }
       return stepState;
     });

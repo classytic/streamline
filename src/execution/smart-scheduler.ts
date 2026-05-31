@@ -191,6 +191,7 @@ export class SmartScheduler {
   private readonly metrics: SchedulerMetrics;
   private staleRecoveryCallback?: (runId: string, thresholdMs: number) => Promise<unknown>;
   private retryCallback?: (runId: string) => Promise<unknown>;
+  private compensationRecoveryCallback?: (runId: string, thresholdMs: number) => Promise<unknown>;
 
   constructor(
     private readonly repository: WorkflowRunRepository,
@@ -228,6 +229,18 @@ export class SmartScheduler {
    */
   setRetryCallback(callback: (runId: string) => Promise<unknown>): void {
     this.retryCallback = callback;
+  }
+
+  /**
+   * Set callback for recovering runs left in `compensating` after a crash
+   * mid-saga-rollback (durable saga, v2.4). Separate from stale-running
+   * recovery: the compensation phase re-enters via its own state-machine path
+   * and skips already-`done` per-step compensations (effectively-once).
+   */
+  setCompensationRecoveryCallback(
+    callback: (runId: string, thresholdMs: number) => Promise<unknown>,
+  ): void {
+    this.compensationRecoveryCallback = callback;
   }
 
   /**
@@ -475,6 +488,24 @@ export class SmartScheduler {
       // Query workflows ready for retry (exponential backoff) - PAGINATED.
       const retrying = await this.repository.getReadyForRetry(now, limit, { bypassTenant: true });
 
+      // Query workflows blocked on a childWorkflow wait that are due for
+      // crash-durable reconciliation - PAGINATED.
+      //
+      // THE BUG THIS CLOSES: a parent suspended on ctx.startChildWorkflow()
+      // is normally resumed only by in-process event-bus listeners. After a
+      // crash/restart those listeners are gone and NO other sweep reclaims
+      // the wait (it has no resumeAt/retryAfter and isn't status='running').
+      // This sweep hands the orphaned wait to resumeCallback → engine.resume,
+      // which reconciles against the child run (resume if the child already
+      // finished, else re-register listeners + bump nextReconcileAt). The
+      // engine's waiting→running atomic claim makes a concurrent in-memory
+      // listener or a second polling worker a no-op (race-safe, idempotent).
+      // Cross-tenant sweep — bypass scope; per-row writes downstream are
+      // id-scoped.
+      const childWaiting = await this.repository.getChildWaitingRuns(now, limit, {
+        bypassTenant: true,
+      });
+
       let resumedCount = 0;
 
       // Resume waiting workflows
@@ -483,6 +514,14 @@ export class SmartScheduler {
         if (this.timers.has(run._id)) continue;
 
         // Resume workflow (atomic claim happens inside resumeCallback/engine)
+        await this.resumeWorkflow(run._id);
+        resumedCount++;
+      }
+
+      // Reconcile childWorkflow waits. resumeCallback → engine.resume drives
+      // reconciliation; the waiting→running claim guards against double-drive
+      // by an in-memory listener or another worker.
+      for (const run of childWaiting) {
         await this.resumeWorkflow(run._id);
         resumedCount++;
       }
@@ -576,9 +615,39 @@ export class SmartScheduler {
         }
       }
 
+      // Recover runs stuck in `compensating` after a crash mid-saga-rollback
+      // (durable saga, v2.4). Mirrors stale-running recovery: a genuinely
+      // crashed compensation has a stale heartbeat (a live one heartbeats),
+      // and the recovery callback re-enters the compensation phase which skips
+      // per-step compensations already `done` (effectively-once, no
+      // double-compensation). Cross-tenant sweep; per-row writes id-scoped.
+      let compensatingCount = 0;
+      if (this.compensationRecoveryCallback) {
+        const stuckCompensating = await this.repository.getStaleCompensatingRuns(
+          this.config.staleThreshold,
+          limit,
+          { bypassTenant: true },
+        );
+        for (const run of stuckCompensating) {
+          compensatingCount++;
+          try {
+            await this.compensationRecoveryCallback(run._id, this.config.staleThreshold);
+            resumedCount++;
+          } catch (err) {
+            this.emitError('recover-compensation', err, run._id);
+          }
+        }
+      }
+
       // Record successful poll
       const duration = Date.now() - startTime;
-      const totalWorkflows = waiting.length + retrying.length + scheduled.length + staleCount;
+      const totalWorkflows =
+        waiting.length +
+        retrying.length +
+        childWaiting.length +
+        scheduled.length +
+        staleCount +
+        compensatingCount;
       this.metrics.recordPoll(duration, true, totalWorkflows);
       this.consecutiveFailures = 0;
 
@@ -655,6 +724,16 @@ export class SmartScheduler {
       // downstream are id-scoped.
       if (await this.repository.hasWaitingWorkflows({ bypassTenant: true })) return true;
 
+      // Check for childWorkflow waits due for crash-durable reconciliation.
+      // `hasWaitingWorkflows` already matches any status='waiting' run, so this
+      // is usually redundant — but it's an explicit, cadence-gated wake reason
+      // so the child-reconciliation sweep stays correct even if the broad
+      // waiting probe's semantics narrow later.
+      const childWaiting = await this.repository.getChildWaitingRuns(new Date(), 1, {
+        bypassTenant: true,
+      });
+      if (childWaiting.length > 0) return true;
+
       // Check for scheduled workflows ready to execute (timezone-aware)
       const scheduled = await this.repository.getScheduledWorkflowsReadyToExecute(new Date(), {
         limit: 1,
@@ -668,6 +747,14 @@ export class SmartScheduler {
         bypassTenant: true,
       });
       if (stale.length > 0) return true;
+
+      // Check for crashed saga compensations stuck in `compensating` (v2.4).
+      const stuckCompensating = await this.repository.getStaleCompensatingRuns(
+        this.config.staleThreshold,
+        1,
+        { bypassTenant: true },
+      );
+      if (stuckCompensating.length > 0) return true;
 
       // Check for concurrency-queued drafts waiting for promotion (bounded
       // exists-query — short-circuits on the first match). Cross-tenant

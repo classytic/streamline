@@ -25,6 +25,19 @@ const StepStateSchema = new Schema<StepState>(
     waitingFor: { type: Schema.Types.Mixed, required: false },
     error: { type: Schema.Types.Mixed, required: false },
     retryAfter: Date, // Exponential backoff timestamp
+    // Durable saga compensation memoization (v2.4). Mixed subdoc mirrors the
+    // `waitingFor`/`error` pattern so it can be entirely absent on non-saga
+    // runs (no migration, no schema growth). Written DB-first AFTER the
+    // onCompensate handler resolves; `status` is the per-step idempotency CAS
+    // target (pending → done via numeric-index guarded updateOne).
+    compensation: { type: Schema.Types.Mixed, required: false },
+    // Opt-in versioned output history (ring buffer). `default: undefined`
+    // keeps the field ABSENT on legacy/disabled runs — no migration, no
+    // schema growth when `Step.outputHistory.keep` is 0/undefined. Mixed
+    // array mirrors the `output` / `stepLogs` pattern; bounded at write time
+    // via `$slice:-keep`, never indexed (read by `_id`).
+    outputHistory: { type: [Schema.Types.Mixed], default: undefined },
+    pinnedVersion: { type: Number, required: false },
   },
   { _id: false },
 );
@@ -76,7 +89,20 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
     workflowId: { type: String, required: true, index: true },
     status: {
       type: String,
-      enum: ['draft', 'running', 'waiting', 'done', 'failed', 'cancelled'],
+      // Durable saga (v2.4) adds 'compensating' | 'compensated' |
+      // 'compensation_failed'. Additive at runtime — existing runs are
+      // unaffected.
+      enum: [
+        'draft',
+        'running',
+        'waiting',
+        'done',
+        'failed',
+        'cancelled',
+        'compensating',
+        'compensated',
+        'compensation_failed',
+      ],
       required: true,
       index: true,
     },
@@ -152,6 +178,14 @@ WorkflowRunSchema.index({ idempotencyKey: 1, status: 1 }, { sparse: true });
  * reusable after `done` / `failed` / `cancelled` — same documented semantic
  * as before, now actually race-safe.
  *
+ * Durable saga (v2.4): `'compensating'` is included in the active `$in` set —
+ * a run mid-rollback is still ACTIVE and must keep blocking a duplicate
+ * idempotency key (a second start of the same logical operation while the
+ * first is still compensating would be unsafe). The terminal compensation
+ * outcomes `'compensated'` / `'compensation_failed'` are deliberately EXCLUDED
+ * (like `done`/`failed`/`cancelled`), so the key becomes reusable once the
+ * saga fully settles.
+ *
  * `idempotencyKey: { $type: 'string' }` is the standard guard against
  * `null` collisions when other docs lack the field (PACKAGE_RULES §35).
  *
@@ -194,7 +228,9 @@ WorkflowRunSchema.index(
     unique: true,
     partialFilterExpression: {
       idempotencyKey: { $type: 'string' },
-      status: { $in: ['draft', 'running', 'waiting'] },
+      // 'compensating' is still active → keeps blocking duplicate keys.
+      // Terminal 'compensated'/'compensation_failed' are excluded (key reusable).
+      status: { $in: ['draft', 'running', 'waiting', 'compensating'] },
     },
   },
 );
@@ -228,6 +264,20 @@ WorkflowRunSchema.index({
 WorkflowRunSchema.index({
   status: 1,
   lastHeartbeat: 1,
+});
+
+// Critical index for crash-durable child-workflow reconciliation.
+// REQUIRED for production: Supports getChildWaitingRuns() query
+// (CommonQueries.childWaiting in query-builder.ts). Selects
+// status='waiting' runs with a step in status='waiting' whose
+// waitingFor.type='childWorkflow', gated on the reconcile cadence
+// (waitingFor.nextReconcileAt <= now). Without it the poller does a full
+// collection scan every cadence window.
+WorkflowRunSchema.index({
+  status: 1,
+  'steps.status': 1,
+  'steps.waitingFor.type': 1,
+  'steps.waitingFor.nextReconcileAt': 1,
 });
 
 // Critical index for scheduled workflow polling (timezone-aware scheduling)

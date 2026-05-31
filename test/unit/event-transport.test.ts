@@ -171,6 +171,8 @@ describe('STREAMLINE_EVENTS / LEGACY_TO_CANONICAL', () => {
       'workflow:recovered',
       'workflow:retry',
       'workflow:compensating',
+      'workflow:compensated',
+      'workflow:compensation_failed',
       'engine:error',
       'scheduler:error',
       'scheduler:circuit-open',

@@ -21,6 +21,7 @@ import {
 } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { WorkflowRegistry } from '../workflow/registry.js';
+import { GotoSignal, StepContextImpl, WaitSignal } from './context.js';
 import { StepExecutor } from './executor.js';
 import {
   DEFAULT_SCHEDULER_CONFIG,
@@ -276,6 +277,15 @@ export interface WorkflowEngineOptions {
    */
   compensationHandlers?: WorkflowHandlers<unknown>;
   /**
+   * Per-step compensation retry config (durable saga, v2.4). Keyed by stepId.
+   * Absent → 1 attempt (no compensation retry). Threaded from
+   * `StepConfig.compensateRetries`/`compensateRetryDelay`/`compensateRetryBackoff`.
+   */
+  compensationConfigs?: Record<
+    string,
+    { retries?: number; retryDelay?: number; retryBackoff?: 'exponential' | 'linear' | 'fixed' | number }
+  >;
+  /**
    * Optional migration hook for in-flight runs whose `definitionVersion`
    * doesn't match this engine AND whose original-version engine is not
    * registered. The host inspects the run and returns a partial run
@@ -382,6 +392,11 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Set retry callback for exponential backoff retries
     this.scheduler.setRetryCallback(async (runId) => {
       return this.executeRetry(runId);
+    });
+
+    // Set compensation recovery callback for crashed saga rollbacks (v2.4)
+    this.scheduler.setCompensationRecoveryCallback(async (runId, thresholdMs) => {
+      return this.recoverCompensation(runId, thresholdMs);
     });
 
     // Smart start: Only start polling if workflows exist
@@ -648,9 +663,12 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           run = refreshed;
         }
 
-        // Handle terminal states
+        // Handle terminal states. Break out of the loop but DEFER cleanup to
+        // the post-loop block — for a `failed` run with compensation handlers
+        // we must enter the durable `compensating` phase first and only tear
+        // down listeners/hooks once a genuinely-terminal compensation outcome
+        // (compensated / compensation_failed / cancelled) is reached.
         if (isTerminalState(run.status)) {
-          cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
           break;
         }
       }
@@ -699,16 +717,21 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       }
     }
 
-    // Clean up on terminal states
+    // Terminal handling — durable-saga aware.
+    //
+    // ORDERING INVARIANT (verifier-mandated): cleanupEventListeners /
+    // hookRegistry.unregister must fire ONLY on a genuinely-terminal outcome,
+    // NEVER while compensation is still pending. So when a run goes `failed`
+    // AND has compensation handlers, we enter the durable compensation phase
+    // FIRST (it transitions failed → compensating as its first durable action)
+    // and only tear down once it settles to compensated / compensation_failed.
+    if (run.status === 'failed' && this.options.compensationHandlers) {
+      run = await this.runCompensation(run);
+    }
+
     if (isTerminalState(run.status)) {
       cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
       hookRegistry.unregister(runId);
-
-      // Saga compensation: if workflow failed and compensation handlers exist,
-      // run them in reverse order for all completed steps.
-      if (run.status === 'failed' && this.options.compensationHandlers) {
-        run = await this.runCompensation(run);
-      }
 
       // Promote concurrency-queued drafts immediately when a slot frees up.
       // Don't wait for the scheduler poll cycle (could be 60s+).
@@ -721,32 +744,246 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   }
 
   /**
-   * Run saga compensation handlers for completed steps in reverse order.
-   * Called automatically when a workflow fails and compensation handlers are registered.
+   * Durable saga compensation phase (v2.4).
+   *
+   * Inline entry from a freshly-`failed` run: transitions `failed →
+   * compensating` via `assertAndClaim` as the FIRST durable action (so in a
+   * multi-worker setup exactly one worker enters — the loser's claim returns
+   * null and this is a no-op), then drives the compensation walk.
+   *
+   * EXACTLY-ONCE BOUNDARY (documented honestly): per-step compensation
+   * memoization (`steps.<i>.compensation.status` flipped pending→done via a
+   * numeric-index guarded CAS, written DB-first AFTER the handler resolves) is
+   * effectively-once for SAME-CLUSTER writes only. For EXTERNAL side effects
+   * (Stripe refund, etc.) it provides NOTHING by itself: there is a crash
+   * window AFTER the external call succeeds but BEFORE the pending→done CAS
+   * lands, during which recovery re-runs the handler. External compensation is
+   * effectively-once ONLY if the handler passes `ctx.idempotencyKey('compensate')`
+   * (attempt-invariant, stable across crash/resume) to the provider so the
+   * provider dedupes. We make NO "exactly-once against external APIs" claim.
    */
   private async runCompensation(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
     const compensationHandlers = this.options.compensationHandlers;
     if (!compensationHandlers) return run;
 
-    // Get completed steps in reverse order
-    const completedSteps = run.steps
-      .filter((s) => s.status === 'done' && compensationHandlers[s.stepId])
-      .reverse();
+    const runId = run._id;
+    const now = new Date();
 
-    if (completedSteps.length === 0) return run;
-
-    this.container.eventBus.emit('workflow:compensating', {
-      runId: run._id,
-      data: { steps: completedSteps.map((s) => s.stepId) },
+    // FIRST durable action: failed → compensating. assertAndClaim runs the
+    // sync state-machine assertion then an atomic CAS; null = another worker
+    // already entered (multi-worker entry race resolves to one winner). The
+    // loser returns the current state and does NOT build a (possibly stale)
+    // compensation list.
+    const claimed = await assertAndClaim(RUN_MACHINE, this.container.repository, runId, {
+      from: 'failed',
+      to: 'compensating',
+      patch: { lastHeartbeat: now, updatedAt: now },
+      options: { bypassTenant: true },
     });
 
-    for (const stepState of completedSteps) {
-      const handler = compensationHandlers[stepState.stepId];
-      if (!handler) continue;
+    if (!claimed) {
+      // Lost the entry race (or run already past `failed`). Return current
+      // persisted state; the winner (or a recovery sweep) drives compensation.
+      this.container.cache.delete(runId);
+      return (await this.get(runId)) ?? run;
+    }
 
+    this.container.cache.delete(runId);
+    return this.driveCompensation(runId);
+  }
+
+  /**
+   * Crash-recovery entrypoint for a run left in `compensating` after a process
+   * died mid-rollback. Reclaims via a stale-heartbeat-guarded CAS
+   * (compensating → compensating, so only a genuinely-stale run is reclaimed —
+   * a live compensation heartbeats and won't match) and re-drives the walk.
+   * The walk skips per-step compensations already `done` (effectively-once),
+   * so step N+1 isn't compensated twice.
+   *
+   * Wired into the scheduler's poll via `getStaleCompensatingRuns`.
+   */
+  async recoverCompensation(
+    runId: string,
+    staleThresholdMs: number,
+  ): Promise<WorkflowRun<TContext> | null> {
+    const staleTime = new Date(Date.now() - staleThresholdMs);
+    const claimed = await this.container.repository.claim(
+      runId,
+      {
+        from: 'compensating',
+        to: 'compensating',
+        where: {
+          $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
+        },
+      },
+      {
+        $set: { lastHeartbeat: new Date(), updatedAt: new Date() },
+        $inc: { recoveryAttempts: 1 },
+      },
+      { bypassTenant: true },
+    );
+
+    if (!claimed) return null; // live compensation or already settled — not ours
+
+    this.container.cache.delete(runId);
+    this.container.eventBus.emit('workflow:recovered', { runId });
+    return this.driveCompensation(runId);
+  }
+
+  /**
+   * Core compensation walk. Assumes the run is already in `compensating`
+   * (claimed by the inline entry or the recovery reclaim). Always re-reads
+   * persisted `StepState` (never a stale in-memory snapshot) to derive the
+   * reverse-ordered set of completed steps. Runs a real heartbeat for the
+   * duration so the StaleRunSweeper does not race-kill an in-flight rollback.
+   *
+   * COMPENSATION SEMANTICS (documented):
+   *   - Only steps with `status === 'done'` AND a registered `onCompensate`
+   *     handler are compensated, in REVERSE completion order (reverse of the
+   *     persisted `steps[]` array, which the engine appends/advances in
+   *     execution order).
+   *   - Steps left `waiting` / `running` at failure time are NOT compensated:
+   *     they have no committed `done` output to roll back. (If such a step had
+   *     an external side effect that needs undoing, the host must model it as a
+   *     `done` step — a partially-applied `waiting`/`running` step is an
+   *     incomplete effect, not a committed one.)
+   *   - A step run multiple times via goto-loops appears ONCE in `steps[]` and
+   *     is compensated exactly ONCE. If a step's effect is cumulative across
+   *     loop iterations, a single compensation under-rolls-back — the host must
+   *     make `onCompensate` idempotently undo the net effect (e.g. via the
+   *     idempotency key + a host-side ledger).
+   */
+  private async driveCompensation(runId: string): Promise<WorkflowRun<TContext>> {
+    const compensationHandlers = this.options.compensationHandlers ?? {};
+
+    // Real heartbeat for the duration of the rollback so a long compensation
+    // is not marked stale by markStaleAsFailed mid-flight. The AbortController
+    // is wired into each compensation ctx so a cancel/timeout aborts cleanly.
+    const abortController = new AbortController();
+    const heartbeatTimer = setInterval(() => {
+      this.container.repository
+        .updateOne({ _id: runId }, { lastHeartbeat: new Date() }, { bypassTenant: true })
+        .catch(() => {
+          // ignore — the stale threshold is far longer than the interval
+        });
+    }, TIMING.HEARTBEAT_INTERVAL_MS);
+    (heartbeatTimer as { unref?: () => void }).unref?.();
+
+    try {
+      // FRESH read of persisted state — derive the reverse-ordered completed
+      // step list from the database, not an in-memory snapshot (correct on
+      // both the inline and the crash-recovery path).
+      const fresh = await this.get(runId);
+      if (!fresh) return (await this.get(runId)) ?? ({} as WorkflowRun<TContext>);
+
+      const toCompensate = fresh.steps
+        .filter((s) => s.status === 'done' && compensationHandlers[s.stepId])
+        .reverse();
+
+      // Emit once (idempotent on recovery — purely advisory).
+      this.container.eventBus.emit('workflow:compensating', {
+        runId,
+        data: { steps: toCompensate.map((s) => s.stepId) },
+      });
+
+      let anyFailed = false;
+
+      for (const stepState of toCompensate) {
+        // Skip steps already compensated (effectively-once on re-entry).
+        if (stepState.compensation?.status === 'done') continue;
+
+        // Honor cancel mid-compensation: a CANCELLED_GUARD on the per-step
+        // write would reject anyway, but short-circuit early. Cancellation
+        // does NOT roll back already-run compensations (documented).
+        const reread = await this.get(runId);
+        if (reread && reread.status !== 'compensating') {
+          // Cancelled or otherwise transitioned out — stop driving.
+          return reread;
+        }
+
+        const handler = compensationHandlers[stepState.stepId];
+        if (!handler) continue;
+
+        const ok = await this.compensateOneStep(runId, stepState, handler, abortController);
+        if (!ok) anyFailed = true;
+      }
+
+      // Terminal transition: compensating → compensated | compensation_failed.
+      const target: 'compensated' | 'compensation_failed' = anyFailed
+        ? 'compensation_failed'
+        : 'compensated';
+      const settled = await assertAndClaim(RUN_MACHINE, this.container.repository, runId, {
+        from: 'compensating',
+        to: target,
+        patch: { endedAt: new Date(), updatedAt: new Date() },
+        options: { bypassTenant: true },
+      });
+
+      this.container.cache.delete(runId);
+
+      if (settled) {
+        this.container.eventBus.emit(
+          target === 'compensated' ? 'workflow:compensated' : 'workflow:compensation_failed',
+          { runId },
+        );
+      }
+
+      return (await this.get(runId)) ?? fresh;
+    } finally {
+      clearInterval(heartbeatTimer);
+    }
+  }
+
+  /**
+   * Compensate a single step with retry, then memoize the outcome DB-first via
+   * a NUMERIC-INDEX guarded CAS (NOT mongokit claim() — it cannot forward
+   * arrayFilters). Returns true on success (or already-done), false if the
+   * handler exhausted retries / threw fatally.
+   *
+   * The pending→done flip is written AFTER the handler resolves and guarded on
+   * `status:'compensating'` + `steps.<i>.compensation.status:'pending'` so a
+   * concurrent recovery (or a re-entry) cannot double-flip — the second writer
+   * gets modifiedCount:0 and treats it as already-done.
+   */
+  private async compensateOneStep(
+    runId: string,
+    stepState: StepState,
+    handler: WorkflowHandlers<unknown>[string],
+    abortController: AbortController,
+  ): Promise<boolean> {
+    const cfg = this.options.compensationConfigs?.[stepState.stepId];
+    const maxAttempts = Math.max(1, cfg?.retries ?? 1);
+    const baseDelay = cfg?.retryDelay ?? 0;
+
+    // Re-read the freshest run for the ctx (context/output the handler reads).
+    const run = (await this.get(runId)) ?? null;
+    if (!run) return false;
+    const stepIndex = run.steps.findIndex((s) => s.stepId === stepState.stepId);
+    if (stepIndex === -1) return false;
+
+    // Mark compensation pending + startedAt (idempotent — only sets if absent).
+    if (!run.steps[stepIndex]?.compensation) {
+      await this.container.repository.updateOne(
+        { _id: runId, status: 'compensating' },
+        {
+          $set: {
+            [`steps.${stepIndex}.compensation`]: {
+              status: 'pending',
+              attempts: 0,
+              startedAt: new Date(),
+            },
+            updatedAt: new Date(),
+          },
+        },
+        { bypassTenant: true },
+      );
+    }
+
+    let lastError: Error | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const ctx = new (await import('./context.js')).StepContextImpl(
-          run._id,
+        const ctx = new StepContextImpl(
+          runId,
           stepState.stepId,
           run.context,
           run.input,
@@ -754,25 +991,90 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           run,
           this.container.repository,
           this.container.eventBus,
+          abortController.signal,
+          this.container.signalStore,
         );
 
-        await (handler as (ctx: unknown) => Promise<unknown>)(ctx);
+        const result = (handler as (ctx: unknown) => Promise<unknown>)(ctx);
 
+        // RUNTIME GUARD: a compensation handler must not suspend. If a
+        // WaitSignal / GotoSignal escapes, fail the compensation rather than
+        // hang (the define-time static scan is best-effort).
+        const output = await result;
+        if (output instanceof WaitSignal || output instanceof GotoSignal) {
+          throw new Error(
+            `Compensation handler for step "${stepState.stepId}" attempted to suspend — ` +
+              `compensation must be non-suspending`,
+          );
+        }
+
+        // Success → memoize pending→done via numeric-index guarded CAS.
+        const res = await this.container.repository.updateOne(
+          {
+            _id: runId,
+            status: 'compensating',
+            [`steps.${stepIndex}.compensation.status`]: 'pending',
+          },
+          {
+            $set: {
+              [`steps.${stepIndex}.compensation.status`]: 'done',
+              [`steps.${stepIndex}.compensation.completedAt`]: new Date(),
+              updatedAt: new Date(),
+            },
+            $inc: { [`steps.${stepIndex}.compensation.attempts`]: 1 },
+          },
+          { bypassTenant: true },
+        );
+
+        // modifiedCount:0 → a concurrent writer already flipped it to done, or
+        // the run left `compensating` (cancel). Treat as success (idempotent).
+        this.container.cache.delete(runId);
         this.container.eventBus.emit('step:compensated', {
-          runId: run._id,
+          runId,
           stepId: stepState.stepId,
         });
+        void res;
+        return true;
       } catch (err) {
-        // Compensation failures are logged but don't block other compensations
+        const e = err as Error;
+        // A WaitSignal/GotoSignal thrown synchronously also lands here.
+        if (e instanceof WaitSignal || e instanceof GotoSignal) {
+          lastError = new Error(
+            `Compensation handler for step "${stepState.stepId}" attempted to suspend — ` +
+              `compensation must be non-suspending`,
+          );
+          break; // non-retriable
+        }
+        lastError = e;
         this.container.eventBus.emit('engine:error', {
-          runId: run._id,
+          runId,
           error: toError(err),
           context: `compensation-${stepState.stepId}`,
         });
+        if (attempt < maxAttempts && baseDelay > 0) {
+          const mult = cfg?.retryBackoff === 'exponential' ? 2 ** (attempt - 1) : 1;
+          await new Promise((r) => setTimeout(r, baseDelay * mult));
+        }
       }
     }
 
-    return run;
+    // Exhausted retries → record failed compensation status.
+    await this.container.repository.updateOne(
+      { _id: runId, status: 'compensating' },
+      {
+        $set: {
+          [`steps.${stepIndex}.compensation.status`]: 'failed',
+          [`steps.${stepIndex}.compensation.error`]: {
+            message: lastError?.message ?? 'compensation failed',
+          },
+          updatedAt: new Date(),
+        },
+        $inc: { [`steps.${stepIndex}.compensation.attempts`]: 1 },
+      },
+      { bypassTenant: true },
+    );
+    this.container.cache.delete(runId);
+    return false;
   }
 
   /**
@@ -902,105 +1204,13 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       return false;
     }
 
-    // Child workflow wait — auto-start the child and listen for completion
+    // Child workflow wait — auto-start the child (first entry) or reconcile
+    // against an already-started child (re-entry, e.g. after a crash). See
+    // `handleChildWorkflowWait`.
     if (stepState.waitingFor?.type === 'childWorkflow') {
-      const data = stepState.waitingFor.data as
-        | {
-            childWorkflowId: string;
-            childInput: unknown;
-            parentRunId: string;
-            parentStepId: string;
-            childRunId?: string;
-          }
-        | undefined;
-
-      if (data?.childWorkflowId && !data.childRunId) {
-        // Look up the child workflow engine by workflowId
-        const childEngine = workflowRegistry.getEngine(data.childWorkflowId);
-
-        if (childEngine) {
-          // Auto-start the child workflow
-          const childRun = await childEngine.start(data.childInput);
-
-          // Store the childRunId in the parent's waitingFor data
-          const stepIndex = run.steps.findIndex((s) => s.stepId === run.currentStepId);
-          if (stepIndex !== -1) {
-            await this.container.repository.updateOne(
-              { _id: runId },
-              { $set: { [`steps.${stepIndex}.waitingFor.data.childRunId`]: childRun._id } },
-              { bypassTenant: true },
-            );
-          }
-
-          // Listen for child completion and auto-resume parent.
-          //
-          // Buses to subscribe on:
-          //   1. parent's container bus — same-container children fire here
-          //   2. child's container bus  — cross-container children fire here
-          //      (the executor calls `this.eventBus.emit` against the child
-          //      engine's own container, NOT the parent's)
-          // Subscribe to both; dedupe by `_resumed` flag so only one fires
-          // when buses are the same.
-          const sameContainer = childEngine.container.eventBus === this.container.eventBus;
-          let resumed = false;
-
-          const cleanup = () => {
-            this.container.eventBus.off('workflow:completed', childCompletionHandler);
-            this.container.eventBus.off('workflow:failed', childFailHandler);
-            if (!sameContainer) {
-              childEngine.container.eventBus.off('workflow:completed', childCompletionHandler);
-              childEngine.container.eventBus.off('workflow:failed', childFailHandler);
-            }
-          };
-
-          const childCompletionHandler = async (payload: { runId?: string; data?: unknown }) => {
-            if (!payload.runId || payload.runId !== childRun._id) return;
-            if (resumed) return;
-            resumed = true;
-            try {
-              const completedChild = await childEngine.get(childRun._id);
-              const output = completedChild?.output ?? completedChild?.context;
-              await this.resume(runId, output);
-            } catch {
-              // Parent may have been cancelled or already resumed
-            }
-            cleanup();
-          };
-
-          const childFailHandler = async (payload: { runId?: string; data?: unknown }) => {
-            if (!payload.runId || payload.runId !== childRun._id) return;
-            if (resumed) return;
-            resumed = true;
-            try {
-              const failedChild = await childEngine.get(childRun._id);
-              await this.resume(runId, { __childFailed: true, error: failedChild?.error });
-            } catch {
-              // Parent may have been cancelled
-            }
-            cleanup();
-          };
-
-          this.container.eventBus.on('workflow:completed', childCompletionHandler);
-          this.container.eventBus.on('workflow:failed', childFailHandler);
-          if (!sameContainer) {
-            childEngine.container.eventBus.on('workflow:completed', childCompletionHandler);
-            childEngine.container.eventBus.on('workflow:failed', childFailHandler);
-          }
-        } else {
-          // Child engine not found — emit guidance
-          this.container.eventBus.emit('engine:error', {
-            runId,
-            error: new Error(
-              `Child workflow '${data.childWorkflowId}' not registered. ` +
-                `Ensure the child workflow is created with createWorkflow() before the parent starts. ` +
-                `Or resume the parent manually when the child completes.`,
-            ),
-            context: 'child-workflow-not-found',
-          });
-        }
-      }
-
-      // Break — child execution handles completion asynchronously
+      await this.handleChildWorkflowWait(runId, run);
+      // Break — child completion drives the resume (in-process listener
+      // when alive, scheduler reconciliation poll otherwise).
       return false;
     }
 
@@ -1010,6 +1220,204 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
   private findCurrentStep(run: WorkflowRun<TContext>): StepState | undefined {
     return run.steps.find((s) => s.stepId === run.currentStepId);
+  }
+
+  /**
+   * Handle a `childWorkflow` wait — crash-durable.
+   *
+   * Two entry shapes share this method:
+   *
+   *   1. **First entry** (`childRunId` not yet set) — auto-start the child,
+   *      persist its `childRunId`, register the in-process completion
+   *      listeners, and stamp `nextReconcileAt` so the scheduler can reclaim
+   *      the wait if this process dies before the listener fires.
+   *
+   *   2. **Re-entry / reconciliation** (`childRunId` already set) — the
+   *      previous handler's in-memory listeners may be gone (process crash/
+   *      restart) or the scheduler's child-waiting sweep re-drove the wait.
+   *      Look the child up: if it's terminal, resume the parent directly
+   *      (done → child output; failed → `{ __childFailed, error }`), exactly
+   *      like the listeners would have. If the child is still active,
+   *      re-register the listeners (so same-process completion still fires)
+   *      and bump `nextReconcileAt` so the poller revisits later.
+   *
+   * Idempotency / race-safety: every resume path goes through
+   * `this.resume(runId, …)`, whose `waiting → running` atomic claim
+   * (`resumeStep` / the RUN_MACHINE-guarded executor write) lets exactly one
+   * caller win. A concurrent in-memory listener, a second polling worker, and
+   * this reconciliation can all fire — the losers no-op when the step is no
+   * longer `waiting`.
+   *
+   * Scoped to `childWorkflow`; the `nextReconcileAt` cadence + the generic
+   * `withChildWaiting` query are shaped so later slices can extend the same
+   * machinery to `gate` / `branchJoin` waits.
+   */
+  private async handleChildWorkflowWait(runId: string, run: WorkflowRun<TContext>): Promise<void> {
+    const stepState = this.findCurrentStep(run);
+    const data = stepState?.waitingFor?.data as
+      | {
+          childWorkflowId: string;
+          childInput: unknown;
+          parentRunId: string;
+          parentStepId: string;
+          childRunId?: string;
+        }
+      | undefined;
+
+    if (!data?.childWorkflowId) return;
+
+    const childEngine = workflowRegistry.getEngine(data.childWorkflowId);
+    if (!childEngine) {
+      // Child engine not found — emit guidance. (Same message as before.)
+      this.container.eventBus.emit('engine:error', {
+        runId,
+        error: new Error(
+          `Child workflow '${data.childWorkflowId}' not registered. ` +
+            `Ensure the child workflow is created with createWorkflow() before the parent starts. ` +
+            `Or resume the parent manually when the child completes.`,
+        ),
+        context: 'child-workflow-not-found',
+      });
+      return;
+    }
+
+    const stepIndex = run.steps.findIndex((s) => s.stepId === run.currentStepId);
+
+    // ---- First entry: no child started yet ----
+    if (!data.childRunId) {
+      const childRun = await childEngine.start(data.childInput);
+
+      // Persist childRunId AND the initial reconcile cadence in one write so
+      // a crash immediately after start still leaves a poll-reclaimable wait.
+      if (stepIndex !== -1) {
+        await this.container.repository.updateOne(
+          { _id: runId },
+          {
+            $set: {
+              [`steps.${stepIndex}.waitingFor.data.childRunId`]: childRun._id,
+              [`steps.${stepIndex}.waitingFor.nextReconcileAt`]: new Date(
+                Date.now() + TIMING.CHILD_RECONCILE_INTERVAL_MS,
+              ),
+            },
+          },
+          { bypassTenant: true },
+        );
+      }
+
+      this.registerChildCompletionListeners(runId, childRun._id, childEngine);
+      return;
+    }
+
+    // ---- Re-entry: child already started, reconcile its state ----
+    const childRunId = data.childRunId;
+    const child = await childEngine.get(childRunId);
+
+    if (child && (child.status === 'done' || child.status === 'failed')) {
+      // Terminal child — resume the parent exactly like the listeners would.
+      // The waiting→running claim inside resume() guards against a concurrent
+      // listener / poller double-resuming.
+      try {
+        if (child.status === 'done') {
+          const output = child.output ?? child.context;
+          await this.resume(runId, output);
+        } else {
+          await this.resume(runId, { __childFailed: true, error: child.error });
+        }
+      } catch {
+        // Lost the resume race (already resumed/cancelled) — no-op.
+      }
+      return;
+    }
+
+    // Child still active (or not yet readable): re-arm the in-process
+    // listeners so same-process completion fires, and push the reconcile
+    // cadence forward so the poller revisits later instead of every cycle.
+    this.registerChildCompletionListeners(runId, childRunId, childEngine);
+
+    if (stepIndex !== -1) {
+      await this.container.repository.updateOne(
+        { _id: runId },
+        {
+          $set: {
+            [`steps.${stepIndex}.waitingFor.nextReconcileAt`]: new Date(
+              Date.now() + TIMING.CHILD_RECONCILE_INTERVAL_MS,
+            ),
+          },
+        },
+        { bypassTenant: true },
+      );
+    }
+  }
+
+  /**
+   * Register in-process event-bus listeners that resume the parent when the
+   * child run completes/fails. Extracted from the inline `childWorkflow`
+   * branch so both the first-entry and reconciliation paths share one
+   * implementation.
+   *
+   * Buses to subscribe on:
+   *   1. parent's container bus — same-container children fire here
+   *   2. child's container bus  — cross-container children fire here
+   *      (the executor emits against the child engine's own container)
+   * Subscribe to both; dedupe by a local `resumed` flag so only one fires
+   * when the buses are the same.
+   *
+   * These listeners are a fast-path optimisation, NOT the durability
+   * guarantee — after a crash they're gone, and the scheduler's child-waiting
+   * reconciliation sweep (`handleChildWorkflowWait` re-entry) reclaims the
+   * wait. The `resume()` atomic claim makes listener + poll mutually
+   * exclusive.
+   */
+  private registerChildCompletionListeners(
+    runId: string,
+    childRunId: string,
+    childEngine: WorkflowEngine<unknown>,
+  ): void {
+    const sameContainer = childEngine.container.eventBus === this.container.eventBus;
+    let resumed = false;
+
+    const cleanup = () => {
+      this.container.eventBus.off('workflow:completed', childCompletionHandler);
+      this.container.eventBus.off('workflow:failed', childFailHandler);
+      if (!sameContainer) {
+        childEngine.container.eventBus.off('workflow:completed', childCompletionHandler);
+        childEngine.container.eventBus.off('workflow:failed', childFailHandler);
+      }
+    };
+
+    const childCompletionHandler = async (payload: { runId?: string; data?: unknown }) => {
+      if (!payload.runId || payload.runId !== childRunId) return;
+      if (resumed) return;
+      resumed = true;
+      try {
+        const completedChild = await childEngine.get(childRunId);
+        const output = completedChild?.output ?? completedChild?.context;
+        await this.resume(runId, output);
+      } catch {
+        // Parent may have been cancelled or already resumed (poll won the race)
+      }
+      cleanup();
+    };
+
+    const childFailHandler = async (payload: { runId?: string; data?: unknown }) => {
+      if (!payload.runId || payload.runId !== childRunId) return;
+      if (resumed) return;
+      resumed = true;
+      try {
+        const failedChild = await childEngine.get(childRunId);
+        await this.resume(runId, { __childFailed: true, error: failedChild?.error });
+      } catch {
+        // Parent may have been cancelled or already resumed
+      }
+      cleanup();
+    };
+
+    this.container.eventBus.on('workflow:completed', childCompletionHandler);
+    this.container.eventBus.on('workflow:failed', childFailHandler);
+    if (!sameContainer) {
+      childEngine.container.eventBus.on('workflow:completed', childCompletionHandler);
+      childEngine.container.eventBus.on('workflow:failed', childFailHandler);
+    }
   }
 
   // ============ Wait Handlers ============
@@ -1233,6 +1641,30 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     if (currentStepId) {
       const stepState = run.steps.find((s) => s.stepId === currentStepId);
 
+      // Child-workflow wait, no payload — this is a crash-durable
+      // reconciliation poll (scheduler's child-waiting sweep calls
+      // `resume(runId)` with no payload), NOT a completion signal. Routing it
+      // through `resumeStep(undefined)` would WRONGLY complete the step with
+      // an undefined child result before the child has finished. Instead,
+      // reconcile against the child: resume only if the child is terminal,
+      // otherwise re-arm listeners + bump the reconcile cadence and stay
+      // `waiting`.
+      //
+      // The in-process listeners and manual `resume(runId, output)` callers
+      // DO pass a payload, so they fall through to the normal completion path
+      // below. The `waiting → running` claim in `resumeStep` still makes
+      // listener-vs-poll mutually exclusive if both somehow drive a resume.
+      if (
+        stepState?.status === 'waiting' &&
+        stepState.waitingFor?.type === 'childWorkflow' &&
+        payload === undefined
+      ) {
+        await this.handleChildWorkflowWait(runId, run);
+        // Return current state — reconciliation either already resumed the
+        // run (terminal child) or left it waiting (active child).
+        return (await this.get(runId)) ?? run;
+      }
+
       // If step is 'waiting' (explicit wait/sleep/waitFor), complete it with payload
       if (stepState?.status === 'waiting') {
         cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
@@ -1428,8 +1860,58 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   async rewindTo(runId: string, stepId: string): Promise<WorkflowRun<TContext>> {
     const run = await this.getOrThrow(runId);
 
+    // `rewindRun` computes the rewound in-memory shape (resetting steps from
+    // the target onward; preserving `output`/`outputHistory` on
+    // history-enabled steps so a re-success can archive the prior generation).
     const rewoundRun = this.registry.rewindRun(run, stepId);
-    await this.container.repository.updateById(runId, rewoundRun, { bypassTenant: true });
+
+    // Persist via NARROW per-step $set/$unset, NOT a full-document
+    // `updateById(rewoundRun)` spread. The full-doc path triggers mongoose-9's
+    // update-cast to coerce the embedded `steps[]` plain objects into
+    // Subdocument instances in place, poisoning the cache (invariant #8 — the
+    // same hazard `cancel()`/`pause()` avoid). Build the field map from the
+    // already-computed rewound steps so history preservation rides the narrow
+    // write instead of widening it.
+    const targetIndex = this.registry.definition.steps.findIndex((s) => s.id === stepId);
+    const set: Record<string, unknown> = {
+      currentStepId: rewoundRun.currentStepId,
+      status: rewoundRun.status,
+      updatedAt: new Date(),
+    };
+    const unset: Record<string, ''> = {
+      output: '',
+      endedAt: '',
+      error: '',
+    };
+
+    rewoundRun.steps.forEach((step, index) => {
+      if (index < targetIndex) return; // untouched steps stay as-is
+      set[`steps.${index}.status`] = step.status;
+      set[`steps.${index}.attempts`] = step.attempts;
+      // Reset fields that the fresh state omits.
+      unset[`steps.${index}.error`] = '';
+      unset[`steps.${index}.startedAt`] = '';
+      unset[`steps.${index}.completedAt`] = '';
+      unset[`steps.${index}.endedAt`] = '';
+      unset[`steps.${index}.durationMs`] = '';
+      unset[`steps.${index}.waitingFor`] = '';
+      unset[`steps.${index}.retryAfter`] = '';
+      // Output + history: preserved by `rewindRun` for history-enabled steps,
+      // dropped otherwise. Mirror that exactly with $set (present) / $unset.
+      if (step.output !== undefined) set[`steps.${index}.output`] = step.output;
+      else unset[`steps.${index}.output`] = '';
+      if (step.outputHistory !== undefined)
+        set[`steps.${index}.outputHistory`] = step.outputHistory;
+      else unset[`steps.${index}.outputHistory`] = '';
+      // pinnedVersion is per-generation metadata — clear it on rewind.
+      unset[`steps.${index}.pinnedVersion`] = '';
+    });
+
+    await this.container.repository.updateOne(
+      { _id: runId, status: { $ne: 'cancelled' } },
+      { $set: set, $unset: unset },
+      { bypassTenant: true },
+    );
     this.container.cache.set(rewoundRun);
 
     return rewoundRun;
@@ -1541,6 +2023,9 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       });
       this.scheduler.setRetryCallback(async (runId) => {
         return this.executeRetry(runId);
+      });
+      this.scheduler.setCompensationRecoveryCallback(async (runId, thresholdMs) => {
+        return this.recoverCompensation(runId, thresholdMs);
       });
 
       this.options.scheduler = currentConfig;

@@ -36,6 +36,8 @@ export const STREAMLINE_EVENTS = {
   WORKFLOW_RECOVERED: 'streamline:workflow.recovered',
   WORKFLOW_RETRY: 'streamline:workflow.retry',
   WORKFLOW_COMPENSATING: 'streamline:workflow.compensating',
+  WORKFLOW_COMPENSATED: 'streamline:workflow.compensated',
+  WORKFLOW_COMPENSATION_FAILED: 'streamline:workflow.compensation-failed',
 
   // Engine telemetry
   ENGINE_ERROR: 'streamline:engine.error',
@@ -70,6 +72,8 @@ export const LEGACY_TO_CANONICAL: Readonly<Record<WorkflowEventName, StreamlineE
   'workflow:recovered': STREAMLINE_EVENTS.WORKFLOW_RECOVERED,
   'workflow:retry': STREAMLINE_EVENTS.WORKFLOW_RETRY,
   'workflow:compensating': STREAMLINE_EVENTS.WORKFLOW_COMPENSATING,
+  'workflow:compensated': STREAMLINE_EVENTS.WORKFLOW_COMPENSATED,
+  'workflow:compensation_failed': STREAMLINE_EVENTS.WORKFLOW_COMPENSATION_FAILED,
   'engine:error': STREAMLINE_EVENTS.ENGINE_ERROR,
   'scheduler:error': STREAMLINE_EVENTS.SCHEDULER_ERROR,
   'scheduler:circuit-open': STREAMLINE_EVENTS.SCHEDULER_CIRCUIT_OPEN,

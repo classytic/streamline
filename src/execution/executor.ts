@@ -30,6 +30,35 @@ import { GotoSignal, StepContextImpl, WaitSignal } from './context.js';
 const CANCELLED_GUARD = { status: { $ne: 'cancelled' } };
 
 /**
+ * Structural equality for two persisted step-output values. Used only by the
+ * output-history idempotency guard to detect a replay of the same success
+ * write (same value already at the top of the ring buffer). Step outputs are
+ * JSON-document values (they round-trip through the run doc), so a stable
+ * JSON stringify with sorted keys is a sound, order-insensitive compare.
+ */
+function stableEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  try {
+    return stableStringify(a) === stableStringify(b);
+  } catch {
+    return false;
+  }
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, val) => {
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const sorted: Record<string, unknown> = {};
+      for (const k of Object.keys(val as Record<string, unknown>).sort()) {
+        sorted[k] = (val as Record<string, unknown>)[k];
+      }
+      return sorted;
+    }
+    return val;
+  });
+}
+
+/**
  * Type-safe interface for WaitSignal data payload.
  * Used when steps call ctx.wait(), ctx.sleep(), or ctx.waitFor().
  */
@@ -633,6 +662,87 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   }
 
   /**
+   * Resolve the opt-in output-history ring depth for a step.
+   * Step-level config wins over workflow defaults; 0/undefined ⇒ disabled.
+   */
+  private resolveHistoryKeep(stepId: string): number {
+    const step = this.registry.getStep(stepId);
+    const keep =
+      step?.outputHistory?.keep ?? this.registry.definition.defaults?.outputHistory?.keep ?? 0;
+    return keep > 0 ? keep : 0;
+  }
+
+  /**
+   * Decide whether the PRIOR committed output of a step should be archived as
+   * a history version on THIS success-transition write, and build the version.
+   *
+   * Capture is anchored to the rerun/rewind transition (verifier-mandated):
+   * a version is pushed only when a step that previously committed a real,
+   * non-`__checkpoint` output (preserved through the rewind/goto reset for
+   * history-enabled steps) re-succeeds. An idempotency guard refuses to
+   * re-archive the value already at the top of the buffer, closing the
+   * done-then-crash-before-moveToNextStep double-push window.
+   *
+   * Returns `undefined` when nothing should be pushed (feature disabled, no
+   * genuine prior generation, sentinel/intermediate output, or duplicate).
+   */
+  private buildHistoryPush(
+    priorStep: StepState | undefined,
+    updates: Partial<StepState>,
+    keep: number,
+  ): import('../storage/update-builders.js').OutputHistoryPush | undefined {
+    // Only on the success write (status → done), and only when enabled.
+    if (keep <= 0 || updates.status !== 'done') return undefined;
+    if (!priorStep) return undefined;
+
+    // There must be a genuine PRIOR committed output occupying the slot. This
+    // is the rerun/rewind discriminator: a FIRST forward success has no prior
+    // output (the step was just claimed `running` with the slot empty), so it
+    // archives nothing. A re-success after rewind/goto/rerun DOES — because
+    // the reset paths deliberately PRESERVE the prior `output` (+ history) when
+    // the feature is enabled, so the prior committed generation is still in the
+    // slot at re-success time.
+    if (priorStep.output === undefined) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(priorStep, 'output')) return undefined;
+
+    const priorOutput = priorStep.output;
+    // Never archive a checkpoint/scatter sentinel as a "prior output".
+    if (
+      priorOutput !== null &&
+      typeof priorOutput === 'object' &&
+      '__checkpoint' in (priorOutput as Record<string, unknown>)
+    ) {
+      return undefined;
+    }
+
+    const history = priorStep.outputHistory ?? [];
+    const top = history[history.length - 1];
+    // Idempotency: refuse to archive a generation already sitting at the top
+    // of the buffer. The `attempts` counter resets on rewind so it cannot
+    // identify a generation across reruns; instead we compare the value being
+    // archived against the most-recent archived value. A genuine new rerun
+    // archives a DIFFERENT prior generation than the last one captured; a
+    // replay of the same success write would try to re-archive the value
+    // already at the top (the done-then-crash-before-moveToNextStep window),
+    // which this skips. Outputs are JSON-document values, so a structural
+    // compare is sound and matches what a crash-recovery reload would see.
+    if (top !== undefined && stableEqual(top.output, priorOutput)) {
+      return undefined;
+    }
+
+    const nextVersion = (top?.version ?? 0) + 1;
+    return {
+      version: {
+        version: nextVersion,
+        output: priorOutput,
+        at: new Date(),
+        attempt: priorStep.attempts,
+      },
+      keep,
+    };
+  }
+
+  /**
    * Update a step's state and derive new workflow status.
    * Atomically updates both in-memory and database state.
    */
@@ -644,12 +754,20 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     // Convert Mongoose document to plain object if needed
     run = toPlainRun(run);
 
-    const { index: stepIndex } = this.findStepOrThrow(run, stepId);
+    const { index: stepIndex, step: priorStep } = this.findStepOrThrow(run, stepId);
 
-    // Apply updates to in-memory state (once — reused for status derivation)
-    const updatedSteps = applyStepUpdates(stepId, run.steps, updates);
+    // Snapshot the PRIOR committed output BEFORE applyStepUpdates overwrites
+    // it, then decide whether this success-transition archives a version.
+    const historyPush = this.buildHistoryPush(priorStep, updates, this.resolveHistoryKeep(stepId));
+
+    // Apply updates to in-memory state (once — reused for status derivation).
+    // The in-memory mirror replicates the SAME $push + $slice ring.
+    const updatedSteps = applyStepUpdates(stepId, run.steps, updates, historyPush);
     const newStatus = deriveRunStatus({ ...run, steps: updatedSteps });
-    const updateOps = buildStepUpdateOps(stepIndex, updates, { includeStatus: newStatus });
+    const updateOps = buildStepUpdateOps(stepIndex, updates, {
+      includeStatus: newStatus,
+      ...(historyPush ? { historyPush } : {}),
+    });
 
     run.steps = updatedSteps;
     run.updatedAt = new Date();
@@ -769,15 +887,30 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       updatedAt: now,
     };
 
-    // Reset the target step to pending so it can be executed
+    // Reset the target step to pending so it can be executed.
+    //
+    // When output-history is ENABLED for the target, PRESERVE its prior
+    // committed `output` (+ existing `outputHistory`) through the goto-loop
+    // reset so the next success archives the prior generation — same
+    // discriminator as `rewindRun`. A `__checkpoint` sentinel is never carried
+    // forward. DISABLED steps behave byte-for-byte as v2.3.4 (the original
+    // narrow `$set` of status+attempts; output is cleared in-memory only).
     if (targetIndex !== -1) {
       updates[`steps.${targetIndex}.status`] = 'pending';
       updates[`steps.${targetIndex}.attempts`] = 0;
       const step = run.steps[targetIndex];
+      const keep = this.resolveHistoryKeep(targetStepId);
+      const priorOutput = step?.output;
+      const isSentinel =
+        priorOutput !== null &&
+        typeof priorOutput === 'object' &&
+        '__checkpoint' in (priorOutput as Record<string, unknown>);
+      const preserveOutput = keep > 0 && priorOutput !== undefined && !isSentinel;
+
       if (step) {
         step.status = 'pending';
         step.attempts = 0;
-        step.output = undefined;
+        if (!preserveOutput) step.output = undefined;
         step.error = undefined;
         step.startedAt = undefined;
         step.endedAt = undefined;

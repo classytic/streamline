@@ -57,6 +57,7 @@ export type { WorkflowDefinitionDoc } from './storage/definition.model.js';
  */
 export {
   WorkflowDefinitionModel,
+  WorkflowDefinitionRepository,
   workflowDefinitionRepository,
 } from './storage/definition.model.js';
 /**
@@ -92,7 +93,7 @@ export {
  * with raw field keys (Mongo would silently drop them). `runSet` /
  * `runSetUnset` are the builders every streamline write path uses.
  */
-export type { MongoUpdate } from './storage/update-builders.js';
+export type { MongoUpdate, OutputHistoryPush } from './storage/update-builders.js';
 export {
   buildStepUpdateOps,
   normalizeUpdate,
