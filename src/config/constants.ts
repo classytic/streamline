@@ -28,6 +28,16 @@ export const TIMING = {
   HOOK_CLEANUP_INTERVAL_MS: 60_000, // 1 minute
 
   /**
+   * Reconcile cadence for crash-recoverable `childWorkflow` waits. The
+   * engine stamps `waitingFor.nextReconcileAt = now + this` when a parent
+   * suspends on (or re-reconciles) a still-active child; the scheduler's
+   * child-waiting sweep only revisits the parent once that timestamp
+   * passes. Bounds how stale a missed in-process completion can get after
+   * a crash without hammering the DB for legitimately-blocked parents.
+   */
+  CHILD_RECONCILE_INTERVAL_MS: 30_000, // 30 seconds
+
+  /**
    * Consecutive heartbeat-write failures after which the executor aborts the
    * step to prevent the stale-detector from flipping the run to 'crashed'
    * while another worker is still executing it (double-run risk). At default

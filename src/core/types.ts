@@ -1,5 +1,54 @@
 export type StepStatus = 'pending' | 'running' | 'waiting' | 'done' | 'failed' | 'skipped';
-export type RunStatus = 'draft' | 'running' | 'waiting' | 'done' | 'failed' | 'cancelled';
+/**
+ * Workflow run lifecycle status.
+ *
+ * ⚠️ TYPE-LEVEL BREAKING CHANGE (semver-MINOR at runtime, breaking for
+ * exhaustive consumers). v2.4 adds the durable-saga compensation phase:
+ * `'compensating' | 'compensated' | 'compensation_failed'`. These are purely
+ * ADDITIVE at runtime — no existing transition or terminal-state behavior
+ * changes for workflows without compensation handlers, and the engine never
+ * emits them unless a failed run has registered `onCompensate` handlers.
+ *
+ * BUT any downstream TypeScript consumer doing an exhaustive `switch (status)`
+ * with a `never`-check default (common under `isolatedModules`/strict) will
+ * stop compiling until it handles the three new literals. Document this in the
+ * changelog as a type-level break. There is no runtime migration.
+ */
+export type RunStatus =
+  | 'draft'
+  | 'running'
+  | 'waiting'
+  | 'done'
+  | 'failed'
+  | 'cancelled'
+  // ── Durable saga / compensation phase (v2.4) ──
+  /** Failed run is actively rolling back completed steps in reverse order. */
+  | 'compensating'
+  /** All compensations completed successfully (TERMINAL). */
+  | 'compensated'
+  /** A compensation handler exhausted retries / threw fatally (TERMINAL). */
+  | 'compensation_failed';
+
+/**
+ * Per-step compensation memoization record (durable saga, v2.4).
+ *
+ * NEW field on `StepState` — never overlaps the `output` slot (invariant #9).
+ * Default-absent on runs that never enter compensation (no migration, no
+ * schema growth for non-saga workflows).
+ *
+ * `status` is the idempotency CAS target: the engine flips `pending → done`
+ * via a numeric-index guarded `updateOne` (NOT mongokit `claim()`, which can't
+ * forward arrayFilters) ONLY after the handler resolves. A re-entered recovery
+ * skips any step already `done`, so a step compensates effectively-once within
+ * the same cluster.
+ */
+export interface StepCompensationState {
+  status: 'pending' | 'done' | 'failed' | 'skipped';
+  attempts: number;
+  startedAt?: Date;
+  completedAt?: Date;
+  error?: StepError;
+}
 
 export interface Step {
   id: string;
@@ -90,6 +139,53 @@ export interface Step {
    * ```
    */
   runIf?: (context: unknown) => boolean | Promise<boolean>;
+
+  // ============ Versioned Output History (opt-in) ============
+
+  /**
+   * Opt-in per-step versioned output ring buffer.
+   *
+   * When `keep > 0`, the engine snapshots the step's PRIOR committed output
+   * into `StepState.outputHistory` on the rerun/rewind transition (i.e. when
+   * a step that was previously `done` re-succeeds). The buffer is bounded to
+   * the most recent `keep` versions via a `$push` + `$slice:-keep` ring.
+   *
+   * `keep` of `0` or `undefined` ⇒ feature DISABLED ⇒ behavior is
+   * byte-for-byte identical to v2.3.4: no `outputHistory` field is ever
+   * written and the run-document schema does not grow.
+   *
+   * History stores raw outputs inline in the run document — bound the value
+   * size (the 16MB BSON cap is `keep × output-size` per step). For large
+   * blobs, store a handle/reference, not the payload.
+   */
+  outputHistory?: { keep: number };
+}
+
+/**
+ * One archived generation of a step's output, captured on the rerun/rewind
+ * transition. Stored inline in `StepState.outputHistory` as a bounded ring
+ * buffer (see `Step.outputHistory.keep`).
+ *
+ * `version` is a monotonically-increasing per-step counter (the value of
+ * `attempt`/generation at capture time is recorded in `attempt` for the
+ * idempotency guard). The engine never interprets these for control flow —
+ * they are pure provenance the host reads via `ctx.outputHistory()` and
+ * selects from via `ctx.pinOutput()`.
+ */
+export interface StepOutputVersion<T = unknown> {
+  /** Monotonic per-step version number (1-based). */
+  version: number;
+  /** The archived output value (the prior committed generation). */
+  output: T;
+  /** When this generation was archived. */
+  at: Date;
+  /**
+   * The step `attempts` count of the generation being archived. Used as the
+   * idempotency guard: the engine refuses to push a version whose `attempt`
+   * matches the top-of-buffer entry, so the same generation can't double-push
+   * (e.g. on a done-then-crash-before-moveToNextStep replay).
+   */
+  attempt?: number;
 }
 
 /**
@@ -128,6 +224,20 @@ export interface WaitingFor {
   resumeAt?: Date;
   eventName?: string;
   data?: unknown;
+  /**
+   * Reconciliation cadence gate for poll-recoverable waits (currently
+   * `childWorkflow`; designed generically so later slices can extend it to
+   * `gate` / `branchJoin`). The scheduler's child-waiting sweep only
+   * revisits a run once `nextReconcileAt <= now`, so a step that is still
+   * legitimately blocked isn't re-reconciled on every poll cycle. The
+   * engine sets/bumps this each reconcile attempt.
+   *
+   * Optional + default-absent: a run that never enters a poll-recoverable
+   * wait never carries this field. Event / human / webhook / timer waits
+   * resume via their own hook/timer and never set it. Persists
+   * automatically — the `StepState` schema stores `waitingFor` as Mixed.
+   */
+  nextReconcileAt?: Date;
 }
 
 export interface StepState<TOutput = unknown> {
@@ -147,6 +257,28 @@ export interface StepState<TOutput = unknown> {
   waitingFor?: WaitingFor;
   error?: StepError;
   retryAfter?: Date; // Exponential backoff - don't retry before this time
+  /**
+   * Bounded ring buffer of prior committed outputs, populated only when the
+   * step opts in via `Step.outputHistory.keep > 0` AND the step is re-run
+   * (a previously-`done` step re-succeeds). NEVER overlaps the live `output`
+   * slot — invariant #9. Default-absent on legacy/disabled runs (no
+   * migration). Oldest entries are evicted past `keep` (`$slice:-keep`).
+   */
+  outputHistory?: StepOutputVersion[];
+  /**
+   * Host-chosen index/version restored into the live `output` slot via
+   * `ctx.pinOutput()` / `restoreStepOutput()`. Pure metadata — the engine
+   * stores it but never acts on it for control flow. Default-absent.
+   */
+  pinnedVersion?: number;
+  /**
+   * Durable saga compensation memoization (v2.4). Written DB-first AFTER the
+   * step's `onCompensate` handler resolves, flipped `pending → done` via a
+   * numeric-index guarded CAS so a crash-resumed compensation phase skips
+   * already-compensated steps (effectively-once within the cluster). NEVER
+   * overlaps `output` (invariant #9). Default-absent on non-saga runs.
+   */
+  compensation?: StepCompensationState;
 }
 
 /**
@@ -289,6 +421,12 @@ export interface WorkflowDefinition<TContext = Record<string, unknown>> {
      * @default 'exponential'
      */
     retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+    /**
+     * Workflow-wide default for the opt-in output-history ring buffer.
+     * Per-step `Step.outputHistory` overrides this. `keep` 0/undefined ⇒
+     * disabled (byte-for-byte v2.3.4 — no new writes, no schema growth).
+     */
+    outputHistory?: { keep: number };
   };
 }
 
@@ -454,6 +592,69 @@ export interface StepContext<TContext = Record<string, unknown>> {
     tasks: T,
     options?: { concurrency?: number },
   ) => Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }>;
+
+  /**
+   * Read the versioned output history for a step (defaults to the current
+   * step). Pure read — returns the in-memory `StepState.outputHistory` of the
+   * loaded run, no I/O. Empty array when history is disabled or the step has
+   * never been re-run.
+   *
+   * Ordered oldest→newest (the ring-buffer order); the last element is the
+   * most recently archived generation.
+   *
+   * @example
+   * ```typescript
+   * const versions = ctx.outputHistory<MyOutput>('generate-shot');
+   * const previous = versions.at(-1)?.output;
+   * ```
+   */
+  outputHistory: <T = unknown>(stepId?: string) => StepOutputVersion<T>[];
+
+  /**
+   * Durably restore a historical output version back into the live `output`
+   * slot of a step (defaults to the current step) and record `pinnedVersion`.
+   *
+   * A guarded compare-and-set copy-back: refused on a cancelled run. Pinning
+   * the same version twice is idempotent (same resulting state).
+   *
+   * @param version - The `StepOutputVersion.version` to restore.
+   * @param stepId - Target step (defaults to the current step).
+   *
+   * @example
+   * ```typescript
+   * const versions = ctx.outputHistory('generate-shot');
+   * await ctx.pinOutput(versions[0].version, 'generate-shot'); // restore oldest
+   * ```
+   */
+  pinOutput: (version: number, stepId?: string) => Promise<void>;
+
+  /**
+   * Deterministic, **attempt-invariant** idempotency key for effectively-once
+   * external side effects (charge a card, send an email, POST to a vendor).
+   *
+   * Returns `` `${runId}:${stepId}` `` (optionally `` `:${scope}` `` for several
+   * distinct effects in one step). The key is STABLE across retries and crash
+   * recovery — it deliberately does NOT include `attempt`, because a retried
+   * step must reuse the SAME key so the downstream provider dedupes the call
+   * instead of charging twice. Pass it as the provider's idempotency key /
+   * `Idempotency-Key` header.
+   *
+   * This is a pure primitive: the engine guarantees the key is stable; the
+   * HOST composes effectively-once by handing the key to an idempotent API or
+   * its own dedup store. The engine performs no external dedup itself.
+   *
+   * @param scope - Optional discriminator when one step makes multiple
+   *   distinct side-effecting calls (e.g. `'charge'` vs `'refund'`).
+   *
+   * @example
+   * ```typescript
+   * await stripe.charges.create(
+   *   { amount, currency, customer },
+   *   { idempotencyKey: ctx.idempotencyKey('charge') },
+   * );
+   * ```
+   */
+  idempotencyKey: (scope?: string) => string;
 }
 
 export type StepHandler<TOutput = unknown, TContext = Record<string, unknown>> = (

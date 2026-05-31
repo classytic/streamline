@@ -12,7 +12,7 @@
  * closer to the wire.
  */
 import type { MongoOperatorUpdate } from '@classytic/mongokit';
-import type { StepState, WorkflowRun } from '../core/types.js';
+import type { StepOutputVersion, StepState, WorkflowRun } from '../core/types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -107,16 +107,38 @@ interface StepUpdateOperators {
 }
 
 /**
+ * Append-a-history-version directive for {@link buildStepUpdateOps} /
+ * {@link applyStepUpdates}. When present, the builders emit (and the in-memory
+ * mirror replicates) a bounded `$push` + `$slice:-keep` ring write on
+ * `steps.<index>.outputHistory` ALONGSIDE the normal `$set`/`$unset` for the
+ * fresh output. The two must stay in the SAME atomic update so the prior
+ * generation and the new output commit (or not) together.
+ */
+export interface OutputHistoryPush {
+  /** The prior committed generation being archived. */
+  version: StepOutputVersion;
+  /** Ring-buffer depth — oldest entries past `keep` are evicted (`$slice:-keep`). */
+  keep: number;
+}
+
+/**
  * Build `$set`/`$unset` for a single step's state at `steps.<index>.<field>`.
  *
  * `undefined` values in `updates` become `$unset` entries (Mongo removes the
  * field) — that's the established convention across the engine and must not
  * change without auditing every step-state write.
+ *
+ * INTERNAL-CONTRACT NOTE: when `options.historyPush` is supplied this builder
+ * additionally emits a `$push: { steps.<i>.outputHistory: { $each: [v],
+ * $slice: -keep } }` operator. Callers/consumers that relied on this function
+ * returning ONLY `{ $set, $unset }` must tolerate an optional `$push` key.
+ * The push is only present on the opt-in output-history rerun path; the
+ * default (disabled) path is byte-for-byte unchanged.
  */
 export function buildStepUpdateOps(
   stepIndex: number,
   updates: Partial<StepState>,
-  options?: { includeStatus?: string; includeUpdatedAt?: boolean },
+  options?: { includeStatus?: string; includeUpdatedAt?: boolean; historyPush?: OutputHistoryPush },
 ): StepUpdateOperators {
   const $set: Record<string, unknown> = {};
   const $unset: Record<string, ''> = {};
@@ -130,17 +152,34 @@ export function buildStepUpdateOps(
   if (options?.includeUpdatedAt !== false) $set.updatedAt = new Date();
   if (options?.includeStatus) $set.status = options.includeStatus;
 
-  return { $set, $unset };
+  const ops: StepUpdateOperators = { $set, $unset };
+
+  if (options?.historyPush && options.historyPush.keep > 0) {
+    ops.$push = {
+      [`steps.${stepIndex}.outputHistory`]: {
+        $each: [options.historyPush.version],
+        $slice: -options.historyPush.keep,
+      },
+    };
+  }
+
+  return ops;
 }
 
 /**
  * Apply the same step-field updates to an in-memory `steps[]` array so the
  * mirror matches what the DB update will produce (undefined → delete).
+ *
+ * When `historyPush` is supplied this replicates the SAME ring semantics the
+ * DB `$push` + `$slice:-keep` produces (append the prior version, then trim
+ * from the FRONT when `length > keep`) so a same-process read after the write
+ * sees exactly what crash-recovery would reload (cross-cutting invariant #1).
  */
 export function applyStepUpdates<_TContext>(
   stepId: string,
   steps: StepState[],
   updates: Partial<StepState>,
+  historyPush?: OutputHistoryPush,
 ): StepState[] {
   return steps.map((step) => {
     if (step.stepId !== stepId) return step;
@@ -150,6 +189,14 @@ export function applyStepUpdates<_TContext>(
         delete updated[key as keyof StepState];
       }
     }
+
+    if (historyPush && historyPush.keep > 0) {
+      // Append then trim-from-front — mirrors Mongo's `$push` + `$slice:-keep`.
+      const next = [...(updated.outputHistory ?? []), historyPush.version];
+      updated.outputHistory =
+        next.length > historyPush.keep ? next.slice(next.length - historyPush.keep) : next;
+    }
+
     return updated;
   });
 }

@@ -1,6 +1,6 @@
 import type { SignalStore } from '../core/container.js';
 import type { WorkflowEventBus } from '../core/events.js';
-import type { StepContext, StepLogEntry, WorkflowRun } from '../core/types.js';
+import type { StepContext, StepLogEntry, StepOutputVersion, WorkflowRun } from '../core/types.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
 import { logger } from '../utils/logger.js';
 
@@ -271,5 +271,53 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     const step = this.run.steps.find((s) => s.stepId === this.stepId);
     const output = step?.output as { __checkpoint?: T } | undefined;
     return output?.__checkpoint;
+  }
+
+  outputHistory<T = unknown>(stepId?: string): StepOutputVersion<T>[] {
+    const id = stepId ?? this.stepId;
+    const step = this.run.steps.find((s) => s.stepId === id);
+    return (step?.outputHistory ?? []) as StepOutputVersion<T>[];
+  }
+
+  async pinOutput(version: number, stepId?: string): Promise<void> {
+    // Honor cancellation before any I/O (every ctx I/O checks abort).
+    if (this.signal.aborted) {
+      throw new Error(`Cannot pin output: workflow ${this.runId} has been cancelled`);
+    }
+
+    const id = stepId ?? this.stepId;
+    const step = this.run.steps.find((s) => s.stepId === id);
+    if (!step) {
+      throw new Error(`Cannot pin output: step "${id}" not found in run ${this.runId}`);
+    }
+
+    const entry = (step.outputHistory ?? []).find((v) => v.version === version);
+    if (!entry) {
+      throw new Error(
+        `Cannot pin output: version ${version} not found in history of step "${id}" ` +
+          `(run ${this.runId}).`,
+      );
+    }
+
+    // Durable, cancelled-guarded copy-back into the live output slot.
+    const result = await this.repository.restoreStepOutput(this.runId, id, version);
+    if (result.modifiedCount === 0) {
+      throw new Error(
+        `Cannot pin output: run ${this.runId} is cancelled or version ${version} no longer ` +
+          `exists for step "${id}".`,
+      );
+    }
+
+    // Mirror the durable write in-memory so a subsequent ctx.getOutput sees it.
+    step.output = entry.output;
+    step.pinnedVersion = version;
+  }
+
+  idempotencyKey(scope?: string): string {
+    // Attempt-invariant by design: the key MUST be identical across retries
+    // and crash recovery so the downstream provider dedupes a re-issued call
+    // instead of performing the side effect twice. Never fold in `attempt`.
+    const base = `${this.runId}:${this.stepId}`;
+    return scope ? `${base}:${scope}` : base;
   }
 }

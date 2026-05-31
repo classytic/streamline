@@ -117,6 +117,9 @@
     "vitest": "^4.0.0"
   },
   "dependencies": {
+    "@classytic/mongokit": ">=3.14.0",
+    "@classytic/primitives": ">=0.6.0",
+    "@classytic/repo-core": ">=0.5.0",
     "luxon": "^3.0.0",
     "semver": "^7.0.0"
   }

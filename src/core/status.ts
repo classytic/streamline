@@ -40,6 +40,10 @@ export const RUN_STATUS_VALUES: RunStatus[] = [
   'done',
   'failed',
   'cancelled',
+  // Durable saga / compensation phase (v2.4) — additive at runtime.
+  'compensating',
+  'compensated',
+  'compensation_failed',
 ];
 
 export function isStepStatus(value: unknown): value is StepStatus {
@@ -103,6 +107,14 @@ export const STEP_MACHINE = defineStateMachine<StepStatus>({
  * Terminal: `cancelled` (no further transitions).
  *
  * `done | failed → running` allows rewind/retry for completed runs.
+ *
+ * Durable saga (v2.4): `failed → compensating` is the first durable action of
+ * the compensation phase (via `assertAndClaim`, so a multi-worker race resolves
+ * to exactly one winner). `compensating` self-loops to advance per-step
+ * compensation and resolves to a terminal `compensated` /
+ * `compensation_failed`, or `cancelled` if the run is cancelled mid-rollback.
+ * `compensated` / `compensation_failed` are structurally terminal (no outgoing
+ * transitions).
  */
 export const RUN_MACHINE = defineStateMachine<RunStatus>({
   name: 'WorkflowRun',
@@ -111,7 +123,10 @@ export const RUN_MACHINE = defineStateMachine<RunStatus>({
     running: ['waiting', 'done', 'failed', 'cancelled'],
     waiting: ['running', 'cancelled'],
     done: ['running'],
-    failed: ['running'],
+    failed: ['running', 'compensating'],
+    compensating: ['compensating', 'compensated', 'compensation_failed', 'cancelled'],
+    compensated: [],
+    compensation_failed: [],
     cancelled: [],
   },
 });
@@ -154,5 +169,18 @@ export function isValidRunTransition(from: RunStatus, to: RunStatus): boolean {
  * `RUN_MACHINE.isTerminal(status)` directly.
  */
 export function isTerminalState(status: RunStatus): boolean {
-  return status === 'done' || status === 'failed' || status === 'cancelled';
+  // NOTE: `failed` is treated as terminal here for the NON-saga lifecycle
+  // (execution loop stops, scheduler ignores). The durable-saga path
+  // transitions `failed → compensating` BEFORE this helper gates cleanup, so
+  // the engine re-enters the compensation phase instead of stopping. The
+  // genuinely terminal compensation outcomes are `compensated` /
+  // `compensation_failed`; `compensating` is explicitly NOT terminal (the run
+  // is still active and must keep rolling back / be reclaimed after a crash).
+  return (
+    status === 'done' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'compensated' ||
+    status === 'compensation_failed'
+  );
 }

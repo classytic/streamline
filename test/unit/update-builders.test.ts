@@ -154,6 +154,80 @@ describe('applyStepUpdates', () => {
   });
 });
 
+// ===========================================================================
+// Output-history ring buffer (opt-in) — buildStepUpdateOps + applyStepUpdates
+// must produce/replicate the SAME $push + $slice:-keep shape (invariant #1).
+// ===========================================================================
+
+describe('buildStepUpdateOps — output-history $push', () => {
+  it('emits a $push with $each + $slice:-keep when historyPush is supplied', () => {
+    const at = new Date(0);
+    const out = buildStepUpdateOps(
+      1,
+      { status: 'done', output: { gen: 2 } },
+      { historyPush: { version: { version: 1, output: { gen: 1 }, at, attempt: 1 }, keep: 3 } },
+    );
+    expect(out.$set['steps.1.output']).toEqual({ gen: 2 });
+    expect(out.$push).toEqual({
+      'steps.1.outputHistory': {
+        $each: [{ version: 1, output: { gen: 1 }, at, attempt: 1 }],
+        $slice: -3,
+      },
+    });
+  });
+
+  it('does NOT emit $push when no historyPush is supplied (disabled = unchanged)', () => {
+    const out = buildStepUpdateOps(0, { status: 'done', output: { ok: true } });
+    expect(out.$push).toBeUndefined();
+    expect(Object.keys(out)).toEqual(['$set', '$unset']);
+  });
+
+  it('does NOT emit $push when keep is 0', () => {
+    const out = buildStepUpdateOps(
+      0,
+      { status: 'done' },
+      { historyPush: { version: { version: 1, output: 1, at: new Date(0) }, keep: 0 } },
+    );
+    expect(out.$push).toBeUndefined();
+  });
+});
+
+describe('applyStepUpdates — output-history ring mirror', () => {
+  it('appends a version, leaving the in-memory mirror matching the DB push', () => {
+    const steps: StepState[] = [{ stepId: 'a', status: 'done', attempts: 1, output: { gen: 2 } }];
+    const v = { version: 1, output: { gen: 1 }, at: new Date(0), attempt: 1 };
+    const out = applyStepUpdates('a', steps, { status: 'done', output: { gen: 2 } }, { version: v, keep: 3 });
+    expect(out[0].outputHistory).toEqual([v]);
+  });
+
+  it('evicts the OLDEST entry once length exceeds keep (slice -keep, trim front)', () => {
+    const existing = [
+      { version: 1, output: 'a', at: new Date(0), attempt: 1 },
+      { version: 2, output: 'b', at: new Date(1), attempt: 2 },
+    ];
+    const steps: StepState[] = [
+      { stepId: 'a', status: 'done', attempts: 3, output: 'c', outputHistory: [...existing] },
+    ];
+    const v3 = { version: 3, output: 'c', at: new Date(2), attempt: 3 };
+    const out = applyStepUpdates('a', steps, { status: 'done' }, { version: v3, keep: 2 });
+    // keep=2 → oldest (version 1) evicted, newest two remain in order.
+    expect(out[0].outputHistory?.map((h) => h.version)).toEqual([2, 3]);
+  });
+
+  it('writes nothing to outputHistory when historyPush is absent (disabled)', () => {
+    const steps: StepState[] = [{ stepId: 'a', status: 'done', attempts: 1, output: 'x' }];
+    const out = applyStepUpdates('a', steps, { status: 'done', output: 'y' });
+    expect(out[0].outputHistory).toBeUndefined();
+  });
+
+  it('starts a fresh buffer when none exists', () => {
+    const steps: StepState[] = [{ stepId: 'a', status: 'done', attempts: 1, output: 'b' }];
+    const v = { version: 1, output: 'a', at: new Date(0), attempt: 1 };
+    const out = applyStepUpdates('a', steps, { status: 'done' }, { version: v, keep: 5 });
+    expect(out[0].outputHistory).toEqual([v]);
+  });
+});
+
 describe('toPlainRun', () => {
   it('returns plain runs unchanged', () => {
     const run = { _id: 'r1', context: { foo: 1 } } as unknown as WorkflowRun;

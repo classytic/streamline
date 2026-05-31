@@ -118,6 +118,89 @@ export interface StepConfig<TOutput = unknown, TContext = Record<string, unknown
    * ```
    */
   onCompensate?: StepHandler<unknown, TContext>;
+
+  /**
+   * Max compensation attempts for this step's `onCompensate` handler when it
+   * throws (durable saga, v2.4). Includes the initial attempt. If all attempts
+   * fail, the run terminates `compensation_failed`.
+   *
+   * @default 3
+   */
+  compensateRetries?: number;
+  /** Base delay (ms) before the first compensation retry. @default 1000 */
+  compensateRetryDelay?: number;
+  /**
+   * Compensation retry backoff strategy. @default 'exponential'
+   */
+  compensateRetryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+
+  /**
+   * Opt-in per-step versioned output history (ring buffer).
+   *
+   * `keep > 0` archives the step's prior committed output into
+   * `StepState.outputHistory` when the step is re-run (rewind/goto/rerun and
+   * the step re-succeeds), bounded to the most recent `keep` versions.
+   * `0`/`undefined` ⇒ disabled ⇒ byte-for-byte v2.3.4 (no new writes).
+   *
+   * Read with `ctx.outputHistory()`, restore with `ctx.pinOutput()`.
+   *
+   * @example
+   * ```typescript
+   * generateShot: {
+   *   handler: async (ctx) => renderShot(ctx.input),
+   *   outputHistory: { keep: 5 }, // keep the last 5 generations
+   * }
+   * ```
+   */
+  outputHistory?: { keep: number };
+}
+
+/**
+ * Best-effort define-time guard: a compensation handler MUST NOT suspend.
+ *
+ * The durable compensation phase walks completed steps synchronously and
+ * checkpoints each per-step compensation; a `ctx.wait` / `ctx.waitFor` /
+ * `ctx.sleep` / `ctx.startChildWorkflow` inside an `onCompensate` handler would
+ * throw a `WaitSignal` that has NO resume site in the compensation loop —
+ * wedging a half-parked `compensating` run. We reject such handlers at
+ * definition time.
+ *
+ * This is a STATIC source scan — it cannot catch a suspending call hidden
+ * behind an indirection (a helper that closes over `ctx`). The compensation
+ * runtime is the backstop: a `WaitSignal` (or `GotoSignal`) that escapes a
+ * compensation handler is caught and fails the step's compensation to
+ * `compensation_failed` rather than hanging. The static check exists to fail
+ * the common, obvious mistake loudly at boot.
+ *
+ * We deliberately match `ctx`-qualified calls (and the common `{ wait }`
+ * destructured-then-called shape is NOT matched — too noisy/false-positive;
+ * the runtime guard covers it). The regex tolerates whitespace and optional
+ * chaining/awaits.
+ */
+const SUSPENDING_PRIMITIVE_RE =
+  /\b(?:ctx|context)\s*\.\s*(?:wait|waitFor|sleep|startChildWorkflow)\s*\(/;
+
+function assertNonSuspendingCompensation(stepId: string, handler: StepHandler<unknown, unknown>) {
+  // Function.prototype.toString gives the source for non-native fns. Native /
+  // bound fns return "[native code]" — we skip those (can't introspect).
+  let src: string;
+  try {
+    src = Function.prototype.toString.call(handler);
+  } catch {
+    return; // not introspectable — rely on the runtime guard
+  }
+  if (src.includes('[native code]')) return;
+  if (SUSPENDING_PRIMITIVE_RE.test(src)) {
+    const match = SUSPENDING_PRIMITIVE_RE.exec(src);
+    throw new Error(
+      `Workflow step "${stepId}": onCompensate handler calls a suspending primitive ` +
+        `(${match?.[0] ?? 'ctx.wait/waitFor/sleep/startChildWorkflow'}). ` +
+        `Compensation handlers MUST NOT suspend — they run inside the durable ` +
+        `compensation phase, which has no resume site for a wait. Remove the ` +
+        `suspending call (do the rollback synchronously, using ` +
+        `ctx.idempotencyKey('compensate') for effectively-once external calls).`,
+    );
+  }
 }
 
 /** Type guard: is the step entry a StepConfig object (vs a plain handler fn)? */
@@ -148,6 +231,8 @@ function toStepDef<TContext>(stepId: string, entry: StepConfig<unknown, TContext
   if (entry.condition) step.condition = entry.condition as Step['condition'];
   if (entry.skipIf) step.skipIf = entry.skipIf as Step['skipIf'];
   if (entry.runIf) step.runIf = entry.runIf as Step['runIf'];
+
+  if (entry.outputHistory !== undefined) step.outputHistory = entry.outputHistory;
 
   return step;
 }
@@ -182,6 +267,11 @@ export interface WorkflowConfig<TContext, TInput = unknown> {
     timeout?: number;
     retryDelay?: number;
     retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+    /**
+     * Workflow-wide default for the opt-in output-history ring buffer.
+     * Per-step `outputHistory` overrides this. `keep` 0/undefined ⇒ disabled.
+     */
+    outputHistory?: { keep: number };
   };
   autoExecute?: boolean;
   /** Optional custom container for dependency injection */
@@ -587,6 +677,10 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
   // Normalize: separate handlers, compensation handlers, and step definitions
   const handlers: Record<string, StepHandler<unknown, TContext>> = {};
   const compensationHandlers: Record<string, StepHandler<unknown, TContext>> = {};
+  const compensationConfigs: Record<
+    string,
+    { retries?: number; retryDelay?: number; retryBackoff?: 'exponential' | 'linear' | 'fixed' | number }
+  > = {};
   const steps: Step[] = stepIds.map((stepId) => {
     validateId(stepId, 'step');
 
@@ -597,7 +691,23 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
       validateRetryConfig(entry.retries, entry.timeout, entry.retryDelay, entry.retryBackoff);
       handlers[stepId] = entry.handler;
       if (entry.onCompensate) {
+        // Reject suspending primitives in compensation handlers at define time
+        // (best-effort static scan; the compensation runtime is the backstop).
+        assertNonSuspendingCompensation(
+          stepId,
+          entry.onCompensate as StepHandler<unknown, unknown>,
+        );
         compensationHandlers[stepId] = entry.onCompensate;
+        const cfg: {
+          retries?: number;
+          retryDelay?: number;
+          retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+        } = {};
+        if (entry.compensateRetries !== undefined) cfg.retries = entry.compensateRetries;
+        if (entry.compensateRetryDelay !== undefined) cfg.retryDelay = entry.compensateRetryDelay;
+        if (entry.compensateRetryBackoff !== undefined)
+          cfg.retryBackoff = entry.compensateRetryBackoff;
+        if (Object.keys(cfg).length > 0) compensationConfigs[stepId] = cfg;
       }
       return toStepDef(stepId, entry);
     }
@@ -626,6 +736,7 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
             import('../core/types.js').StepHandler<unknown, unknown>
           >)
         : undefined,
+    ...(Object.keys(compensationConfigs).length > 0 && { compensationConfigs }),
     ...(config.migrateRun !== undefined && { migrateRun: config.migrateRun }),
   });
 

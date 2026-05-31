@@ -65,6 +65,10 @@ export interface EventPayloadMap {
   'workflow:retry': BaseEventPayload;
   'workflow:compensating': BaseEventPayload & { data?: { steps: string[] } };
   'step:compensated': StepEventPayload;
+  /** Durable saga (v2.4): all compensations completed (run terminal). */
+  'workflow:compensated': BaseEventPayload;
+  /** Durable saga (v2.4): a compensation exhausted retries (run terminal). */
+  'workflow:compensation_failed': BaseEventPayload;
   'engine:error': EngineErrorPayload;
   'scheduler:error': EngineErrorPayload;
   'scheduler:circuit-open': { error: Error; context: string };

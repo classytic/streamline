@@ -261,6 +261,69 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     ) as Promise<WorkflowRun<TContext>>;
   }
 
+  /**
+   * Durably restore a historical output version into a step's live `output`
+   * slot and stamp `pinnedVersion`.
+   *
+   * Atomic + guarded copy-back: the conditional `findOneAndUpdate` (routed via
+   * {@link updateOne}, so audit/cache/tenant plugins fire and the schema-level
+   * `{w:'majority',j:true}` write concern is inherited) sets the output ONLY
+   * when:
+   *   - the run is NOT cancelled (CANCELLED_GUARD) — restore is refused on a
+   *     cancelled run (restore-on-terminal policy, see below), AND
+   *   - the chosen `version` still exists in `steps.<i>.outputHistory`
+   *     (guards against a concurrent rewrite that evicted it).
+   *
+   * RESTORE-ON-TERMINAL POLICY (documented + enforced):
+   *   - `cancelled` runs: FORBIDDEN. The cancelled guard rejects the write;
+   *     callers see `modifiedCount: 0`. Cancellation is the one externally
+   *     forced terminal state and must stay immutable.
+   *   - `done` / `failed` runs: ALLOWED. Restore is an explicit operator/host
+   *     action on a finished run (the regenerate/inspect-prior-generation use
+   *     case). It mutates only `steps.<i>.output` + `pinnedVersion` +
+   *     `updatedAt`; it deliberately does NOT touch run `status` or `endedAt`,
+   *     so the run stays terminal and TTL-eligible (terminal-runs TTL keys on
+   *     `endedAt`, which is untouched — a pinned terminal run is purged on the
+   *     same schedule as before, by design). Hosts that need a restored run to
+   *     re-execute should `rewindTo`/rerun, not rely on pin.
+   *
+   * Reads the value from the loaded doc (small, bounded inline array) and
+   * writes it back in one guarded update. Returns `{ modifiedCount }`:
+   * `0` = refused (cancelled / version gone / run missing).
+   */
+  async restoreStepOutput(
+    runId: string,
+    stepId: string,
+    version: number,
+  ): Promise<{ modifiedCount: number }> {
+    const run = (await this.getById(runId)) as WorkflowRun | null;
+    if (!run) return { modifiedCount: 0 };
+
+    const stepIndex = run.steps.findIndex((s) => s.stepId === stepId);
+    if (stepIndex === -1) return { modifiedCount: 0 };
+
+    const entry = (run.steps[stepIndex].outputHistory ?? []).find((v) => v.version === version);
+    if (!entry) return { modifiedCount: 0 };
+
+    // Conditional copy-back: refuse on a cancelled run, and only if the chosen
+    // version is still present (defends against a concurrent eviction/rewrite).
+    return this.updateOne(
+      {
+        _id: runId,
+        status: { $ne: 'cancelled' },
+        [`steps.${stepIndex}.outputHistory.version`]: version,
+      },
+      {
+        $set: {
+          [`steps.${stepIndex}.output`]: entry.output,
+          [`steps.${stepIndex}.pinnedVersion`]: version,
+          updatedAt: new Date(),
+        },
+      },
+      { bypassTenant: true },
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Scheduler claim queries — encode timer/retry/stale/scheduled semantics.
   // These are genuine domain verbs: the filter composition and cutoff
@@ -284,6 +347,29 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     return this.queryLean(CommonQueries.readyForRetry(now), { updatedAt: 1 }, limit, options);
   }
 
+  /**
+   * Runs blocked on a `childWorkflow` wait that are due for crash-durable
+   * reconciliation (`waitingFor.nextReconcileAt <= now`).
+   *
+   * A childWorkflow wait is normally driven to completion by an in-process
+   * event-bus listener registered in the engine. After a process crash/
+   * restart those listeners are gone and no other sweep reclaims the wait
+   * (timer-ready needs `resumeAt`, retry needs `retryAfter`, stale needs
+   * status='running'). This sweep hands such orphaned waits back to the
+   * engine's `resume` path, which reconciles against the child run.
+   *
+   * Mirrors `getReadyToResume` / `getReadyForRetry`: same `queryLean`
+   * pagination, `updatedAt: 1` sort (oldest-first fairness), and
+   * `bypassTenant` / `tenantId` conventions.
+   */
+  async getChildWaitingRuns(
+    now: Date,
+    limit = 100,
+    options?: AtomicUpdateOptions,
+  ): Promise<LeanWorkflowRun[]> {
+    return this.queryLean(CommonQueries.childWaiting(now), { updatedAt: 1 }, limit, options);
+  }
+
   async getStaleRunningWorkflows(
     staleThresholdMs: number,
     limit = 100,
@@ -291,6 +377,31 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
   ): Promise<LeanWorkflowRun[]> {
     return this.queryLean(
       CommonQueries.staleRunning(staleThresholdMs),
+      { updatedAt: 1 },
+      limit,
+      options,
+    );
+  }
+
+  /**
+   * Runs left in `compensating` after a crash mid-saga-rollback whose
+   * heartbeat is stale (durable saga, v2.4). Mirrors
+   * `getStaleRunningWorkflows` — same `queryLean`, `updatedAt: 1` sort
+   * (oldest-first fairness), and tenant conventions. The recovery callback
+   * re-enters the compensation phase, which skips per-step compensations
+   * already `done` (effectively-once) and resumes from the next pending step
+   * in reverse order. Reuses the `{ status:1, lastHeartbeat:1 }` index.
+   *
+   * The compensation phase heartbeats while it runs, so this only matches a
+   * genuinely crashed rollback, never a live one.
+   */
+  async getStaleCompensatingRuns(
+    staleThresholdMs: number,
+    limit = 100,
+    options?: AtomicUpdateOptions,
+  ): Promise<LeanWorkflowRun[]> {
+    return this.queryLean(
+      CommonQueries.staleCompensating(staleThresholdMs),
       { updatedAt: 1 },
       limit,
       options,
