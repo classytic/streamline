@@ -45,6 +45,16 @@ type LeanWorkflowRun<TContext = unknown> = WorkflowRun<TContext>;
 interface AtomicUpdateOptions {
   tenantId?: string;
   bypassTenant?: boolean;
+  /**
+   * Engine-scoping filter (v2.4.0 distributed-correctness fix). When set,
+   * scheduler pickup queries are constrained to runs of this `workflowId`
+   * so a per-engine scheduler only ever sees its own workflow's runs and can
+   * never claim/execute a foreign workflow's run. Distinct from `tenantId`:
+   * tenant scopes across customers, `workflowId` scopes across workflow
+   * definitions co-registered in the same process. Omit for cross-workflow
+   * sweeps/probes (legacy behaviour).
+   */
+  workflowId?: string;
 }
 
 /**
@@ -336,7 +346,12 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     limit = 100,
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
-    return this.queryLean(CommonQueries.readyToResume(now), { updatedAt: 1 }, limit, options);
+    return this.queryLean(
+      CommonQueries.readyToResume(now, options?.workflowId),
+      { updatedAt: 1 },
+      limit,
+      options,
+    );
   }
 
   async getReadyForRetry(
@@ -344,7 +359,12 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     limit = 100,
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
-    return this.queryLean(CommonQueries.readyForRetry(now), { updatedAt: 1 }, limit, options);
+    return this.queryLean(
+      CommonQueries.readyForRetry(now, options?.workflowId),
+      { updatedAt: 1 },
+      limit,
+      options,
+    );
   }
 
   /**
@@ -367,7 +387,35 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     limit = 100,
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
-    return this.queryLean(CommonQueries.childWaiting(now), { updatedAt: 1 }, limit, options);
+    return this.queryLean(
+      CommonQueries.childWaiting(now, options?.workflowId),
+      { updatedAt: 1 },
+      limit,
+      options,
+    );
+  }
+
+  /**
+   * Runs blocked on a `branchJoin` wait that are due for crash-durable
+   * reconciliation (`waitingFor.nextReconcileAt <= now`). Exact analogue of
+   * `getChildWaitingRuns`: a branchJoin parent is woken by in-process
+   * listeners that are gone after a crash, and no other sweep (timer/retry/
+   * stale) reclaims it. This hands the orphaned wait back to `engine.resume`,
+   * which re-reads each branch child and resolves the join when the quorum is
+   * met. Same `queryLean` pagination, `updatedAt: 1` sort, and tenant
+   * conventions as the childWorkflow sweep.
+   */
+  async getBranchJoinWaitingRuns(
+    now: Date,
+    limit = 100,
+    options?: AtomicUpdateOptions,
+  ): Promise<LeanWorkflowRun[]> {
+    return this.queryLean(
+      CommonQueries.branchJoinWaiting(now, options?.workflowId),
+      { updatedAt: 1 },
+      limit,
+      options,
+    );
   }
 
   async getStaleRunningWorkflows(
@@ -376,7 +424,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
     return this.queryLean(
-      CommonQueries.staleRunning(staleThresholdMs),
+      CommonQueries.staleRunning(staleThresholdMs, options?.workflowId),
       { updatedAt: 1 },
       limit,
       options,
@@ -401,7 +449,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
     return this.queryLean(
-      CommonQueries.staleCompensating(staleThresholdMs),
+      CommonQueries.staleCompensating(staleThresholdMs, options?.workflowId),
       { updatedAt: 1 },
       limit,
       options,
@@ -432,7 +480,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     staleThresholdMs: number,
     options?: AtomicUpdateOptions & { batchSize?: number },
   ): AsyncIterableIterator<LeanWorkflowRun> {
-    return this.cursor(CommonQueries.staleRunning(staleThresholdMs), {
+    return this.cursor(CommonQueries.staleRunning(staleThresholdMs, options?.workflowId), {
       sort: { updatedAt: 1 },
       batchSize: options?.batchSize ?? 50,
       lean: true,
@@ -545,13 +593,14 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
       cursor?: string | null;
       tenantId?: string;
       bypassTenant?: boolean;
+      workflowId?: string;
     } = {},
   ): Promise<PaginatedResult<LeanWorkflowRun>> {
-    const { page = 1, limit = 100, cursor, tenantId, bypassTenant } = options;
+    const { page = 1, limit = 100, cursor, tenantId, bypassTenant, workflowId } = options;
 
     const result = await this.getAll(
       {
-        filters: CommonQueries.scheduledReady(now),
+        filters: CommonQueries.scheduledReady(now, workflowId),
         sort: { 'scheduling.executionTime': 1 },
         page,
         limit,
@@ -588,6 +637,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
       {
         status: 'waiting',
         paused: { $ne: true },
+        ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
       },
       {
         ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
@@ -614,6 +664,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
         concurrencyKey: { $exists: true, $ne: null },
         scheduling: { $exists: false },
         paused: { $ne: true },
+        ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
       },
       {
         ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
@@ -676,6 +727,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
         concurrencyKey: { $exists: true, $ne: null },
         scheduling: { $exists: false },
         paused: { $ne: true },
+        ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
       },
       {
         sort: { priority: -1, createdAt: 1 },

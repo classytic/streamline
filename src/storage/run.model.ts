@@ -289,6 +289,59 @@ WorkflowRunSchema.index({
   paused: 1,
 });
 
+/**
+ * WORKFLOW-SCOPED SCHEDULER PICKUP INDEXES (v2.4.0 distributed-correctness fix).
+ *
+ * Each WorkflowEngine owns its own SmartScheduler, now scoped to the engine's
+ * own `workflowId` so engine B never picks up engine A's run. That scoping adds
+ * a leading `workflowId` equality predicate to every pickup query. These
+ * compound indexes carry that `workflowId` prefix so the scoped sweeps stay
+ * index-backed (an index whose prefix doesn't match the query's leading
+ * equality term can't be used, so the unscoped indexes above are insufficient
+ * once `workflowId` is the leading filter term).
+ *
+ * Each mirrors an unscoped pickup index above, prefixed with `workflowId`:
+ *   - readyToResume  : status + steps.status + steps.waitingFor.resumeAt
+ *   - readyForRetry  : status + steps.status + steps.retryAfter
+ *   - staleRunning / staleCompensating : status + lastHeartbeat
+ *   - childWaiting / branchJoinWaiting : status + steps.status
+ *                       + steps.waitingFor.type + steps.waitingFor.nextReconcileAt
+ *   - scheduledReady : status + scheduling.executionTime + paused
+ * The existing `{ workflowId:1, status:1 }` and
+ * `{ workflowId:1, concurrencyKey:1, status:1 }` indexes already back the
+ * scoped waiting/concurrency-draft existence probes and concurrency-draft list.
+ */
+WorkflowRunSchema.index({
+  workflowId: 1,
+  status: 1,
+  'steps.status': 1,
+  'steps.waitingFor.resumeAt': 1,
+});
+WorkflowRunSchema.index({
+  workflowId: 1,
+  status: 1,
+  'steps.status': 1,
+  'steps.retryAfter': 1,
+});
+WorkflowRunSchema.index({
+  workflowId: 1,
+  status: 1,
+  lastHeartbeat: 1,
+});
+WorkflowRunSchema.index({
+  workflowId: 1,
+  status: 1,
+  'steps.status': 1,
+  'steps.waitingFor.type': 1,
+  'steps.waitingFor.nextReconcileAt': 1,
+});
+WorkflowRunSchema.index({
+  workflowId: 1,
+  status: 1,
+  'scheduling.executionTime': 1,
+  paused: 1,
+});
+
 // Compound indexes for keyset pagination used by repository getAll/scheduler queries.
 // Without these, MongoKit emits warnings and MongoDB does full collection scans.
 WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: -1, _id: -1 });

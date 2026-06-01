@@ -218,16 +218,64 @@ export interface WorkflowError {
   stack?: string;
 }
 
+/**
+ * One branch of a declarative parallel fan-out (`ctx.joinBranches`).
+ *
+ * A branch SELECTS a pre-registered child workflow by `workflowId` and maps
+ * its `input` — it ships NO executable logic (the named-handler-registry rule).
+ * `key` is a stable per-branch discriminator used to (a) order results, (b)
+ * synthesize the deterministic child idempotency key
+ * (`${parentRunId}:${parentStepId}:${key}`) so a crash between
+ * `childEngine.start()` and the `childRunId` $set cannot double-spawn, and (c)
+ * persist the started `childRunId` back into the parent's `waitingFor.data`.
+ */
+export interface BranchPlan {
+  key: string;
+  workflowId: string;
+  input: unknown;
+  /** Stamped once the child is started — the durable de-dupe / re-read anchor. */
+  childRunId?: string;
+}
+
+/** Completion policy for a branch group. Frozen 4-value enum (pure status math). */
+export type JoinPolicy = 'all' | 'any' | 'race' | 'allSettled';
+
+/** Per-branch outcome inside a resolved {@link JoinResult}. */
+export interface JoinBranchResult {
+  key: string;
+  workflowId: string;
+  childRunId?: string;
+  status: 'done' | 'failed' | 'cancelled';
+  output?: unknown;
+  error?: StepError;
+}
+
+/**
+ * The resolved value of `ctx.joinBranches` — reconstructed durably from the
+ * child runs, NOT held in memory. Becomes the joining step's `output`.
+ *
+ * `satisfied` is pure status math over the policy:
+ *   - `all`        → every branch `done`
+ *   - `any`        → at least one branch `done`
+ *   - `race`       → at least one branch terminal (first to finish wins)
+ *   - `allSettled` → always satisfied once every branch is terminal
+ */
+export interface JoinResult {
+  policy: JoinPolicy;
+  satisfied: boolean;
+  branches: JoinBranchResult[];
+}
+
 export interface WaitingFor {
-  type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow';
+  type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow' | 'branchJoin';
   reason: string;
   resumeAt?: Date;
   eventName?: string;
   data?: unknown;
   /**
-   * Reconciliation cadence gate for poll-recoverable waits (currently
-   * `childWorkflow`; designed generically so later slices can extend it to
-   * `gate` / `branchJoin`). The scheduler's child-waiting sweep only
+   * Reconciliation cadence gate for poll-recoverable waits (`childWorkflow`
+   * and `branchJoin`; designed generically so later slices can extend it to
+   * `gate`). The scheduler's child-waiting / branch-join sweeps only
    * revisits a run once `nextReconcileAt <= now`, so a step that is still
    * legitimately blocked isn't re-reconciled on every poll cycle. The
    * engine sets/bumps this each reconcile attempt.
@@ -592,6 +640,55 @@ export interface StepContext<TContext = Record<string, unknown>> {
     tasks: T,
     options?: { concurrency?: number },
   ) => Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }>;
+
+  /**
+   * Declarative parallel STEPS + durable join — fan out to N pre-registered
+   * child workflows, run them concurrently and crash-durably, then JOIN them
+   * with a completion policy before this step proceeds.
+   *
+   * Unlike `scatter()` (in-process, same-worker, single-step tasks), each
+   * branch is a real child workflow run = a document parked at zero compute,
+   * with its own retry/timeout/compensation/output-history. The parent step
+   * enters a `branchJoin` wait that survives process restarts: on crash the
+   * scheduler's branch-join sweep re-reads each child's persisted status,
+   * re-starts only branches that never got a `childRunId`, and resolves the
+   * join when the policy quorum is met. Completed branches are never re-run.
+   *
+   * Resolves (on resume) to a {@link JoinResult}, which becomes this step's
+   * output — read it from a later step via `ctx.getOutput(thisStepId)`.
+   *
+   * Partial-failure policy:
+   *   - `all` (default): one branch failure ⇒ this step fails ⇒ the run goes
+   *     `failed` ⇒ existing saga compensation rolls back completed branches.
+   *   - `any` / `race`: first success (any) / first terminal (race) resolves;
+   *     still-running losers are cancelled when `cancelLosers` (default true).
+   *   - `allSettled`: every outcome is collected; a branch failure NEVER fails
+   *     the step.
+   *
+   * @example
+   * ```typescript
+   * const wf = createWorkflow('render', {
+   *   steps: {
+   *     fanout: async (ctx) =>
+   *       ctx.joinBranches(
+   *         [
+   *           { key: 'a', workflowId: 'render-shot', input: { shot: 1 } },
+   *           { key: 'b', workflowId: 'render-shot', input: { shot: 2 } },
+   *         ],
+   *         { policy: 'all' },
+   *       ),
+   *     compose: async (ctx) => {
+   *       const join = ctx.getOutput<JoinResult>('fanout');
+   *       return join?.branches.map((b) => b.output);
+   *     },
+   *   },
+   * });
+   * ```
+   */
+  joinBranches: <TJoin = JoinResult>(
+    branches: Array<{ key?: string; workflowId: string; input: unknown }>,
+    options?: { policy?: JoinPolicy; cancelLosers?: boolean },
+  ) => Promise<TJoin>;
 
   /**
    * Read the versioned output history for a step (defaults to the current

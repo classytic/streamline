@@ -41,6 +41,7 @@ import type {
   WorkflowRun,
 } from '../core/types.js';
 import { WorkflowEngine } from '../execution/engine.js';
+import type { SmartSchedulerConfig } from '../execution/smart-scheduler.js';
 import { makeCounterId } from '../storage/concurrency-counter.model.js';
 import { ConcurrencyLimitReachedError, WorkflowNotFoundError } from '../utils/errors.js';
 import { validateId, validateRetryConfig } from '../utils/validation.js';
@@ -276,6 +277,18 @@ export interface WorkflowConfig<TContext, TInput = unknown> {
   autoExecute?: boolean;
   /** Optional custom container for dependency injection */
   container?: StreamlineContainer;
+  /**
+   * Custom scheduler configuration (partial — merged over the defaults).
+   * Notably `inMemoryTimers: false` opts a high-scale deployment into
+   * DB-only polling for timer/sleep resumes (no per-wait `setTimeout`).
+   */
+  scheduler?: Partial<SmartSchedulerConfig>;
+  /**
+   * Ring-buffer cap for persisted `stepLogs` (ctx.log()) on the run doc.
+   * Defaults to {@link LIMITS.MAX_STEP_LOGS} (1000). See
+   * {@link WorkflowEngineOptions.maxStepLogs}.
+   */
+  maxStepLogs?: number;
 
   // ============ Distributed Primitives ============
 
@@ -349,8 +362,10 @@ export interface WorkflowConfig<TContext, TInput = unknown> {
      *
      * Drift recovery: the counter can leak +1 if a worker dies between
      * `claimSlot` and `repository.create` (bounded by parallelism × MTBF).
-     * Run `WorkflowConcurrencyCounterRepository.reconcile(workflowId)`
-     * periodically (daily cron is plenty) to reset counters to truth.
+     * Call `WorkflowConcurrencyCounterRepository.reconcile(workflowId)` (repairs
+     * every bucket for the workflow) or `reconcile(workflowId, key)` (one
+     * bucket) periodically — a daily cron is plenty — to recount active runs
+     * and reset the counter(s) to truth. Returns the corrected count.
      *
      * @example
      * concurrency: {
@@ -742,6 +757,8 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
         : undefined,
     ...(Object.keys(compensationConfigs).length > 0 && { compensationConfigs }),
     ...(config.migrateRun !== undefined && { migrateRun: config.migrateRun }),
+    ...(config.scheduler !== undefined && { scheduler: config.scheduler }),
+    ...(config.maxStepLogs !== undefined && { maxStepLogs: config.maxStepLogs }),
   });
 
   const waitFor = async (

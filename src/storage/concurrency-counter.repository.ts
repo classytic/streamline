@@ -26,9 +26,22 @@
 
 import { Repository } from '@classytic/mongokit';
 import {
+  makeCounterId,
   type WorkflowConcurrencyCounter,
   WorkflowConcurrencyCounterModel,
 } from './concurrency-counter.model.js';
+import { WorkflowRunModel } from './run.model.js';
+
+/**
+ * Run statuses that hold a strict-concurrency slot. The slot is claimed at
+ * `start()` (before the run exists) and released only when the run reaches a
+ * TERMINAL state (`done`/`failed`/`cancelled`/`compensated`/`compensation_failed`).
+ * So a run still holding a slot is in one of these non-terminal active states.
+ * `compensating` is INCLUDED — a run mid-rollback hasn't released its slot yet
+ * (mirrors the idempotency-index active set in run.model.ts). `draft` is
+ * EXCLUDED for strict mode: strict claims the counter slot, never queues drafts.
+ */
+const SLOT_HOLDING_STATUSES = ['running', 'waiting', 'compensating'] as const;
 
 export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowConcurrencyCounter> {
   constructor() {
@@ -100,6 +113,79 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
   /** Read a counter doc without mutating it (diagnostics / admin UIs). */
   async getCounter(id: string): Promise<WorkflowConcurrencyCounter | null> {
     return (await this.getById(id)) as WorkflowConcurrencyCounter | null;
+  }
+
+  /**
+   * Repair counter drift/leaks by recomputing the TRUE active-run count and
+   * resetting the counter doc(s) to it.
+   *
+   * A counter can leak +1 when a worker dies AFTER `claimSlot` but BEFORE the
+   * run is persisted (no run exists to release the slot), or skew if a release
+   * is missed. This recounts the actual slot-holding runs
+   * ({@link SLOT_HOLDING_STATUSES}) for `workflowId` (+ `concurrencyKey` if
+   * given) and atomically `$set`s the counter `count` to the truth.
+   *
+   * Modes:
+   *   - `reconcile(workflowId, key)` — repair ONE bucket; returns its count.
+   *   - `reconcile(workflowId)` — repair EVERY existing counter doc for the
+   *     workflow; returns the SUM of the corrected counts.
+   *
+   * Idempotent: re-running with no concurrent activity yields the same result
+   * and a correct counter is left unchanged. Small window (documented): a
+   * concurrent `claimSlot`/`releaseSlot` racing the recount-then-set can be
+   * over/under-written by ±1 until the next reconcile; run from a low-traffic
+   * cron or after confirmed worker crashes, when the bucket is quiescent.
+   *
+   * @returns the corrected count (single bucket) or the summed corrected count
+   *   (whole workflow).
+   */
+  async reconcile(workflowId: string, concurrencyKey?: string): Promise<number> {
+    if (concurrencyKey !== undefined) {
+      return this.reconcileBucket(workflowId, concurrencyKey);
+    }
+
+    // Whole-workflow: repair every existing counter bucket for this workflow.
+    const counters = (await this.findAll({ workflowId }, {
+      lean: true,
+      bypassTenant: true,
+    } as Parameters<
+      Repository<WorkflowConcurrencyCounter>['findAll']
+    >[1])) as WorkflowConcurrencyCounter[];
+
+    let total = 0;
+    for (const counter of counters) {
+      total += await this.reconcileBucket(workflowId, counter.concurrencyKey);
+    }
+    return total;
+  }
+
+  /** Recount one `(workflowId, key)` bucket and reset its counter to truth. */
+  private async reconcileBucket(workflowId: string, concurrencyKey: string): Promise<number> {
+    // Count the runs that actually still hold a slot. Query the run model
+    // directly (cross-tenant — the strict counter is a global gate, same
+    // rationale as the repository's no-tenant-plugin design above).
+    const trueCount = await WorkflowRunModel.countDocuments({
+      workflowId,
+      concurrencyKey,
+      status: { $in: SLOT_HOLDING_STATUSES },
+    });
+
+    const id = makeCounterId(workflowId, concurrencyKey);
+    const now = new Date();
+
+    // Atomically set the counter to truth. Upsert so a bucket whose counter
+    // doc was lost (but which has active runs) is recreated; `$setOnInsert`
+    // backfills the immutable bootstrap fields only on creation.
+    await this.findOneAndUpdate(
+      { _id: id },
+      {
+        $set: { count: trueCount, updatedAt: now },
+        $setOnInsert: { workflowId, concurrencyKey, limit: trueCount, createdAt: now },
+      },
+      { upsert: true, returnDocument: 'after' },
+    );
+
+    return trueCount;
   }
 }
 

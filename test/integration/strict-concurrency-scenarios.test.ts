@@ -243,6 +243,71 @@ describe('Strict concurrency — race safety vs best-effort', () => {
   });
 });
 
+describe('Strict concurrency — reconcile() drift repair (v2.4.0 hardening #5)', () => {
+  useTestDb();
+
+  it('resets a leaked counter (higher than truth) down to the true active-run count', async () => {
+    // Two real active runs hold slots; simulate a +3 leak (workers that died
+    // between claimSlot and repository.create), then reconcile back to truth.
+    const wf = makeStrictWorkflow('reconcile-leak', 10);
+    await wf.start({ jobId: 'k1' });
+    await wf.start({ jobId: 'k1' });
+
+    const counterId = 'reconcile-leak:k1';
+    // Inflate the counter to simulate leaked slots.
+    await WorkflowConcurrencyCounterModel.updateOne({ _id: counterId }, { $set: { count: 5 } });
+    expect((await WorkflowConcurrencyCounterModel.findById(counterId).lean())?.count).toBe(5);
+
+    // Single-bucket reconcile returns the corrected count.
+    const corrected = await workflowConcurrencyCounterRepository.reconcile('reconcile-leak', 'k1');
+    expect(corrected).toBe(2);
+    expect((await WorkflowConcurrencyCounterModel.findById(counterId).lean())?.count).toBe(2);
+  });
+
+  it('leaves an already-correct counter unchanged (idempotent)', async () => {
+    const wf = makeStrictWorkflow('reconcile-noop', 10);
+    await wf.start({ jobId: 'k1' });
+
+    const counterId = 'reconcile-noop:k1';
+    expect((await WorkflowConcurrencyCounterModel.findById(counterId).lean())?.count).toBe(1);
+
+    const corrected = await workflowConcurrencyCounterRepository.reconcile('reconcile-noop', 'k1');
+    expect(corrected).toBe(1);
+    expect((await WorkflowConcurrencyCounterModel.findById(counterId).lean())?.count).toBe(1);
+
+    // Re-running is idempotent.
+    expect(await workflowConcurrencyCounterRepository.reconcile('reconcile-noop', 'k1')).toBe(1);
+    expect((await WorkflowConcurrencyCounterModel.findById(counterId).lean())?.count).toBe(1);
+  });
+
+  it('whole-workflow reconcile repairs every bucket and returns the summed count', async () => {
+    const wf = makeStrictWorkflow('reconcile-all', 10);
+    await wf.start({ jobId: 'a' }); // 1 active in bucket a
+    await wf.start({ jobId: 'b' });
+    await wf.start({ jobId: 'b' }); // 2 active in bucket b
+
+    // Leak both buckets.
+    await WorkflowConcurrencyCounterModel.updateOne(
+      { _id: 'reconcile-all:a' },
+      { $set: { count: 9 } },
+    );
+    await WorkflowConcurrencyCounterModel.updateOne(
+      { _id: 'reconcile-all:b' },
+      { $set: { count: 7 } },
+    );
+
+    const total = await workflowConcurrencyCounterRepository.reconcile('reconcile-all');
+    expect(total).toBe(3); // 1 + 2
+
+    expect((await WorkflowConcurrencyCounterModel.findById('reconcile-all:a').lean())?.count).toBe(
+      1,
+    );
+    expect((await WorkflowConcurrencyCounterModel.findById('reconcile-all:b').lean())?.count).toBe(
+      2,
+    );
+  });
+});
+
 describe('Strict concurrency — config validation', () => {
   it('throws at definition time when `strict: true` without `limit`', () => {
     expect(() =>
