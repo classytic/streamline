@@ -169,7 +169,11 @@ describe('Saga compensation (rollback)', () => {
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
 
-    expect(result.status).toBe('failed');
+    // Durable saga (v2.4): a failed run WITH compensation handlers drives the
+    // compensation phase before returning, so the terminal status is
+    // 'compensated' (all rollbacks succeeded), NOT the bare 'failed'. The
+    // pre-v2.4 assertion of 'failed' predated the durable-saga terminal states.
+    expect(result.status).toBe('compensated');
 
     // Compensations should run in reverse: provisionServer first, then chargeCard
     expect(compensated).toEqual([
