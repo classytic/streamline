@@ -679,7 +679,11 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
   const compensationHandlers: Record<string, StepHandler<unknown, TContext>> = {};
   const compensationConfigs: Record<
     string,
-    { retries?: number; retryDelay?: number; retryBackoff?: 'exponential' | 'linear' | 'fixed' | number }
+    {
+      retries?: number;
+      retryDelay?: number;
+      retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+    }
   > = {};
   const steps: Step[] = stepIds.map((stepId) => {
     validateId(stepId, 'step');
