@@ -91,6 +91,8 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     private readonly eventBus: WorkflowEventBus,
     private readonly cache: WorkflowCache,
     private readonly signalStore?: import('../core/container.js').SignalStore,
+    /** Ring-buffer cap for persisted stepLogs; threaded into each StepContextImpl. */
+    private readonly maxStepLogs?: number,
   ) {}
 
   /**
@@ -371,6 +373,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       this.eventBus,
       abortController.signal,
       this.signalStore,
+      this.maxStepLogs,
     );
 
     try {
@@ -703,7 +706,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     // the feature is enabled, so the prior committed generation is still in the
     // slot at re-success time.
     if (priorStep.output === undefined) return undefined;
-    if (!Object.prototype.hasOwnProperty.call(priorStep, 'output')) return undefined;
+    if (!Object.hasOwn(priorStep, 'output')) return undefined;
 
     const priorOutput = priorStep.output;
     // Never archive a checkpoint/scatter sentinel as a "prior output".
@@ -800,7 +803,11 @@ export class StepExecutor<TContext = Record<string, unknown>> {
    * If no more steps, marks workflow as done and sets final output.
    */
   private async moveToNextStep(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
-    const nextStep = this.registry.getNextStep(run.currentStepId!);
+    const currentStepId = run.currentStepId;
+    if (!currentStepId) {
+      throw new Error(`moveToNextStep called without a currentStepId (run ${run._id})`);
+    }
+    const nextStep = this.registry.getNextStep(currentStepId);
 
     const updates: Record<string, unknown> = {
       updatedAt: new Date(),
@@ -938,15 +945,22 @@ export class StepExecutor<TContext = Record<string, unknown>> {
    *
    * @param run - Workflow run to resume
    * @param payload - Data to pass as step output
-   * @returns Updated workflow run
+   * @returns `{ run, won }` — `won:false` means a concurrent resume already
+   *   completed this step (the durable CAS lost); the run is returned fresh
+   *   from the DB and the caller MUST NOT re-drive execution (the winner
+   *   already advanced + emitted). `won:true` means this call advanced the run.
    * @throws {InvalidStateError} If step is not in waiting state
    */
-  async resumeStep(run: WorkflowRun<TContext>, payload: unknown): Promise<WorkflowRun<TContext>> {
+  async resumeStep(
+    run: WorkflowRun<TContext>,
+    payload: unknown,
+  ): Promise<{ run: WorkflowRun<TContext>; won: boolean }> {
+    run = toPlainRun(run);
     const stepId = run.currentStepId;
     if (!stepId) {
       throw new InvalidStateError('resume step', run.status, ['waiting'], { runId: run._id });
     }
-    const { step: stepState } = this.findStepOrThrow(run, stepId);
+    const { index: stepIndex, step: stepState } = this.findStepOrThrow(run, stepId);
 
     if (stepState.status !== 'waiting') {
       throw new InvalidStateError('resume step', stepState.status, ['waiting'], {
@@ -955,19 +969,54 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       });
     }
 
-    // Mark step as done with the payload as output, then move to next step
-    let updatedRun = await this.updateStepState(run, stepId, {
+    // RESUME CAS (v2.4.0): the LOCAL `waiting` check above is necessary but not
+    // sufficient — two concurrent `engine.resume(runId, A|B)` can both pass it
+    // (each loaded the run while it was still `waiting`) and then both write the
+    // step `done`, last-write-wins, double-emitting the resume event and
+    // double-advancing the run. Guard the durable write on the step STILL being
+    // `waiting` via a NUMERIC-INDEX CAS (mirrors saga.ts/compensateOneStep and
+    // restoreStepOutput). modifiedCount===0 ⇒ a concurrent writer already
+    // resumed it → treat as a no-op (do NOT re-advance, do NOT re-emit).
+    const updates: Partial<StepState> = {
       status: 'done',
       endedAt: new Date(),
       output: payload,
       waitingFor: undefined,
+    };
+    const historyPush = this.buildHistoryPush(stepState, updates, this.resolveHistoryKeep(stepId));
+    const updatedSteps = applyStepUpdates(stepId, run.steps, updates, historyPush);
+    const newStatus = deriveRunStatus({ ...run, steps: updatedSteps });
+    const updateOps = buildStepUpdateOps(stepIndex, updates, {
+      includeStatus: newStatus,
+      ...(historyPush ? { historyPush } : {}),
     });
+
+    const result = await this.repository.updateOne(
+      {
+        _id: run._id,
+        ...CANCELLED_GUARD,
+        [`steps.${stepIndex}.status`]: 'waiting',
+      },
+      updateOps,
+      { bypassTenant: true },
+    );
+
+    if (result.modifiedCount === 0) {
+      // Lost the resume race (or run cancelled). Return the freshest persisted
+      // state without re-driving — the winner already advanced + emitted.
+      this.cache.delete(run._id);
+      const current = (await this.repository.getById(run._id)) as WorkflowRun<TContext> | null;
+      return { run: current ?? run, won: false };
+    }
+
+    // We won the CAS — mirror the durable write in-memory, emit once, advance once.
+    run.steps = updatedSteps;
+    run.updatedAt = new Date();
+    run.status = newStatus;
 
     this.eventBus.emit('workflow:resumed', { runId: run._id, stepId, data: payload });
 
-    // Move to next step
-    updatedRun = await this.moveToNextStep(updatedRun);
-
-    return updatedRun;
+    const advanced = await this.moveToNextStep(run);
+    return { run: advanced, won: true };
   }
 }

@@ -73,16 +73,6 @@ import { logger } from '../utils/logger.js';
 import { TimezoneHandler } from './timezone-handler.js';
 
 /**
- * Type for scheduled workflow data before creation
- */
-type ScheduledWorkflowInput<TContext> = Omit<
-  WorkflowRun<TContext>,
-  'startedAt' | 'endedAt' | 'output' | 'error' | 'lastHeartbeat' | 'paused'
-> & {
-  tenantId?: string;
-};
-
-/**
  * Type for sort options
  */
 type WorkflowSort = Record<string, SortOrder>;

@@ -164,6 +164,22 @@ export interface SmartSchedulerConfig {
    * @default Infinity (no limit — current behavior)
    */
   maxConcurrentExecutions: number;
+  /**
+   * Whether `scheduleResume` arms an in-process `setTimeout` for fast,
+   * sub-poll-interval resume of timer/sleep waits.
+   *
+   * SCALE TRADEOFF: with this `true` (default, current behavior) every
+   * sub-~24.8-day `ctx.sleep`/timer wait creates one unref'd process timer so
+   * the run resumes the instant it's due rather than waiting up to one poll
+   * interval. At high sleeping-workflow volume (tens of thousands) that's tens
+   * of thousands of live timers — memory + event-loop pressure. MongoDB
+   * polling is the DURABLE backstop and resumes the same waits regardless, so
+   * high-scale deployments can set this `false` to rely PURELY on DB polling
+   * for bounded process-timer usage (trading instant resume for up-to-one-poll
+   * latency). Long delays (≥ ~24.8 days) already skip the timer unconditionally.
+   * @default true (in-process timers — current behavior, byte-for-byte)
+   */
+  inMemoryTimers?: boolean;
 }
 
 export const DEFAULT_SCHEDULER_CONFIG: SmartSchedulerConfig = {
@@ -177,6 +193,7 @@ export const DEFAULT_SCHEDULER_CONFIG: SmartSchedulerConfig = {
   staleCheckInterval: SCHEDULER.STALE_CHECK_INTERVAL_MS,
   staleThreshold: TIMING.STALE_WORKFLOW_THRESHOLD_MS,
   maxConcurrentExecutions: Infinity,
+  inMemoryTimers: true,
 };
 
 export class SmartScheduler {
@@ -193,14 +210,28 @@ export class SmartScheduler {
   private retryCallback?: (runId: string) => Promise<unknown>;
   private compensationRecoveryCallback?: (runId: string, thresholdMs: number) => Promise<unknown>;
 
+  /**
+   * Engine-scoping filter (v2.4.0 distributed-correctness fix). Every engine
+   * owns its own scheduler; passing the engine's `workflowId` here scopes
+   * EVERY pickup query (resume/retry/scheduled/stale/concurrency/child/
+   * branchJoin/compensating) to this workflow's runs only. Without it, in a
+   * multi-workflow deployment engine B's scheduler would pick up engine A's
+   * run and run B's step graph against it (step-not-found / wrong-handler).
+   * `undefined` preserves the legacy cross-workflow sweep (single-workflow
+   * deployments, or callers that intentionally span all workflows).
+   */
+  private readonly scopedOpts: { bypassTenant: true; workflowId?: string };
+
   constructor(
     private readonly repository: WorkflowRunRepository,
     private readonly resumeCallback: (runId: string) => Promise<void>,
     private readonly config: SmartSchedulerConfig = DEFAULT_SCHEDULER_CONFIG,
     private readonly eventBus?: WorkflowEventBus,
+    workflowId?: string,
   ) {
     this.currentInterval = config.basePollInterval;
     this.metrics = new SchedulerMetrics();
+    this.scopedOpts = workflowId ? { bypassTenant: true, workflowId } : { bypassTenant: true };
   }
 
   private emitError(context: string, error: unknown, runId?: string): void {
@@ -313,7 +344,21 @@ export class SmartScheduler {
       return;
     }
 
-    // Schedule in-memory timer for fast resume (< 24.8 days)
+    // OPT-IN DB-ONLY POLLING (`inMemoryTimers: false`): skip the per-wait
+    // process timer entirely and let the MongoDB poll resume this run when
+    // `resumeAt` passes. Trades instant resume for up-to-one-poll latency but
+    // bounds process-timer count at high sleeping-workflow volume. See the
+    // `inMemoryTimers` config doc for the full scale tradeoff.
+    if (this.config.inMemoryTimers === false) {
+      return;
+    }
+
+    // SCALE TRADEOFF (default `inMemoryTimers !== false`): each sub-~24.8-day
+    // timer/sleep wait arms ONE unref'd in-process `setTimeout` so the run
+    // resumes the moment it's due instead of waiting up to a poll interval. At
+    // very high sleeping-workflow volume this is many thousands of live timers;
+    // MongoDB polling is the DURABLE backstop that resumes these waits even
+    // with no timer, so set `inMemoryTimers: false` to rely purely on polling.
     const timer = setTimeout(() => {
       this.timers.delete(runId);
       this.resumeWorkflow(runId);
@@ -434,7 +479,7 @@ export class SmartScheduler {
       const staleWorkflows = await this.repository.getStaleRunningWorkflows(
         this.config.staleThreshold,
         1,
-        { bypassTenant: true },
+        this.scopedOpts,
       );
 
       if (staleWorkflows.length > 0 && !this.isPolling) {
@@ -483,10 +528,10 @@ export class SmartScheduler {
 
       // Query workflows ready to resume (timer-based) - PAGINATED.
       // Cross-tenant sweep — bypass scope; per-row writes downstream are id-scoped.
-      const waiting = await this.repository.getReadyToResume(now, limit, { bypassTenant: true });
+      const waiting = await this.repository.getReadyToResume(now, limit, this.scopedOpts);
 
       // Query workflows ready for retry (exponential backoff) - PAGINATED.
-      const retrying = await this.repository.getReadyForRetry(now, limit, { bypassTenant: true });
+      const retrying = await this.repository.getReadyForRetry(now, limit, this.scopedOpts);
 
       // Query workflows blocked on a childWorkflow wait that are due for
       // crash-durable reconciliation - PAGINATED.
@@ -502,9 +547,20 @@ export class SmartScheduler {
       // listener or a second polling worker a no-op (race-safe, idempotent).
       // Cross-tenant sweep — bypass scope; per-row writes downstream are
       // id-scoped.
-      const childWaiting = await this.repository.getChildWaitingRuns(now, limit, {
-        bypassTenant: true,
-      });
+      const childWaiting = await this.repository.getChildWaitingRuns(now, limit, this.scopedOpts);
+
+      // Query workflows blocked on a branchJoin (declarative parallel) wait
+      // due for crash-durable reconciliation - PAGINATED. Same orphaned-wait
+      // bug class as childWorkflow: a parent parked on ctx.joinBranches() is
+      // normally resumed by in-process listeners; after a crash those are gone
+      // and no other sweep reclaims it. This hands the wait to resumeCallback →
+      // engine.resume, which re-reads each branch child and resolves the join
+      // quorum. The waiting→running claim makes concurrent drivers no-op.
+      const branchJoinWaiting = await this.repository.getBranchJoinWaitingRuns(
+        now,
+        limit,
+        this.scopedOpts,
+      );
 
       let resumedCount = 0;
 
@@ -522,6 +578,12 @@ export class SmartScheduler {
       // reconciliation; the waiting→running claim guards against double-drive
       // by an in-memory listener or another worker.
       for (const run of childWaiting) {
+        await this.resumeWorkflow(run._id);
+        resumedCount++;
+      }
+
+      // Reconcile branchJoin waits — same race-safe drive as childWorkflow.
+      for (const run of branchJoinWaiting) {
         await this.resumeWorkflow(run._id);
         resumedCount++;
       }
@@ -546,7 +608,7 @@ export class SmartScheduler {
       // Cross-tenant sweep — bypass scope; per-row writes downstream are id-scoped.
       const scheduledResult = await this.repository.getScheduledWorkflowsReadyToExecute(now, {
         limit,
-        bypassTenant: true,
+        ...this.scopedOpts,
       });
       const scheduled = scheduledResult.data || [];
 
@@ -574,9 +636,7 @@ export class SmartScheduler {
       // Cross-tenant sweep — one scheduler serves every tenant's queue, so
       // bypass tenant scope on the read. Per-row promotion writes downstream
       // are `_id`-scoped.
-      const concurrencyDrafts = await this.repository.getConcurrencyDrafts(limit, {
-        bypassTenant: true,
-      });
+      const concurrencyDrafts = await this.repository.getConcurrencyDrafts(limit, this.scopedOpts);
 
       for (const draft of concurrencyDrafts) {
         if (this.retryCallback) {
@@ -598,9 +658,10 @@ export class SmartScheduler {
       // The consumer breaks at `limit` for the per-poll budget, so wire
       // cost is identical to the bounded read.
       let staleCount = 0;
-      for await (const run of this.repository.cursorStaleRunning(this.config.staleThreshold, {
-        bypassTenant: true,
-      })) {
+      for await (const run of this.repository.cursorStaleRunning(
+        this.config.staleThreshold,
+        this.scopedOpts,
+      )) {
         if (staleCount >= limit) break;
         staleCount++;
         if (this.staleRecoveryCallback) {
@@ -626,7 +687,7 @@ export class SmartScheduler {
         const stuckCompensating = await this.repository.getStaleCompensatingRuns(
           this.config.staleThreshold,
           limit,
-          { bypassTenant: true },
+          this.scopedOpts,
         );
         for (const run of stuckCompensating) {
           compensatingCount++;
@@ -645,6 +706,7 @@ export class SmartScheduler {
         waiting.length +
         retrying.length +
         childWaiting.length +
+        branchJoinWaiting.length +
         scheduled.length +
         staleCount +
         compensatingCount;
@@ -705,7 +767,7 @@ export class SmartScheduler {
 
   private async hasWaitingWorkflows(): Promise<boolean> {
     try {
-      return await this.repository.hasWaitingWorkflows({ bypassTenant: true });
+      return await this.repository.hasWaitingWorkflows(this.scopedOpts);
     } catch (error) {
       this.emitError('check-waiting', error);
       return false;
@@ -722,37 +784,49 @@ export class SmartScheduler {
       // Cross-tenant wake-up probes — scheduler activates when ANY tenant
       // has work pending. Bypass tenant scope on every read; per-row writes
       // downstream are id-scoped.
-      if (await this.repository.hasWaitingWorkflows({ bypassTenant: true })) return true;
+      if (await this.repository.hasWaitingWorkflows(this.scopedOpts)) return true;
 
       // Check for childWorkflow waits due for crash-durable reconciliation.
       // `hasWaitingWorkflows` already matches any status='waiting' run, so this
       // is usually redundant — but it's an explicit, cadence-gated wake reason
       // so the child-reconciliation sweep stays correct even if the broad
       // waiting probe's semantics narrow later.
-      const childWaiting = await this.repository.getChildWaitingRuns(new Date(), 1, {
-        bypassTenant: true,
-      });
+      const childWaiting = await this.repository.getChildWaitingRuns(
+        new Date(),
+        1,
+        this.scopedOpts,
+      );
       if (childWaiting.length > 0) return true;
+
+      // Check for branchJoin (declarative parallel) waits due for reconciliation.
+      const branchJoinWaiting = await this.repository.getBranchJoinWaitingRuns(
+        new Date(),
+        1,
+        this.scopedOpts,
+      );
+      if (branchJoinWaiting.length > 0) return true;
 
       // Check for scheduled workflows ready to execute (timezone-aware)
       const scheduled = await this.repository.getScheduledWorkflowsReadyToExecute(new Date(), {
         limit: 1,
-        bypassTenant: true,
+        ...this.scopedOpts,
       });
       if (scheduled.data && scheduled.data.length > 0) return true;
 
       // Check for STALE running workflows (might need recovery after crashes)
       // Don't start scheduler for healthy running workflows
-      const stale = await this.repository.getStaleRunningWorkflows(this.config.staleThreshold, 1, {
-        bypassTenant: true,
-      });
+      const stale = await this.repository.getStaleRunningWorkflows(
+        this.config.staleThreshold,
+        1,
+        this.scopedOpts,
+      );
       if (stale.length > 0) return true;
 
       // Check for crashed saga compensations stuck in `compensating` (v2.4).
       const stuckCompensating = await this.repository.getStaleCompensatingRuns(
         this.config.staleThreshold,
         1,
-        { bypassTenant: true },
+        this.scopedOpts,
       );
       if (stuckCompensating.length > 0) return true;
 
@@ -760,7 +834,7 @@ export class SmartScheduler {
       // exists-query — short-circuits on the first match). Cross-tenant
       // probe — the scheduler decides whether to wake based on global
       // queue depth across all tenants.
-      if (await this.repository.hasConcurrencyDrafts({ bypassTenant: true })) return true;
+      if (await this.repository.hasConcurrencyDrafts(this.scopedOpts)) return true;
 
       return false;
     } catch (error) {

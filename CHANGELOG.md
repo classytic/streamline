@@ -5,6 +5,119 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-06-01 — Durable saga · crash-recovery fix · output history · parallel/join · idempotency keys
+
+A capability release that makes streamline best-in-class for agentic, order, and
+distributed workflows — while staying a **neutral durable-execution substrate**
+(no AI/LLM/streaming; that layer is `@classytic/arc-ai`, which composes on top of
+this engine via `./integrations/streamline`). All changes are **additive /
+semver-minor**; default behavior for existing workflows is byte-for-byte unchanged
+(proven by the full e2e suite passing untouched). See the two type-level notes
+under *Migration*.
+
+### Fixed — childWorkflow / untimed-wait crash-recovery (data-loss bug)
+
+A run suspended on `ctx.startChildWorkflow()` was woken to completion **only** by
+in-memory event-bus listeners. After a process crash those listeners were gone,
+and no scheduler poll class reclaimed the parent (`status:'waiting'`, no
+`resumeAt`, not `running`) — it dead-waited forever. v2.4 adds a durable
+reconciliation poll (`CommonQueries.childWaiting` → `getChildWaitingRuns` →
+scheduler branch) plus reconcile-on-re-entry: a reclaimed parent re-reads the
+child's persisted status and resumes (or re-arms) instead of no-oping. Same spine
+now also backs the new `branchJoin` waits.
+
+### Added — durable saga compensation
+
+`failed → compensating → compensated | compensation_failed` as a first-class,
+crash-recoverable phase. `onCompensate` handlers roll back completed steps in
+reverse order, derived from freshly-read persisted state; the `failed→compensating`
+transition is an `assertAndClaim` (multi-worker entry resolves to one winner);
+per-step `pending→done` memoization via a numeric-index guarded CAS makes
+recovery skip already-compensated steps (effectively-once within the cluster). A
+real heartbeat runs for the rollback's duration so the stale-sweeper can't
+race-kill it. Proven by an 11-scenario matrix (`test/integration/saga-compensation.test.ts`).
+**Exactly-once boundary (honest):** for external side effects use
+`ctx.idempotencyKey('compensate')` — the engine provides effectively-once via a
+stable key, not transactional exactly-once against third-party APIs.
+
+### Added — `ctx.idempotencyKey(scope?)`
+
+Deterministic, **attempt-invariant** key (`${runId}:${stepId}[:${scope}]`) for
+effectively-once external calls. Stable across retries and crash recovery by
+design (never folds in `attempt`), so a re-issued call dedupes at the provider.
+
+### Added — per-step versioned output history (opt-in)
+
+`Step.outputHistory: { keep }` keeps the last N outputs of a step in a bounded
+ring buffer, captured on the rerun/rewind transition. Read via
+`ctx.outputHistory(stepId?)`; restore a prior generation via
+`ctx.pinOutput(version, stepId?)`. `keep` 0/undefined ⇒ disabled ⇒ no schema
+growth, byte-for-byte v2.3.4.
+
+### Added — declarative parallel steps + durable join
+
+`ctx.joinBranches(branches, { policy })` fans out child-workflow branches that run
+concurrently and join durably, with policies `all | any | race | allSettled`.
+Each branch is a real run with its own retry/timeout/compensation; the join is a
+crash-recoverable `branchJoin` wait (reuses the reconciliation spine above).
+Under `policy:'all'`, a branch failure fails the step and triggers saga
+compensation of completed work. Gated entirely behind branch-presence — the
+linear step graph (`getNextStep`) is untouched.
+
+### Changed — storage deepening on mongokit
+
+`WorkflowDefinitionRepository` now extends mongokit `Repository` (the old
+plain-object export remains as a deprecated delegating shim). Dropped the dead,
+never-executed serialized `condition` field from the definition model (no
+eval-of-data — explicit non-goal). Added an `assertWriteConcern` regression test
+guarding `{ w:'majority', j:true }` on the run + concurrency-counter models.
+
+### Internal — engine.ts de-bloated
+
+Extracted cohesive subsystems out of the 2076-line god-class into focused modules
+(`saga.ts`, `child-workflow.ts`, `parallel-steps.ts`, `registries.ts`); engine.ts
+is the thin orchestrator. No public API or behavior change.
+
+### Hardened — distributed correctness (adversarial-review fixes)
+
+- **Cross-workflow scheduler isolation (was a critical bug).** Each engine's
+  scheduler previously polled the *global* run pool and could claim + mis-execute
+  another workflow's run. Pickup queries are now scoped by the engine's
+  `workflowId` (+ a routing guard at the claim/execute paths). Regression test
+  registers two distinct workflows and proves isolation.
+- **`resume` is now a true waiting-step CAS** — the durable write is guarded on
+  the step still being `waiting`, so two concurrent resumes can't both advance it.
+- **`ctx.scatter()` no longer drops early task failures** — failures are
+  accumulated independently of the concurrency-gating set; a failed task reliably
+  throws instead of returning partial success.
+- **`stepLogs` is ring-buffer capped** (`maxStepLogs`, default 1000) — prevents
+  unbounded `$push` growth toward the 16 MB BSON limit.
+- **`WorkflowConcurrencyCounterRepository.reconcile(workflowId, concurrencyKey?)`**
+  implemented — recounts true slot-holding runs and repairs leaked strict-mode
+  counters (was documented but missing).
+- **`scheduler.inMemoryTimers` opt-out** — set `false` to rely purely on DB
+  polling for resumes (bounded timers for high-scale deployments). Default `true`.
+
+### Known limitations / operating guidance
+
+streamline is multi-worker-capable and durable on a single cluster, but it is
+**not** "Temporal-grade distributed by default" (no worker-lease protocol, no
+sharded task queue, BYO Redis/Kafka signal store + monitoring, inline payloads
+bounded only for logs/output-history). See
+[`docs/DISTRIBUTED-READINESS.md`](docs/DISTRIBUTED-READINESS.md) for the full
+limitations + how to operate around each at scale.
+
+### Migration (two type-level notes — no runtime migration)
+
+- **`RunStatus` gains `'compensating' | 'compensated' | 'compensation_failed'`**
+  and **`WaitingFor.type` gains `'branchJoin'`**. Additive at runtime (never
+  emitted unless you use compensation / `joinBranches`), but a downstream
+  exhaustive `switch (status)` with a `never`-default will stop compiling until it
+  handles the new literals.
+- **Idempotency partial-unique index** now includes `'compensating'` in its active
+  set (a compensating run still blocks duplicate keys); terminal compensation
+  states are excluded so keys remain reusable. Index rebuilds automatically.
+
 ## [2.3.4] - 2026-05-24 — `Workflow.bindFailureTo` + peer dep floor bumps
 
 ### Added — `Workflow.bindFailureTo({ model, key, field, value, errorField? })`

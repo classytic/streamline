@@ -235,7 +235,15 @@ Distributed primitives have specific guarantees. Honest summary:
 | `concurrency.throttle` | **Best-effort smoothing, not a strict distributed rate limiter.** Sequential bursts get strictly-staggered slots (`tail + windowMs/limit`). Parallel concurrent starts can reserve the same slot — bounded by parallelism, not by `limit`. Use an external token-bucket / counter for strict guarantees. |
 | `concurrency.debounce` | **Race-safe for the bump path.** Each start is a single atomic `findOneAndUpdate` against `(workflowId, concurrencyKey)`; the timer push is serialized by Mongo. The fall-through "no draft existed yet → create one" can race two creates if the first start in a quiet window arrives twice within the same millisecond — bounded to two drafts max, both at the same `executionTime`. |
 
-If your workload is concurrency-sensitive in the strict sense — payment captures, ticket reservations, license-seat allocation — wrap the start call in your own gate (Redis lock, partial-unique resource index per [PACKAGE_RULES §32](https://github.com/classytic/specs)) instead of relying on `concurrency.limit`. The streamline gate is fine for "don't overload the embedding API" but not for "exactly N seats."
+If your workload is concurrency-sensitive in the strict sense — payment captures, ticket reservations, license-seat allocation — use `concurrency: { limit, strict: true }` (atomic counter; repair drift with `concurrencyCounterRepo.reconcile(workflowId, key?)`), or wrap the start call in your own gate (Redis lock, partial-unique resource index per [PACKAGE_RULES §32](https://github.com/classytic/specs)). The best-effort `concurrency.limit` is fine for "don't overload the embedding API" but not for "exactly N seats."
+
+> **Running at scale / multi-worker / multi-tenant?** Read
+> [`docs/DISTRIBUTED-READINESS.md`](docs/DISTRIBUTED-READINESS.md) — it covers
+> per-workflow scheduler scoping (v2.4), strict vs best-effort concurrency,
+> tenant-scoped concurrency keys, the `scheduler.inMemoryTimers` opt-out, inline
+> payload size limits, and bring-your-own signal-store/monitoring. streamline is
+> durable and multi-worker-capable, but **not** Temporal-grade distributed by
+> default — that doc states each boundary plainly.
 
 ## Multi-tenant
 

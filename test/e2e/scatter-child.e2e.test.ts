@@ -178,6 +178,105 @@ describe('ctx.scatter() — durable parallel execution', () => {
     workflow.shutdown();
   });
 
+  it('should THROW when a fast task fails early among slower successes (no partial success)', async () => {
+    // Pinpoints the dropped-early-failure bug: the failing task settles and
+    // leaves the in-flight gating set BEFORE the slow successes; the old code
+    // only inspected the residual `executing` set, so the early rejection was
+    // never observed and scatter returned partial success. With the fix the
+    // step must FAIL.
+    const settledOrder: string[] = [];
+
+    const workflow = createWorkflow('scatter-early-fail', {
+      steps: {
+        mixed: async (ctx) => {
+          // concurrency:1 forces the gate to `Promise.race` (and, in the
+          // buggy version, `.catch(()=>{})`-swallow) the early failure BEFORE
+          // the slow successes run — so the failing promise has already left
+          // the in-flight `executing` set by the tail await. The old code only
+          // inspected that residual set, dropping the failure → partial
+          // success. With the fix the failure is accumulated independently.
+          return ctx.scatter(
+            {
+              // Fails immediately — settles & leaves `executing` first.
+              boom: async () => {
+                settledOrder.push('boom');
+                throw new Error('early failure');
+              },
+              // Slower successes that outlive the early failure.
+              slowA: async () => {
+                await new Promise((r) => setTimeout(r, 80));
+                settledOrder.push('slowA');
+                return 'A';
+              },
+              slowB: async () => {
+                await new Promise((r) => setTimeout(r, 120));
+                settledOrder.push('slowB');
+                return 'B';
+              },
+            },
+            { concurrency: 1 },
+          );
+        },
+      },
+      defaults: { retries: 1 }, // no retry — fail on first attempt
+      autoExecute: false,
+    });
+
+    const run = await workflow.start({});
+    const result = await workflow.execute(run._id);
+
+    // The early failure must surface as a failed step — NOT partial success.
+    expect(result.status).toBe('failed');
+    // Sanity: the early failure really did settle before the slow successes.
+    expect(settledOrder[0]).toBe('boom');
+
+    workflow.shutdown();
+  });
+
+  it('crash mid-scatter re-runs ONLY the incomplete/failed task on recovery', async () => {
+    // Successful tasks checkpoint {done:true}; the failed task is NOT
+    // checkpointed done, so the retry restores the completed result and
+    // re-runs only the previously-failed task.
+    const runs: Record<string, number> = { done1: 0, done2: 0, flaky: 0 };
+
+    const workflow = createWorkflow('scatter-recovery-selective', {
+      steps: {
+        fetchAll: async (ctx) => {
+          return ctx.scatter({
+            done1: async () => {
+              runs.done1++;
+              return 'd1';
+            },
+            done2: async () => {
+              runs.done2++;
+              return 'd2';
+            },
+            flaky: async () => {
+              runs.flaky++;
+              if (ctx.attempt === 1) throw new Error('flaky crash');
+              return 'recovered';
+            },
+          });
+        },
+      },
+      defaults: { retries: 3 },
+      autoExecute: false,
+    });
+
+    const run = await workflow.start({});
+    const result = await workflow.execute(run._id);
+
+    expect(result.status).toBe('done');
+    expect(result.output).toEqual({ done1: 'd1', done2: 'd2', flaky: 'recovered' });
+    // The two successes ran exactly once (restored from checkpoint on retry);
+    // only the flaky task re-ran.
+    expect(runs.done1).toBe(1);
+    expect(runs.done2).toBe(1);
+    expect(runs.flaky).toBe(2);
+
+    workflow.shutdown();
+  });
+
   it('should handle empty scatter (no tasks)', async () => {
     const workflow = createWorkflow('scatter-empty', {
       steps: {

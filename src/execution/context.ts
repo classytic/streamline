@@ -1,12 +1,20 @@
+import { LIMITS } from '../config/constants.js';
 import type { SignalStore } from '../core/container.js';
 import type { WorkflowEventBus } from '../core/events.js';
-import type { StepContext, StepLogEntry, StepOutputVersion, WorkflowRun } from '../core/types.js';
+import type {
+  BranchPlan,
+  JoinPolicy,
+  StepContext,
+  StepLogEntry,
+  StepOutputVersion,
+  WorkflowRun,
+} from '../core/types.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
 import { logger } from '../utils/logger.js';
 
 export class WaitSignal extends Error {
   constructor(
-    public type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow',
+    public type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow' | 'branchJoin',
     public reason: string,
     public data?: unknown,
   ) {
@@ -42,6 +50,11 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     private eventBus: WorkflowEventBus,
     signal?: AbortSignal,
     private signalStore?: SignalStore,
+    /**
+     * Ring-buffer cap for persisted `stepLogs`. Threaded from
+     * `WorkflowEngineOptions.maxStepLogs`; falls back to the default constant.
+     */
+    private maxStepLogs: number = LIMITS.MAX_STEP_LOGS,
   ) {
     this.signal = signal ?? new AbortController().signal;
   }
@@ -144,6 +157,14 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
   /**
    * Flush buffered log entries to the run document in a single $push.
    * Called by the executor after step completion (success, failure, or wait).
+   *
+   * Bounded with `$slice: -maxStepLogs` so `stepLogs` is a ring buffer keeping
+   * the most recent N entries. Without the slice a long-running / high-volume
+   * workflow grows this inline array unbounded toward Mongo's 16MB doc limit.
+   * `context`, step `output`, `checkpoint` and `outputHistory` are ALSO inline
+   * on the run doc — the engine bounds logs (here) and output-history, but
+   * cannot bound arbitrary user payloads; hosts storing large blobs should
+   * persist a reference/handle, not the payload.
    */
   async flushLogs(): Promise<void> {
     if (this.logBuffer.length === 0) return;
@@ -152,7 +173,7 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     try {
       await this.repository.updateOne(
         { _id: this.runId },
-        { $push: { stepLogs: { $each: entries } } },
+        { $push: { stepLogs: { $each: entries, $slice: -this.maxStepLogs } } },
         { bypassTenant: true },
       );
     } catch {
@@ -164,6 +185,42 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     throw new WaitSignal('childWorkflow', `Waiting for child workflow: ${workflowId}`, {
       childWorkflowId: workflowId,
       childInput: input,
+      parentRunId: this.runId,
+      parentStepId: this.stepId,
+    });
+  }
+
+  async joinBranches<TJoin = unknown>(
+    branches: Array<{ key?: string; workflowId: string; input: unknown }>,
+    options?: { policy?: JoinPolicy; cancelLosers?: boolean },
+  ): Promise<TJoin> {
+    if (!Array.isArray(branches) || branches.length === 0) {
+      throw new Error('joinBranches requires at least one branch');
+    }
+
+    // Normalize branch keys: default to the array index. Keys must be unique
+    // because they synthesize the deterministic child idempotency key and the
+    // durable childRunId slot. Reject duplicates up front (fail-closed).
+    const plan: BranchPlan[] = branches.map((b, i) => ({
+      key: b.key ?? String(i),
+      workflowId: b.workflowId,
+      input: b.input,
+    }));
+    const seen = new Set<string>();
+    for (const b of plan) {
+      if (seen.has(b.key)) {
+        throw new Error(`joinBranches: duplicate branch key "${b.key}"`);
+      }
+      seen.add(b.key);
+    }
+
+    // Like startChildWorkflow/goto: throw a WaitSignal. The engine's
+    // branchJoin handler fans out the children and parks the parent durably;
+    // on quorum the parent resumes with the JoinResult as this step's output.
+    throw new WaitSignal('branchJoin', `Waiting for ${plan.length} parallel branches`, {
+      branches: plan,
+      policy: options?.policy ?? 'all',
+      cancelLosers: options?.cancelLosers ?? true,
       parentRunId: this.runId,
       parentStepId: this.stepId,
     });
@@ -201,42 +258,64 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
       return results as { [K in keyof T]: Awaited<ReturnType<T[K]>> };
     }
 
-    // Execute pending tasks with concurrency limit
+    // Execute pending tasks with a concurrency limit.
+    //
+    // CORRECTNESS: the in-flight `executing` set is used ONLY to gate
+    // concurrency (race one slot free before starting the next). It MUST NOT
+    // be the source of truth for settled outcomes — each task removes itself
+    // from the set in `finally`, so a task that fails (or finishes) early is
+    // already gone by the time we await the tail. Awaiting only the residual
+    // set would silently drop early failures and let scatter return partial
+    // success. Instead we keep `allTasks` (every task's promise, never pruned)
+    // and `failures` (settled rejections), and decide success/failure from
+    // those — independent of what's still in the gating set.
     const executing = new Set<Promise<void>>();
+    const allTasks: Promise<void>[] = [];
+    const failures: unknown[] = [];
 
     for (const id of pending) {
       if (this.signal.aborted) break;
 
-      const taskFn = tasks[id]!;
+      const taskFn = tasks[id];
+      if (!taskFn) continue;
       let promise!: Promise<void>;
       promise = (async () => {
         try {
           const value = await taskFn();
           results[id] = value;
+          // Only successful tasks checkpoint `{done:true}`; a failed task is
+          // NOT recorded done, so crash recovery re-runs exactly the
+          // incomplete/failed tasks (completed ones are restored above).
           checkpoint[id] = { done: true, value };
+          // Persist after each SUCCESS — crash recovery resumes from here.
+          await this.checkpoint(checkpoint);
+        } catch (err) {
+          // Record the failure independently of the gating set so it is
+          // observed even though this promise has already left `executing`.
+          failures.push(err);
         } finally {
           executing.delete(promise);
-          // Persist after each task completes — crash recovery resumes from here
-          await this.checkpoint(checkpoint);
         }
       })();
 
       executing.add(promise);
+      allTasks.push(promise);
 
       if (executing.size >= concurrency) {
-        // Wait for at least one to finish before starting next
-        await Promise.race(executing).catch(() => {});
+        // Wait for at least one to finish before starting the next. The task
+        // body never rejects (it captures its own error), so no swallow here.
+        await Promise.race(executing);
       }
     }
 
-    // Wait for all remaining tasks
-    const settled = await Promise.allSettled(executing);
+    // Wait for EVERY task to settle (not just the residual in-flight set).
+    await Promise.all(allTasks);
 
-    // Check for failures
-    const failures = settled.filter((r) => r.status === 'rejected');
+    // Honor the documented "throws on failure" contract: if ANY task failed,
+    // throw the first error so the step fails (and is retried) rather than
+    // returning a partial-success result.
     if (failures.length > 0) {
-      const first = failures[0] as PromiseRejectedResult;
-      throw first.reason;
+      throw failures[0];
     }
 
     return results as { [K in keyof T]: Awaited<ReturnType<T[K]>> };

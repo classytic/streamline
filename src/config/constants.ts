@@ -69,6 +69,21 @@ export const LIMITS = {
 
   /** Maximum step timeout (30 minutes) */
   MAX_STEP_TIMEOUT_MS: 30 * 60 * 1000,
+
+  /**
+   * Default ring-buffer cap for persisted `stepLogs` (ctx.log()) on the run
+   * doc. `flushLogs` writes with `$push: { $slice: -MAX_STEP_LOGS }` so the
+   * inline array keeps only the most recent N entries — without it a long
+   * loop / high-volume workflow grows the run document toward Mongo's 16MB
+   * limit. Override per-engine via `WorkflowEngineOptions.maxStepLogs`.
+   *
+   * NOTE: the engine bounds `stepLogs` (here) and per-step `outputHistory`
+   * (via `Step.outputHistory.keep`). It CANNOT bound arbitrary `context`,
+   * step `output`, or `checkpoint` payloads — those are also inline on the
+   * run doc. Hosts storing large blobs should persist a reference/handle
+   * (e.g. an S3 key) in context/output, not the payload itself.
+   */
+  MAX_STEP_LOGS: 1000,
 } as const;
 
 export const RETRY = {

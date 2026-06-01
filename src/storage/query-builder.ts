@@ -142,6 +142,26 @@ export class WorkflowQueryBuilder {
     return this;
   }
 
+  /**
+   * Match runs blocked on a crash-recoverable `branchJoin` wait that are due
+   * for reconciliation. Exact analogue of {@link withChildWaiting}: a
+   * branchJoin parent is normally driven by in-process listeners, so after a
+   * crash a poller must reclaim it. Cadence-gated on
+   * `waitingFor.nextReconcileAt <= reconcileBefore`; omit `reconcileBefore`
+   * to match every branchJoin wait (existence probes).
+   */
+  withBranchJoinWaiting(reconcileBefore?: Date) {
+    const elemMatch: Record<string, unknown> = {
+      status: STEP_STATUS.WAITING,
+      'waitingFor.type': 'branchJoin',
+    };
+    if (reconcileBefore) {
+      elemMatch['waitingFor.nextReconcileAt'] = { $lte: reconcileBefore };
+    }
+    this.query.steps = { $elemMatch: elemMatch };
+    return this;
+  }
+
   // Heartbeat/stale detection
   withStaleHeartbeat(thresholdMs: number) {
     const staleTime = new Date(Date.now() - thresholdMs);
@@ -189,6 +209,23 @@ export class WorkflowQueryBuilder {
 // Pre-built Queries
 // ============================================================================
 
+/**
+ * Apply an engine-scoping `workflowId` filter to a builder when supplied.
+ *
+ * v2.4.0 distributed-correctness fix: every scheduler pickup query is scoped
+ * to the owning engine's `workflowId` so engine B's scheduler can never claim
+ * or execute engine A's run (which would run B's step graph against A's run →
+ * step-not-found failure). When `workflowId` is omitted the filter is dropped
+ * (back-compat for the legacy unscoped sweeps and existence probes that
+ * deliberately span all workflows).
+ */
+function withMaybeWorkflowId(
+  builder: WorkflowQueryBuilder,
+  workflowId?: string,
+): WorkflowQueryBuilder {
+  return workflowId ? builder.withWorkflowId(workflowId) : builder;
+}
+
 export const CommonQueries = {
   active: () =>
     WorkflowQueryBuilder.create()
@@ -196,19 +233,17 @@ export const CommonQueries = {
       .notPaused()
       .build(),
 
-  readyForRetry: (now?: Date) =>
-    WorkflowQueryBuilder.create()
-      .withStatus(RUN_STATUS.WAITING)
-      .notPaused()
-      .withRetryReady(now)
-      .build(),
+  readyForRetry: (now?: Date, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create().withStatus(RUN_STATUS.WAITING).notPaused().withRetryReady(now),
+      workflowId,
+    ).build(),
 
-  readyToResume: (now?: Date) =>
-    WorkflowQueryBuilder.create()
-      .withStatus(RUN_STATUS.WAITING)
-      .notPaused()
-      .withTimerReady(now)
-      .build(),
+  readyToResume: (now?: Date, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create().withStatus(RUN_STATUS.WAITING).notPaused().withTimerReady(now),
+      workflowId,
+    ).build(),
 
   /**
    * Runs blocked on a `childWorkflow` wait that are due for crash-durable
@@ -216,19 +251,38 @@ export const CommonQueries = {
    * Pass `reconcileBefore` (typically `now`) to honour the cadence gate;
    * omit it to match every childWorkflow wait (existence probes).
    */
-  childWaiting: (reconcileBefore?: Date) =>
-    WorkflowQueryBuilder.create()
-      .withStatus(RUN_STATUS.WAITING)
-      .notPaused()
-      .withChildWaiting(reconcileBefore)
-      .build(),
+  childWaiting: (reconcileBefore?: Date, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create()
+        .withStatus(RUN_STATUS.WAITING)
+        .notPaused()
+        .withChildWaiting(reconcileBefore),
+      workflowId,
+    ).build(),
 
-  staleRunning: (thresholdMs: number) =>
-    WorkflowQueryBuilder.create()
-      .withStatus(RUN_STATUS.RUNNING)
-      .notPaused()
-      .withStaleHeartbeat(thresholdMs)
-      .build(),
+  /**
+   * Runs blocked on a `branchJoin` wait that are due for crash-durable
+   * reconciliation. See `withBranchJoinWaiting`. Pass `reconcileBefore`
+   * (typically `now`) to honour the cadence gate; omit it for existence
+   * probes.
+   */
+  branchJoinWaiting: (reconcileBefore?: Date, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create()
+        .withStatus(RUN_STATUS.WAITING)
+        .notPaused()
+        .withBranchJoinWaiting(reconcileBefore),
+      workflowId,
+    ).build(),
+
+  staleRunning: (thresholdMs: number, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create()
+        .withStatus(RUN_STATUS.RUNNING)
+        .notPaused()
+        .withStaleHeartbeat(thresholdMs),
+      workflowId,
+    ).build(),
 
   /**
    * Runs left in `compensating` whose heartbeat is stale — a crash mid-saga
@@ -240,19 +294,23 @@ export const CommonQueries = {
    * real heartbeat so this sweep does not race a live, in-flight rollback —
    * only a genuinely crashed one (stale heartbeat) is reclaimed.
    */
-  staleCompensating: (thresholdMs: number) =>
-    WorkflowQueryBuilder.create()
-      .withStatus(RUN_STATUS.COMPENSATING)
-      .notPaused()
-      .withStaleHeartbeat(thresholdMs)
-      .build(),
+  staleCompensating: (thresholdMs: number, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create()
+        .withStatus(RUN_STATUS.COMPENSATING)
+        .notPaused()
+        .withStaleHeartbeat(thresholdMs),
+      workflowId,
+    ).build(),
 
-  scheduledReady: (now?: Date) =>
-    WorkflowQueryBuilder.create()
-      .withStatus(RUN_STATUS.DRAFT)
-      .notPaused()
-      .withScheduledBefore(now ?? new Date())
-      .build(),
+  scheduledReady: (now?: Date, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create()
+        .withStatus(RUN_STATUS.DRAFT)
+        .notPaused()
+        .withScheduledBefore(now ?? new Date()),
+      workflowId,
+    ).build(),
 
   byUser: (userId: string, status?: RunStatus | RunStatus[]) => {
     const builder = WorkflowQueryBuilder.create().withUserId(userId);

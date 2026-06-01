@@ -18,8 +18,13 @@ import {
 } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { WorkflowRegistry } from '../workflow/registry.js';
-import { handleChildWorkflowWait, registerChildCompletionListeners } from './child-workflow.js';
+import { handleChildWorkflowWait } from './child-workflow.js';
 import { StepExecutor } from './executor.js';
+import {
+  cancelBranchChildren,
+  handleBranchJoinWait,
+  writeBranchJoinFailure,
+} from './parallel-steps.js';
 import {
   cleanupEventListeners,
   handleShortDelayOrSchedule,
@@ -49,6 +54,16 @@ export interface WorkflowEngineOptions {
   autoExecute?: boolean;
   /** Custom scheduler configuration */
   scheduler?: Partial<SmartSchedulerConfig>;
+  /**
+   * Ring-buffer cap for persisted `stepLogs` (ctx.log()) on the run doc.
+   * `flushLogs` writes with `$push: { $slice: -maxStepLogs }`, keeping only
+   * the most recent N entries so a long/high-volume workflow can't grow the
+   * inline array toward Mongo's 16MB doc limit. Default {@link LIMITS.MAX_STEP_LOGS}
+   * (1000). NOTE: the engine also bounds per-step `outputHistory`, but cannot
+   * bound arbitrary `context` / step `output` / `checkpoint` payloads (also
+   * inline on the run doc) — store a reference/handle for large blobs.
+   */
+  maxStepLogs?: number;
   /**
    * Compensation handlers for saga pattern rollback.
    * Keyed by stepId. Called in reverse order when a later step fails.
@@ -158,6 +173,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       container.eventBus,
       container.cache,
       container.signalStore,
+      options.maxStepLogs,
     );
 
     const schedulerConfig = {
@@ -172,6 +188,10 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       },
       schedulerConfig,
       container.eventBus,
+      // v2.4.0 distributed-correctness fix: scope every scheduler pickup query
+      // to THIS engine's workflowId so a per-engine scheduler in a
+      // multi-workflow deployment never claims/executes a foreign workflow's run.
+      definition.id,
     );
 
     // Register in global workflow registry for child workflow lookup
@@ -400,6 +420,16 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   async execute(runId: string): Promise<WorkflowRun<TContext>> {
     let run = await this.getOrThrow(runId);
 
+    // workflowId routing guard (v2.4.0 distributed-correctness fix). The run
+    // may belong to a DIFFERENT workflow than this engine (e.g. a manual call,
+    // or — pre-scoping — a foreign run a scheduler picked up). Running this
+    // engine's step graph against a foreign run causes step-not-found/wrong-
+    // handler corruption, so route to the owning engine or no-op. Returns the
+    // delegate's result when routed; falls through to local execution when the
+    // run is ours (workflowId matches). See `routeForeignRun`.
+    const routed = await this.routeForeignRun(run, (engine) => engine.execute(runId));
+    if (routed.handled) return routed.result as WorkflowRun<TContext>;
+
     // Version pinning — if the run was created against a different
     // definition version that's also registered, route execution to that
     // engine instead. The host can swap engines at deploy time without
@@ -606,6 +636,57 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     return run;
   }
 
+  /**
+   * workflowId routing guard (v2.4.0 distributed-correctness fix).
+   *
+   * Defense-in-depth companion to the scheduler-query scoping: even a direct
+   * or manual call to `execute`/`executeRetry`/`recoverStale`/`resume` with a
+   * run that belongs to a DIFFERENT workflow must NOT run this engine's step
+   * graph against it. This decides ownership and either delegates to the
+   * owning engine or no-ops.
+   *
+   * Returns `{ handled: false }` when the run is OURS (`workflowId` matches
+   * this engine's definition id) — the caller proceeds with local execution.
+   *
+   * Returns `{ handled: true, result }` when the run is FOREIGN:
+   *   - If an engine is registered for the run's `workflowId` (version-pinned
+   *     via `lookupVersion(workflowId, definitionVersion)` first, falling back
+   *     to the active `getEngine(workflowId)`), delegate to it via `delegate`
+   *     and return its result.
+   *   - If NO engine is registered for that workflowId, no-op (`result: null`):
+   *     we must never execute a foreign run, and there's no correct engine to
+   *     hand it to. The scheduler/caller treats `null` as "not mine."
+   *
+   * Does NOT break legitimate cross-engine child/branchJoin flows: those
+   * reconciliation paths only ever invoke `resume` on the PARENT run through
+   * the PARENT engine (whose workflowId matches the parent run), and child
+   * runs are driven by the child's own engine — so this guard always sees a
+   * matching workflowId on those calls and returns `{ handled: false }`.
+   */
+  private async routeForeignRun(
+    run: WorkflowRun<TContext>,
+    delegate: (engine: WorkflowEngine<unknown>) => Promise<unknown>,
+  ): Promise<{ handled: boolean; result?: unknown }> {
+    if (run.workflowId === this.definition.id) {
+      return { handled: false };
+    }
+
+    // Foreign run — resolve the owning engine, honouring version pinning.
+    const owner =
+      (run.definitionVersion
+        ? workflowRegistry.lookupVersion(run.workflowId, run.definitionVersion)
+        : undefined) ?? workflowRegistry.getEngine(run.workflowId);
+
+    if (owner && owner !== (this as unknown as WorkflowEngine<unknown>)) {
+      return { handled: true, result: await delegate(owner) };
+    }
+
+    // No engine registered for this foreign workflowId (or it resolved back to
+    // us, which shouldn't happen given the id mismatch above). Do NOT execute
+    // a foreign run on this engine's step graph — no-op.
+    return { handled: true, result: null };
+  }
+
   private shouldContinueExecution(run: WorkflowRun<TContext>): boolean {
     return run.status === 'running' && run.currentStepId !== null;
   }
@@ -677,7 +758,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       const shouldContinue = await this.handleTimerWait(runId, stepState.waitingFor.resumeAt);
       if (shouldContinue) {
         const refreshedRun = await this.getOrThrow(runId);
-        const updatedRun = await this.executor.resumeStep(refreshedRun, undefined);
+        const { run: updatedRun } = await this.executor.resumeStep(refreshedRun, undefined);
         this.container.cache.set(updatedRun);
         return true;
       }
@@ -691,6 +772,16 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       await this.handleChildWorkflowWait(runId, run);
       // Break — child completion drives the resume (in-process listener
       // when alive, scheduler reconciliation poll otherwise).
+      return false;
+    }
+
+    // Branch-join wait — fan out the parallel branch children (first entry)
+    // or reconcile their statuses against the join policy (re-entry / crash
+    // recovery). Mirrors the childWorkflow wait. See `handleBranchJoinWait`.
+    if (stepState.waitingFor?.type === 'branchJoin') {
+      await this.handleBranchJoinWait(runId, run);
+      // Break — branch completion drives the resume (in-process listener when
+      // alive, scheduler branch-join reconciliation poll otherwise).
       return false;
     }
 
@@ -715,18 +806,50 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   }
 
   /**
-   * Register in-process event-bus listeners that resume the parent when the
-   * child run completes/fails. Thin delegate to `./child-workflow.js`. The
-   * listeners are a fast-path optimisation, NOT the durability guarantee —
-   * the scheduler's child-waiting reconciliation sweep reclaims the wait
-   * after a crash.
+   * Handle a `branchJoin` wait — crash-durable. Thin delegate to
+   * `./parallel-steps.js` (`handleBranchJoinWait`). Fans out the branch
+   * children on first entry; reconciles their statuses against the join
+   * policy on re-entry (crash recovery / scheduler branch-join sweep). Resumes
+   * the parent via `this.resume(runId, joinResult)`, whose waiting→running
+   * claim makes listener + poll mutually exclusive.
    */
-  private registerChildCompletionListeners(
+  private async handleBranchJoinWait(runId: string, run: WorkflowRun<TContext>): Promise<void> {
+    return handleBranchJoinWait(this, runId, run);
+  }
+
+  /**
+   * Fail a `branchJoin` step under `policy:'all'` when a branch failed, then
+   * drive saga compensation of prior completed steps. Public so
+   * `./parallel-steps.js` (`handleBranchJoinWait`) can call it via the
+   * `BranchJoinEngine` view.
+   *
+   * Atomicity: claim `waiting → running` first (so a concurrent listener / a
+   * second poller that would resume the same step loses and no-ops), then
+   * write step `failed` + run `failed` via narrow `$set`, emit the standard
+   * `workflow:failed` event, run compensation, and tear down listeners on a
+   * terminal outcome. Returns false when this caller lost the claim.
+   */
+  async failBranchJoinStep(
     runId: string,
-    childRunId: string,
-    childEngine: WorkflowEngine<unknown>,
-  ): void {
-    registerChildCompletionListeners(this, runId, childRunId, childEngine);
+    error: { message: string; code?: string },
+  ): Promise<boolean> {
+    // The CAS + narrow fail-write (the durable, race-safe portion) lives in
+    // `./parallel-steps.js`. It returns false when another driver won the
+    // waiting→running claim (no-op). On success we run the SAME terminal
+    // handling as `execute()`'s post-loop: drive saga compensation of prior
+    // completed steps, then tear down listeners/hooks on a terminal outcome.
+    const claimed = await writeBranchJoinFailure(this, runId, error);
+    if (!claimed) return false;
+
+    let run = await this.getOrThrow(runId);
+    if (run.status === 'failed' && this.options.compensationHandlers) {
+      run = await this.runCompensation(run);
+    }
+    if (isTerminalState(run.status)) {
+      cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
+      hookRegistry.unregister(runId);
+    }
+    return true;
   }
 
   // ============ Wait Handlers ============
@@ -898,6 +1021,19 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   async resume(runId: string, payload?: unknown): Promise<WorkflowRun<TContext>> {
     const run = await this.getOrThrow(runId);
 
+    // workflowId routing guard (v2.4.0). If this run belongs to a different
+    // workflow, delegate to its owning engine (preserving the payload) or
+    // no-op — never resume a foreign run on this engine's step graph. NOTE:
+    // legitimate cross-engine flows are SAFE here because they only ever call
+    // resume on runs of their OWN workflowId: the childWorkflow/branchJoin
+    // helpers resume the PARENT run via the parent engine (`engine.resume`),
+    // and the parent engine's workflowId == the parent run's workflowId. The
+    // CHILD runs are advanced by the child's own engine. So this guard routes
+    // only genuinely-foreign calls and leaves parent/child reconciliation
+    // untouched.
+    const routed = await this.routeForeignRun(run, (engine) => engine.resume(runId, payload));
+    if (routed.handled) return routed.result as WorkflowRun<TContext>;
+
     // Atomic claim: clear paused flag with guard to prevent concurrent resume race.
     // Two workers calling resume() simultaneously — only one wins the atomic claim.
     //
@@ -974,11 +1110,31 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         return (await this.get(runId)) ?? run;
       }
 
+      // Branch-join wait, no payload — crash-durable reconciliation poll
+      // (scheduler's branch-join sweep calls `resume(runId)` with no payload).
+      // Re-read all branch children, evaluate the join quorum, and resume only
+      // when satisfied; otherwise stay `waiting` and bump the cadence. Routing
+      // it through `resumeStep(undefined)` would WRONGLY complete the step with
+      // an undefined result before the branches finished. In-process listeners
+      // and quorum-met reconciles pass the JoinResult payload and fall through.
+      if (
+        stepState?.status === 'waiting' &&
+        stepState.waitingFor?.type === 'branchJoin' &&
+        payload === undefined
+      ) {
+        await this.handleBranchJoinWait(runId, run);
+        return (await this.get(runId)) ?? run;
+      }
+
       // If step is 'waiting' (explicit wait/sleep/waitFor), complete it with payload
       if (stepState?.status === 'waiting') {
         cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
-        const updatedRun = await this.executor.resumeStep(run, payload);
+        const { run: updatedRun, won } = await this.executor.resumeStep(run, payload);
         this.container.cache.set(updatedRun);
+        // Lost the resume CAS to a concurrent resume — the winner already
+        // advanced + drove execution. Do NOT re-drive (would double-execute
+        // the next step). Return the freshest persisted state as a no-op.
+        if (!won) return updatedRun;
         return this.execute(runId);
       }
     }
@@ -1006,6 +1162,19 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     runId: string,
     staleThresholdMs: number,
   ): Promise<WorkflowRun<TContext> | null> {
+    // workflowId routing guard (v2.4.0). Cheap pre-read by id to decide
+    // ownership BEFORE the CAS claim — workflowId is immutable, so the pre-read
+    // is race-free for the routing decision even though the run's status may
+    // change before the claim (the claim's CAS still guards that). Route a
+    // foreign run to its owning engine's recoverStale, or no-op if none.
+    const peek = await this.container.repository.getById(runId, { bypassTenant: true });
+    if (peek) {
+      const routed = await this.routeForeignRun(peek as WorkflowRun<TContext>, (engine) =>
+        engine.recoverStale(runId, staleThresholdMs),
+      );
+      if (routed.handled) return routed.result as WorkflowRun<TContext> | null;
+    }
+
     const staleTime = new Date(Date.now() - staleThresholdMs);
 
     // Atomic claim: Only recover if status is 'running' AND heartbeat is stale.
@@ -1067,6 +1236,29 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    */
   async executeRetry(runId: string): Promise<WorkflowRun<TContext> | null> {
     const now = new Date();
+
+    // workflowId routing guard (v2.4.0 distributed-correctness fix).
+    //
+    // executeRetry historically claimed BLIND (by runId only, no workflowId
+    // guard), so engine B picking up engine A's retry/scheduled/concurrency
+    // draft would CAS-claim it and run B's step graph → A's run fails with
+    // step-not-found. We close that with a cheap PRE-READ (getById by runId,
+    // bypassTenant) to learn the run's workflowId BEFORE the CAS.
+    //
+    // Why pre-read rather than claim-then-verify-then-route: claim-then-verify
+    // would have ALREADY transitioned the foreign run to `running` under the
+    // wrong engine before we noticed — we'd then have to roll it back, a race.
+    // The pre-read is safe because `workflowId` is IMMUTABLE: the routing
+    // decision can't be invalidated by a concurrent status change. The actual
+    // claim below still uses the atomic CAS, so concurrent retriers of the
+    // SAME (correct) engine still resolve to exactly one winner.
+    const peek = await this.container.repository.getById(runId, { bypassTenant: true });
+    if (peek) {
+      const routed = await this.routeForeignRun(peek as WorkflowRun<TContext>, (engine) =>
+        engine.executeRetry(runId),
+      );
+      if (routed.handled) return routed.result as WorkflowRun<TContext> | null;
+    }
 
     // All three claim attempts below use `assertAndClaim` — runs
     // `RUN_MACHINE.assertTransition` (sync, in-memory) before each Mongo
@@ -1239,6 +1431,11 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Abort any in-flight step handlers (fulfills ctx.signal contract)
     this.executor.abortWorkflow(runId);
 
+    // If the run is parked on a branchJoin wait, cancel its branch children so
+    // cancelling the parent doesn't orphan N still-running child workflows
+    // (which burn compute until TTL). Tolerant of already-terminal children.
+    await cancelBranchChildren(run);
+
     // Send ONLY the narrow update fields. Spreading the whole `run` into
     // updateById causes mongoose 9's update-cast to coerce the embedded
     // `steps[]` plain objects into Subdocument instances IN PLACE on the
@@ -1324,6 +1521,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         },
         currentConfig,
         this.container.eventBus,
+        // Keep the engine-scoping filter on reconfigure (see constructor).
+        this.definition.id,
       );
 
       // Re-set callbacks
