@@ -685,7 +685,11 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     return (await this.getOne(
       {
         idempotencyKey: key,
-        status: { $nin: ['done', 'failed', 'cancelled'] },
+        // Active-state allowlist — MUST mirror the partial-unique index's
+        // active set (run.model.ts) so a SETTLED saga run (compensated /
+        // compensation_failed) is treated as reusable, not active; otherwise
+        // start({ idempotencyKey }) would return an old settled run.
+        status: { $in: ['draft', 'running', 'waiting', 'compensating'] },
       },
       {
         ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
@@ -703,7 +707,11 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
       {
         workflowId,
         concurrencyKey,
-        status: { $in: ['running', 'waiting'] },
+        // `compensating` holds a slot too (mirrors SLOT_HOLDING_STATUSES in
+        // concurrency-counter.repository + the idempotency-index active set).
+        // Omitting it let a draft be promoted over the limit while prior runs
+        // were still rolling back — over-promotion / strict-cap oversubscription.
+        status: { $in: ['running', 'waiting', 'compensating'] },
       },
       {
         ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),

@@ -87,7 +87,16 @@ export async function handleChildWorkflowWait<TContext>(
 
   // ---- First entry: no child started yet ----
   if (!data.childRunId) {
-    const childRun = await childEngine.start(data.childInput);
+    // Deterministic idempotency key — a crash AFTER start() but BEFORE the
+    // separate $set of childRunId would otherwise re-spawn a 2nd child on
+    // re-entry. The key makes the child's partial-unique index return the
+    // race-winner instead of inserting a duplicate (mirrors branchJoin's
+    // `branchIdempotencyKey` in ./parallel-steps.ts).
+    const childIdempotencyKey = `${data.parentRunId}:${data.parentStepId}:childWorkflow`;
+    const childRun = await childEngine.start(data.childInput, {
+      idempotencyKey: childIdempotencyKey,
+      bypassTenant: true,
+    });
 
     // Persist childRunId AND the initial reconcile cadence in one write so
     // a crash immediately after start still leaves a poll-reclaimable wait.

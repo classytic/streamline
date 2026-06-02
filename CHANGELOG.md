@@ -97,6 +97,40 @@ is the thin orchestrator. No public API or behavior change.
   counters (was documented but missing).
 - **`scheduler.inMemoryTimers` opt-out** — set `false` to rely purely on DB
   polling for resumes (bounded timers for high-scale deployments). Default `true`.
+- **Strict-concurrency cold-bucket under-admission (was misdiagnosed as a flaky
+  test).** `claimSlot` treated *any* E11000 as "at limit"; on a cold bucket a
+  concurrent racer collided on the just-inserted counter doc and was wrongly
+  rejected though `count < limit`. Now the duplicate-key branch retries a
+  non-upsert guarded increment before deciding the bucket is full.
+- **Idempotency lookup now matches the partial-unique index.** `findActiveByIdempotencyKey`
+  used `$nin:['done','failed','cancelled']`, which wrongly treated settled saga
+  runs (`compensated`/`compensation_failed`) as active — so `start({idempotencyKey})`
+  could return an old settled run. Switched to the active allowlist
+  `['draft','running','waiting','compensating']`.
+- **`shutdown()` now tears down the 5 slot-release bus listeners.** They were
+  registered once in the constructor and never removed; recreating an engine for
+  the same `workflowId` on a shared bus left the old listener live, double-releasing
+  a new run's slot.
+- **childWorkflow first-entry double-spawn fixed** — the child is now started with
+  a deterministic idempotency key (mirrors branchJoin), so a crash before the
+  `childRunId` write can't spawn the child twice.
+- **childWorkflow/branchJoin wedge-forever fixed** — `handleWait` stamps an initial
+  `nextReconcileAt`, so the reclaim sweep can recover a wait even if the process
+  crashed before the handler ran.
+- **`workflow:completed` now persists-before-emit**; saga slot released only at a
+  compensation-terminal state (held through rollback), idempotent per run;
+  `compensating` counted in the best-effort active cap; `recoverStale` uses
+  `$unset` (not the driver-dropped `$set: undefined`) to clear `startedAt`.
+
+### Packaging (publish blockers cleared)
+
+- `@classytic/{mongokit,primitives,repo-core}` moved to **peerDependencies only**
+  (removed from `dependencies`) — a dual declaration risked a duplicate nested
+  copy and split `Repository`/`HttpError` class identity across the host boundary.
+- `WorkflowConcurrencyCounterRepository` + `workflowConcurrencyCounterRepository`
+  + `makeCounterId` + `WorkflowConcurrencyCounter` are now exported from the package
+  entry, so the documented `reconcile()` drift-recovery primitive is reachable.
+- Added `.gitattributes` (`* text=auto eol=lf`) to prevent CRLF diff churn.
 
 ### Known limitations / operating guidance
 

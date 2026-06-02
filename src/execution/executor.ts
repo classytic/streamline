@@ -530,6 +530,16 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     signal: WaitSignal,
   ): Promise<WorkflowRun<TContext>> {
     const signalData = signal.data as WaitSignalData | undefined;
+
+    // childWorkflow / branchJoin waits are reclaimed by the scheduler's
+    // reconciliation sweeps, which only match when
+    // `waitingFor.nextReconcileAt <= now`. The handlers stamp that field, but
+    // if the process crashes BETWEEN this wait-write and the handler running,
+    // nextReconcileAt would never be set and the run would dead-wait forever
+    // (no sweep ever matches it). Stamp an initial `now` so the run is always
+    // reclaimable even if its handler never ran. Other wait types (timer/event/
+    // human/webhook) are woken by their own mechanisms and don't need this.
+    const needsReconcileSeed = signal.type === 'childWorkflow' || signal.type === 'branchJoin';
     const stepState = await this.updateStepState(run, stepId, {
       status: 'waiting',
       waitingFor: {
@@ -538,6 +548,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         resumeAt: signalData?.resumeAt,
         eventName: signalData?.eventName,
         data: signal.data,
+        ...(needsReconcileSeed ? { nextReconcileAt: new Date() } : {}),
       },
     });
 
@@ -831,8 +842,6 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       updates.currentStepId = null;
       updates.status = 'done';
       updates.endedAt = run.endedAt;
-
-      this.eventBus.emit('workflow:completed', { runId: run._id, data: run.output });
     }
 
     run.updatedAt = updates.updatedAt as Date;
@@ -851,6 +860,18 @@ export class StepExecutor<TContext = Record<string, unknown>> {
           runId: run._id,
         });
       }
+    }
+
+    // Emit AFTER the terminal write acknowledges (durable-state-before-emit).
+    // Emitting `workflow:completed` before the `{status:'done', output}` write
+    // (the prior ordering) opened a crash window where listeners — including
+    // the strict-concurrency slot-release listener (engine.ts) and any caller
+    // resolving on completion — fired while the run was still `running`. A
+    // crash in that window left recovery to re-run completion → a 2nd emit + a
+    // 2nd slot release. Persisting first guarantees every observer of
+    // `workflow:completed` reads a durable `done` run with `output` set.
+    if (run.status === 'done' && result.modifiedCount > 0) {
+      this.eventBus.emit('workflow:completed', { runId: run._id, data: run.output });
     }
 
     return run;

@@ -51,6 +51,18 @@ export { createHook, hookToken, resumeHook } from './features/hooks.js';
 // Storage & Database - MongoDB Models & Repositories
 // ============================================================================
 
+export type { WorkflowConcurrencyCounter } from './storage/concurrency-counter.model.js';
+export { makeCounterId } from './storage/concurrency-counter.model.js';
+/**
+ * Strict-concurrency slot counter. Exported so hosts can call
+ * `reconcile(workflowId, concurrencyKey?)` to repair leaked counters (the
+ * documented drift-recovery primitive) and so the
+ * `ContainerOptions.concurrencyCounterRepository` override type is nameable.
+ */
+export {
+  WorkflowConcurrencyCounterRepository,
+  workflowConcurrencyCounterRepository,
+} from './storage/concurrency-counter.repository.js';
 export type { WorkflowDefinitionDoc } from './storage/definition.model.js';
 /**
  * Optional: WorkflowDefinition storage for versioning and auditing.

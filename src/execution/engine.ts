@@ -156,6 +156,17 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     { listener: (...args: unknown[]) => void; eventName: string }
   >();
 
+  /**
+   * Run ids whose strict-concurrency slot has already been released. Guarantees
+   * a run's slot is decremented AT MOST ONCE across the multiple terminal-ish
+   * events it can emit (e.g. `failed` → `compensated`, or a re-emit after
+   * crash recovery). See the `releaseSlotOnTerminal` listener.
+   */
+  private readonly releasedSlots = new Set<string>();
+
+  /** Teardown for the 5 `releaseSlotOnTerminal` bus listeners; invoked by `shutdown()`. */
+  private removeSlotReleaseListeners?: () => void;
+
   /** Exposed for hook registry and external access */
   readonly container: StreamlineContainer;
 
@@ -235,11 +246,41 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       if (!payload.runId) return;
       try {
         const run = await this.container.repository.getById(payload.runId);
-        const counterId = (run?.meta as Record<string, unknown> | undefined)
-          ?.concurrencyCounterId as string | undefined;
-        if (counterId) {
-          await this.container.concurrencyCounterRepository.releaseSlot(counterId);
-        }
+        if (!run) return;
+
+        // (H3) Multi-engine guard: on a SHARED container / global bus, every
+        // engine's listener receives every terminal event. Without this guard
+        // two engines would both decrement the counter for ONE terminal event
+        // (double-release). Only the engine that OWNS the workflow releases.
+        if (run.workflowId !== this.definition.id) return;
+
+        // Saga slot timing: a saga run emits `workflow:failed` and then enters
+        // `compensating` (which STILL holds its slot — see SLOT_HOLDING_STATUSES).
+        // Releasing on `failed` would free the slot mid-rollback and
+        // oversubscribe a strict cap. So:
+        //   - `failed` releases ONLY when the run will NOT compensate
+        //     (no compensation handlers configured). With handlers, the slot
+        //     is released later on `compensated`/`compensation_failed`.
+        //   - `compensating` never releases (slot held through rollback).
+        //   - all other terminal states (done/cancelled/compensated/
+        //     compensation_failed) release.
+        if (run.status === 'compensating') return;
+        if (run.status === 'failed' && this.options.compensationHandlers) return;
+
+        const counterId = (run.meta as Record<string, unknown> | undefined)?.concurrencyCounterId as
+          | string
+          | undefined;
+        if (!counterId) return;
+
+        // Idempotent per run: a run's slot is released AT MOST ONCE, even
+        // though several terminal-ish events can fire for it (failed→compensated,
+        // or a re-emit after crash-recovery). releaseSlot itself is guarded
+        // (count > 0), but this Set stops a legitimate later run reusing the
+        // same counterId bucket from being decremented by THIS run's stale event.
+        if (this.releasedSlots.has(payload.runId)) return;
+        this.releasedSlots.add(payload.runId);
+
+        await this.container.concurrencyCounterRepository.releaseSlot(counterId);
       } catch (err) {
         // Release failures are diagnostic — the counter will drift +1 until
         // reconciled. Don't crash the event-bus listener loop.
@@ -253,6 +294,20 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     this.container.eventBus.on('workflow:completed', releaseSlotOnTerminal);
     this.container.eventBus.on('workflow:failed', releaseSlotOnTerminal);
     this.container.eventBus.on('workflow:cancelled', releaseSlotOnTerminal);
+    this.container.eventBus.on('workflow:compensated', releaseSlotOnTerminal);
+    this.container.eventBus.on('workflow:compensation_failed', releaseSlotOnTerminal);
+    // Store a teardown so shutdown() removes these 5 listeners. Without it,
+    // recreating an engine for the same workflowId leaves the OLD engine's
+    // listener live on the shared bus — it still matches the H3
+    // `run.workflowId === this.definition.id` guard and would double-release a
+    // slot for a NEW run, undercounting the strict counter.
+    this.removeSlotReleaseListeners = () => {
+      this.container.eventBus.off('workflow:completed', releaseSlotOnTerminal);
+      this.container.eventBus.off('workflow:failed', releaseSlotOnTerminal);
+      this.container.eventBus.off('workflow:cancelled', releaseSlotOnTerminal);
+      this.container.eventBus.off('workflow:compensated', releaseSlotOnTerminal);
+      this.container.eventBus.off('workflow:compensation_failed', releaseSlotOnTerminal);
+    };
 
     this.options = { autoExecute: true, ...options };
   }
@@ -1216,7 +1271,15 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           {
             $set: {
               [`steps.${stepIndex}.status`]: 'pending',
-              [`steps.${stepIndex}.startedAt`]: undefined,
+            },
+            // `$set: { startedAt: undefined }` is DROPPED by the Mongo driver
+            // (undefined is stripped from the update doc), so startedAt would
+            // survive and the re-run would compute a wrong durationMs measured
+            // from the FIRST attempt. `$unset` actually clears it (matches the
+            // sibling reset in executor.claimStepExecution, which re-stamps a
+            // fresh startedAt on the next claim).
+            $unset: {
+              [`steps.${stepIndex}.startedAt`]: '',
             },
           },
           { bypassTenant: true },
@@ -1559,6 +1622,10 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       }
     }
     this.eventListeners.clear();
+
+    // Remove the concurrency slot-release listeners (registered once in the
+    // constructor; not tracked in `eventListeners`).
+    this.removeSlotReleaseListeners?.();
 
     // Remove from the global registry — without this, a v2 engine resuming
     // a v1 run would still route execution to a v1 engine the host has
