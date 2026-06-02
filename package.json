@@ -34,8 +34,9 @@
     "test": "vitest run --project unit --project integration",
     "test:unit": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
-    "test:e2e": "vitest run --project e2e",
-    "test:all": "vitest run",
+    "test:e2e": "npm run test:long",
+    "test:long": "vitest run --project long",
+    "test:all": "npm run test && npm run test:long",
     "test:watch": "vitest --project unit --project integration",
     "test:coverage": "vitest run --project unit --project integration --coverage",
     "lint": "biome check src/",
@@ -117,9 +118,6 @@
     "vitest": "^4.0.0"
   },
   "dependencies": {
-    "@classytic/mongokit": ">=3.14.0",
-    "@classytic/primitives": ">=0.6.0",
-    "@classytic/repo-core": ">=0.5.0",
     "luxon": "^3.0.0",
     "semver": "^7.0.0"
   }

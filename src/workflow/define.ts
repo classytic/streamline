@@ -897,6 +897,21 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     let counterClaimed: { id: string } | undefined;
     if (config.concurrency?.limit !== undefined && concurrencyKey !== undefined) {
       if (config.concurrency.strict) {
+        // Idempotency-dedup pre-check (BEFORE claimSlot). With strict
+        // concurrency + an idempotencyKey, claiming a slot here and then
+        // calling engine.start would leak the slot when start short-circuits
+        // to an already-active run (engine.ts returns it WITHOUT throwing, so
+        // the catch-based releaseSlot below never fires). The counter would
+        // drift +1 per duplicate submit — for limit:1 the bucket wedges after
+        // the first dedup. Returning the existing active run here means we
+        // never claim a second slot for a logical run that already holds one.
+        if (idempotencyKey !== undefined) {
+          const existing = await container.repository.findActiveByIdempotencyKey(
+            idempotencyKey,
+            tenantOpts,
+          );
+          if (existing) return existing as WorkflowRun<TContext>;
+        }
         const counterId = makeCounterId(definition.id, concurrencyKey);
         const ok = await container.concurrencyCounterRepository.claimSlot(
           counterId,

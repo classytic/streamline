@@ -12,13 +12,13 @@ needs, not where the source file lives.
 |---|---|---|---|---|
 | **unit** | `test/unit/`, plus `test/core/`\* | pure functions, mocks, in-memory stores | **10 s** | every commit, watch |
 | **integration** | `test/integration/`, `test/plugins/`, `test/scheduling/`, `test/security/`, `test/telemetry/` | `mongodb-memory-server`, scripted MongoKit repos | **30 s** | every commit, pre-push |
-| **e2e** | `test/e2e/`, `test/regression/`, `test/pagination/`, `test/review/` | full workflow scenarios, real timing, scheduler polls | **120 s** | nightly, on-demand |
+| **long** | selected slow integration files, `test/e2e/`, `test/regression/`, `test/pagination/`, `test/core/`, `test/review/` | full workflow scenarios, real timing, scheduler polls | **120 s** | nightly, on-demand |
 
-\* `test/core/` intentionally lives in the e2e tier today — it exercises
+\* `test/core/` intentionally lives in the long tier today — it exercises
 the engine end-to-end.
 
 **Invariant:** unit + integration must run with **no network, no API keys,
-no live MongoDB**. If a test needs any of those, it belongs in e2e.
+no live MongoDB**. If a test needs any of those, it belongs in the long tier.
 
 ## Scripts
 
@@ -26,7 +26,8 @@ no live MongoDB**. If a test needs any of those, it belongs in e2e.
 pnpm test               # unit + integration (fast CI path, ~20 s)
 pnpm test:unit          # unit only, ~5 s
 pnpm test:integration   # integration only, ~20 s
-pnpm test:e2e           # e2e only, ~2-3 min (mongodb-memory-server)
+pnpm test:long          # slow integration + e2e/regression scenarios
+pnpm test:e2e           # alias for test:long
 pnpm test:all           # everything
 pnpm test:watch         # unit + integration in watch mode
 pnpm test:coverage      # unit + integration with coverage report
@@ -36,13 +37,13 @@ pnpm test:coverage      # unit + integration with coverage report
 - `pnpm test` (no args) never runs e2e. Keep it under 30 s on a dev laptop
   — if it crosses that, the next thing developers do is stop running tests
   locally.
-- CI runs `pnpm test` on PRs. `pnpm test:e2e` runs nightly.
-- `pnpm prepublishOnly` runs `test:all` (unit + integration + e2e + build)
+- CI runs `pnpm test` on PRs. `pnpm test:long` runs nightly.
+- `pnpm prepublishOnly` runs `test:all` (unit + integration + long + build)
   so releases see the full suite.
 
 ## Config
 
-One [vitest.config.ts](./vitest.config.ts) with `projects: [unit, integration, e2e]`.
+One [vitest.config.ts](./vitest.config.ts) with `projects: [unit, integration, long]`.
 Tier-specific timeouts live on each project; global options (coverage,
 `setupFiles`) are inherited via `extends: true`.
 
@@ -51,7 +52,7 @@ Tier-specific timeouts live on each project; global options (coverage,
 projects: [
   { extends: true, test: { name: 'unit', testTimeout: 10_000, ... } },
   { extends: true, test: { name: 'integration', testTimeout: 30_000, ... } },
-  { extends: true, test: { name: 'e2e', testTimeout: 120_000, ... } },
+  { extends: true, test: { name: 'long', testTimeout: 120_000, ... } },
 ]
 ```
 
@@ -131,7 +132,7 @@ describe('my feature', () => {
 From testing-infrastructure.md §10, before a PR:
 
 - [ ] `pnpm test` green in < 30 s.
-- [ ] At least one **scenario** test in e2e exercising the feature's main
+- [ ] At least one **scenario** test in the long tier exercising the feature's main
       primitive end-to-end (not a unit test in disguise).
 - [ ] No `.skip` without a `TODO(issue#N)` comment.
 - [ ] No `any` in test files — `unknown` + narrowing, or explicit
@@ -156,8 +157,8 @@ From testing-infrastructure.md §10, before a PR:
 pnpm vitest run --project integration test/integration/smoke.test.ts
 
 # By pattern
-pnpm vitest run --project e2e -t "idempotency"
-pnpm vitest run --project e2e test/e2e/distributed-*
+pnpm vitest run --project long -t "idempotency"
+pnpm vitest run --project long test/e2e/distributed-*
 
 # Watch a single tier during development
 pnpm vitest --project unit

@@ -61,9 +61,12 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
    *   2. If filter matches existing doc: increment. Returns updated doc.
    *   3. If filter matches no doc (first call ever): upsert inserts a
    *      fresh counter with `count: 1`. Returns inserted doc.
-   *   4. If existing doc has `count >= limit`: filter doesn't match
-   *      existing, upsert tries to insert, hits E11000 unique `_id`
-   *      collision, we catch and return `false`.
+   *   4. If existing doc has `count >= limit`: filter doesn't match, upsert
+   *      collides on `_id` (E11000); the catch retries a non-upsert guarded
+   *      increment — still no match at the cap, so it returns `false`.
+   *   5. Cold-bucket race: two concurrent first-calls both upsert; one inserts
+   *      `count:1`, the other gets E11000 and the retry admits it iff
+   *      `count < limit` (fixes first-burst under-admission).
    *
    * `limit` is also stored in the doc (`$setOnInsert`) for diagnostics
    * — the runtime decision still uses the value passed here, so a
@@ -89,9 +92,20 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
       );
       return result !== null;
     } catch (err) {
-      // E11000 = unique `_id` collision when filter rejected the existing
-      // doc and upsert tried to insert. That's the at-limit signal.
-      if (this.isDuplicateKeyError(err)) return false;
+      // E11000 means a CONCURRENT claim just inserted the counter doc
+      // (cold-bucket race): our `{count:{$lt:limit}}` filter matched no doc
+      // (none existed yet), upsert tried to insert, and collided on `_id`.
+      // The doc now EXISTS, so the bucket is NOT necessarily full — retry the
+      // guarded increment WITHOUT upsert. It admits when count<limit, and only
+      // returns null (→ false) if the racer's insert already reached the cap.
+      if (this.isDuplicateKeyError(err)) {
+        const retried = await this.findOneAndUpdate(
+          { _id: id, count: { $lt: limit } },
+          { $inc: { count: 1 }, $set: { updatedAt: now } },
+          { returnDocument: 'after' },
+        );
+        return retried !== null;
+      }
       throw err;
     }
   }

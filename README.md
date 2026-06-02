@@ -538,7 +538,8 @@ See [docs/examples/](./docs/examples): hello-world, wait, sleep, parallel, condi
 
 ```bash
 npm test                # unit + integration (fast)
-npm run test:e2e        # full scenarios (slow)
+npm run test:long       # slow integration + full scenarios
+npm run test:e2e        # alias for test:long
 npm run test:all        # everything
 ```
 

@@ -6,11 +6,20 @@ import { defineConfig } from 'vitest/config';
  * Tiers:
  *   unit         — pure functions, no DB, <10s
  *   integration  — mongo-memory-server, no network, <30s
- *   e2e          — full scenarios, mongo-memory-server, <120s
+ *   long         — slow full scenarios, real timers, scheduler polls, <120s
  *
  * `pnpm test` runs unit + integration only (fast CI path).
- * `pnpm test:e2e` runs the slow tier on demand / nightly.
+ * `pnpm test:long` runs the slow tier on demand / nightly.
  */
+const longIntegrationFiles = [
+  'test/integration/bind-failure-to.test.ts',
+  'test/integration/contract-scenarios.test.ts',
+  'test/integration/hardening-logs-timers.test.ts',
+  'test/integration/smoke.test.ts',
+  'test/integration/strict-concurrency-scenarios.test.ts',
+  'test/security/input-validation.test.ts',
+];
+
 export default defineConfig({
   test: {
     globals: true,
@@ -44,6 +53,7 @@ export default defineConfig({
             'test/security/**/*.test.ts',
             'test/telemetry/**/*.test.ts',
           ],
+          exclude: longIntegrationFiles,
           testTimeout: 30_000,
           hookTimeout: 60_000, // mongodb-memory-server first-download tax
           // mongoose + mongodb-memory-server share a connection — fork once.
@@ -60,8 +70,9 @@ export default defineConfig({
       {
         extends: true,
         test: {
-          name: 'e2e',
+          name: 'long',
           include: [
+            ...longIntegrationFiles,
             'test/e2e/**/*.test.ts',
             'test/regression/**/*.test.ts',
             'test/pagination/**/*.test.ts',
