@@ -132,6 +132,15 @@ is the thin orchestrator. No public API or behavior change.
   entry, so the documented `reconcile()` drift-recovery primitive is reachable.
 - Added `.gitattributes` (`* text=auto eol=lf`) to prevent CRLF diff churn.
 
+### Testing tiers
+
+The suite is split into three vitest projects: **dev loop** `npm test` (unit +
+integration, fast), **before publish** `npm run test:all` (unit + integration +
+long — what `prepublishOnly` runs), and **nightly / slow CI** `npm run test:long`
+(long-running scenarios only). New v2.4 regression coverage: saga compensation
+(11 scenarios), parallel/join, multi-workflow isolation, output-history,
+strict-concurrency fixes, childWorkflow correctness (incl. terminal-child adopt).
+
 ### Known limitations / operating guidance
 
 streamline is multi-worker-capable and durable on a single cluster, but it is

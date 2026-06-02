@@ -1,5 +1,30 @@
 # Pre-Publish Checklist
 
+> **Follow the "Release flow (v2.4.0+)" section directly below.** The detailed
+> sections further down are from the initial 0.1.0 release and are partly stale
+> (version numbers, test counts, `tsup`).
+
+## Release flow (v2.4.0+)
+
+### Test tiers
+- **dev loop:** `npm test` — unit + integration (fast)
+- **before publish:** `npm run test:all` — unit + integration + long (the full gate; `prepublishOnly` runs this)
+- **nightly / slow CI:** `npm run test:long` — long-running scenarios only
+
+### Pre-publish steps
+1. **Bump `package.json` version** AND commit `package-lock.json` at the same version — run `npm install` to refresh it, then confirm `node -e "console.log(require('./package-lock.json').version)"` matches `package.json`.
+2. **Update `CHANGELOG.md`** — a dated entry for the release (e.g. the strict-concurrency / saga / childWorkflow hardening for 2.4.0).
+3. **Confirm tarball contents:** `npm pack --dry-run` — must ship `dist/` + `README.md` + `LICENSE` only (no `src/`, `test/`, `docs/`).
+4. **Run the full gate:** `npm run prepublishOnly` — runs `check` (biome) + `typecheck` + `test:all` + `build`. Must be 100% green.
+5. **Commit, tag, push:** `git tag v<version> && git push origin main --tags`.
+6. **Publish:** `npm publish --access public` (or `npm run release`).
+
+> Note: `@classytic/{mongokit,primitives,repo-core}` are **peerDependencies** (not runtime `dependencies`) — a dual declaration risks a duplicate nested copy + split `Repository`/`HttpError` identity. Don't add them back to `dependencies`.
+
+---
+
+_Initial-release (0.1.0) notes below — partly stale; follow the flow above._
+
 Before running `npm publish`, verify everything is ready:
 
 ## ✅ Package Files

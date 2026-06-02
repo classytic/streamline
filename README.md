@@ -35,6 +35,29 @@ What you give up:
 
 If your workload is "background jobs and multi-step workflows on a Mongo-backed app," this is the right trade. If you need deterministic replay across language boundaries or month-long orchestrators, reach for Temporal/Inngest.
 
+## Guarantees (Mongo-native)
+
+streamline needs **only MongoDB**. Redis / Kafka / BullMQ are *optional* — for
+cross-process event wake and external fan-out — **never required** for
+correctness or durability.
+
+| Property | Guarantee |
+|---|---|
+| **Durable** | Run + step state is persisted to MongoDB with `{ w: 'majority', j: true }` before each transition is acknowledged. A crash/restart loses nothing committed; the scheduler resumes from the exact failed/incomplete step. |
+| **At-least-once step execution** | A step runs **at least once**. Crash recovery, retries, and stale-run reclaim can re-run a step whose side effects partially applied. The engine guarantees a step is *claimed* by exactly one worker at a time (atomic CAS) — not that its external side effects happen exactly once. |
+| **Idempotent handlers required** | Because execution is at-least-once, **step + `onCompensate` handlers must be idempotent** for any external side effect (charge, email, API write). Pass `ctx.idempotencyKey(scope?)` (stable across retries/recovery) as the provider's idempotency key. The engine gives effectively-once *for same-cluster Mongo writes* via atomic claims; external exactly-once is your handler + the key. |
+| **Exactly-once start (dedup)** | `start({ idempotencyKey })` yields at most one **active** run per key (partial-unique index). Reusable once the prior run settles (incl. `compensated`/`compensation_failed`). |
+| **Multiple workers** | Safe. Every scheduler pickup is `workflowId`-scoped + a routing guard, and every transition is an atomic compare-and-set, so two workers never double-drive a run or double-resume a step. Recovery is scheduler-**push** (a polling worker re-drives stale runs) — there is no explicit worker-lease protocol or pulled task queue. |
+| **Ordering** | Steps within a run run in order (`goto` / parallel-join are explicit exceptions). No global cross-run ordering guarantee. |
+| **Strict concurrency** | `concurrency: { limit, strict: true }` is a hard cap (atomic counter); plain `limit` is best-effort. Counters are global per `(workflowId, key)` — put the tenant in `key` for per-tenant caps; repair drift with `concurrencyCounterRepo.reconcile(workflowId, key?)`. |
+
+**Optional external infrastructure (and what each is *for*, not *required* for):**
+- **Redis / Kafka (signal store)** — only for `ctx.waitFor(event)` wake *across processes*. Same-process events need zero extra infra. Plug in via the `SignalStore` interface.
+- **BullMQ / external job queues** — not used and not needed; the scheduler + MongoDB *are* the durable queue.
+- **Monitoring / dashboards / DLQ UI** — consume the event bus (`step:*` / `workflow:*`) + OpenTelemetry hooks into your own stack.
+
+See [`docs/DISTRIBUTED-READINESS.md`](docs/DISTRIBUTED-READINESS.md) for operating at scale (timer opt-out, payload-size limits, per-tenant concurrency keys, BYO signal store).
+
 ## Quick start
 
 ```typescript
@@ -537,13 +560,13 @@ See [docs/examples/](./docs/examples): hello-world, wait, sleep, parallel, condi
 ## Testing your workflows
 
 ```bash
-npm test                # unit + integration (fast)
-npm run test:long       # slow integration + full scenarios
-npm run test:e2e        # alias for test:long
-npm run test:all        # everything
+npm test            # dev loop — unit + integration (fast)
+npm run test:all    # before publish — unit + integration + long (full gate; prepublishOnly runs this)
+npm run test:long   # nightly / slow CI — long-running scenarios only
 ```
 
-See [TESTING.md](./TESTING.md) for tier conventions + helpers.
+See [TESTING.md](./TESTING.md) for tier conventions + helpers, and
+[docs/contributing/PUBLISH_CHECKLIST.md](./docs/contributing/PUBLISH_CHECKLIST.md) for the release flow.
 
 ## What's new in 2.2
 
