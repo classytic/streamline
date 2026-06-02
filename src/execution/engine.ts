@@ -279,6 +279,13 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         // same counterId bucket from being decremented by THIS run's stale event.
         if (this.releasedSlots.has(payload.runId)) return;
         this.releasedSlots.add(payload.runId);
+        // Bound memory on a long-lived engine: a run's terminal events all fire
+        // within a short window, so evicting the oldest entries once the Set is
+        // large (10k runs) cannot cause a re-release of a still-relevant run.
+        if (this.releasedSlots.size > 10_000) {
+          const oldest = this.releasedSlots.values().next().value as string | undefined;
+          if (oldest !== undefined) this.releasedSlots.delete(oldest);
+        }
 
         await this.container.concurrencyCounterRepository.releaseSlot(counterId);
       } catch (err) {
@@ -1626,6 +1633,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Remove the concurrency slot-release listeners (registered once in the
     // constructor; not tracked in `eventListeners`).
     this.removeSlotReleaseListeners?.();
+    this.releasedSlots.clear();
 
     // Remove from the global registry — without this, a v2 engine resuming
     // a v1 run would still route execution to a v1 engine the host has
