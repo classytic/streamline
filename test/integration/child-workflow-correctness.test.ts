@@ -217,3 +217,91 @@ describe('childWorkflow wedge-forever (Finding #2)', () => {
     parent.shutdown();
   });
 });
+
+describe('childWorkflow adopt-terminal (convergence follow-up — terminal-child re-spawn window)', () => {
+  it('first-entry adopts an ALREADY-TERMINAL child by deterministic key instead of spawning a 2nd', async () => {
+    const container = createContainer();
+    const childWfId = uniqueId('adopt-child');
+    const parentWfId = uniqueId('adopt-parent');
+    const stepId = 'delegate';
+
+    let childStarts = 0;
+    const child = createWorkflow(childWfId, {
+      steps: {
+        work: async () => {
+          childStarts++;
+          return { ok: true };
+        },
+      },
+      container,
+      autoExecute: false,
+    });
+
+    const parent = createWorkflow<{ got?: unknown }>(parentWfId, {
+      steps: {
+        [stepId]: async (ctx) => ctx.startChildWorkflow(childWfId, { v: 1 }),
+        finish: async (ctx) => {
+          await ctx.set('got', ctx.getOutput(stepId));
+          return 'done';
+        },
+      },
+      context: () => ({}),
+      container,
+      autoExecute: false,
+    });
+
+    const parentRunId = uniqueId('adopt-parent-run');
+    const childKey = `${parentRunId}:${stepId}:childWorkflow`;
+
+    // Seed an ALREADY-TERMINAL child carrying the deterministic key — the shape
+    // after a crash post-start / pre-childRunId-write where the child ALSO
+    // finished before recovery re-entered. `findActiveByIdempotencyKey` excludes
+    // terminal states, so a plain start() would spawn a SECOND child; the
+    // adopt-by-any-status lookup must reuse this one.
+    const terminalChildId = uniqueId('adopt-child-run');
+    await WorkflowRunModel.create({
+      _id: terminalChildId,
+      workflowId: childWfId,
+      status: 'done',
+      idempotencyKey: childKey,
+      output: { ok: true, adopted: true },
+      steps: [
+        { stepId: 'work', status: 'done', attempts: 1, output: { ok: true, adopted: true } },
+      ],
+      currentStepId: 'work',
+      context: {},
+      input: { v: 1 },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      startedAt: new Date(),
+      endedAt: new Date(),
+    } as unknown as WorkflowRun);
+
+    await persistPreStartParent({
+      parentRunId,
+      parentWorkflowId: parentWfId,
+      allStepIds: [stepId, 'finish'],
+      stepId,
+      childWorkflowId: childWfId,
+      childInput: { v: 1 },
+    });
+
+    // First re-entry: must ADOPT the terminal child (not spawn a 2nd).
+    await parent.engine.resume(parentRunId);
+
+    const childRuns = await WorkflowRunModel.find({ workflowId: childWfId }).lean();
+    expect(childRuns).toHaveLength(1); // adopted, not duplicated
+    expect(childRuns[0]?._id).toBe(terminalChildId);
+    expect(childStarts).toBe(0); // the seeded terminal child's handler never re-ran
+
+    // Re-entry reconciles the (terminal) adopted child → parent resumes with its output.
+    await parent.engine.resume(parentRunId);
+    await waitUntil(async () => (await parent.get(parentRunId))?.status === 'done', 10_000);
+    const finalParent = await parent.get(parentRunId);
+    expect(finalParent?.status).toBe('done');
+    expect((finalParent?.context as { got?: { adopted?: boolean } })?.got?.adopted).toBe(true);
+
+    parent.shutdown();
+    child.shutdown();
+  });
+});
