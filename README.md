@@ -11,10 +11,10 @@ draft → running → waiting ↔ running → done
 ## Install
 
 ```bash
-npm install @classytic/streamline @classytic/mongokit @classytic/primitives mongoose
+npm install @classytic/streamline @classytic/mongokit @classytic/primitives @classytic/repo-core mongoose
 ```
 
-Peer deps: `@classytic/mongokit >=3.13`, `@classytic/primitives >=0.1`, `mongoose >=9.4.1`. Optional: `@opentelemetry/api >=1.0`. (3.13 ships `Repository.claim()` + `MongoOperatorUpdate` — both load-bearing in streamline ≥2.3.)
+Peer deps: `@classytic/mongokit >=3.14`, `@classytic/primitives >=0.6`, `@classytic/repo-core >=0.5`, `mongoose >=9.4.1`. Optional: `@opentelemetry/api >=1.0`. (mongokit ≥3.14 ships `Repository.claim()` + `MongoOperatorUpdate` — both load-bearing in streamline ≥2.4.)
 
 ## Design philosophy — what streamline is *not*
 

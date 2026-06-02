@@ -18,6 +18,7 @@ export type { WorkflowEngineOptions } from './execution/engine.js';
  */
 export { WorkflowEngine } from './execution/engine.js';
 export type {
+  BindFailureToOptions,
   StartOptions,
   StepConfig,
   WaitForOptions,

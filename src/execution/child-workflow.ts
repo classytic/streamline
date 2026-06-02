@@ -93,10 +93,23 @@ export async function handleChildWorkflowWait<TContext>(
     // race-winner instead of inserting a duplicate (mirrors branchJoin's
     // `branchIdempotencyKey` in ./parallel-steps.ts).
     const childIdempotencyKey = `${data.parentRunId}:${data.parentStepId}:childWorkflow`;
-    const childRun = await childEngine.start(data.childInput, {
-      idempotencyKey: childIdempotencyKey,
-      bypassTenant: true,
-    });
+    // ADOPT an existing child for this deterministic key if one exists in ANY
+    // status. Covers the crash-after-start-before-childRunId-write window where
+    // the child may ALREADY be terminal: start()'s active-only idempotency dedup
+    // would miss a terminal child and spawn a 2nd one (double execution). The
+    // sparse {idempotencyKey,status} index keeps this lookup cheap. A terminal
+    // adopted child is reconciled by the re-entry/sweep path (childRunId is set
+    // below + nextReconcileAt seeded), so the parent still resumes correctly.
+    const existingChild = await childEngine.container.repository.getOne(
+      { idempotencyKey: childIdempotencyKey },
+      { bypassTenant: true },
+    );
+    const childRun =
+      existingChild ??
+      (await childEngine.start(data.childInput, {
+        idempotencyKey: childIdempotencyKey,
+        bypassTenant: true,
+      }));
 
     // Persist childRunId AND the initial reconcile cadence in one write so
     // a crash immediately after start still leaves a poll-reclaimable wait.
