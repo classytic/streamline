@@ -230,6 +230,39 @@ export async function handleBranchJoinWait<TContext>(
   const data = stepState?.waitingFor?.data as BranchJoinData | undefined;
   if (!data?.branches?.length) return;
 
+  // ---- Reject cross-container branch targets LOUDLY (before any fan-out) ----
+  // A join resumes by two mechanisms, BOTH scoped to the parent's container:
+  //   1. in-process listeners on `engine.container.eventBus` (see
+  //      `registerBranchCompletionListeners`), and
+  //   2. the reconcile read `engine.container.repository.getById(childRunId)`
+  //      (see `readBranchResults`).
+  // A branch whose engine lives on a DIFFERENT container emits its completion
+  // on a bus the parent never subscribed to AND writes its run to a repository
+  // the parent's reconcile can't read — so the quorum is never met and the
+  // parent parks forever with no error or log. Fail at fan-out instead of
+  // dead-waiting. (Unregistered targets are handled in the start loop below,
+  // preserving the existing engine:error-and-continue behaviour.)
+  const crossContainer = data.branches.find((b) => {
+    const childEngine = workflowRegistry.getEngine(b.workflowId);
+    return childEngine && childEngine.container !== engine.container;
+  });
+  if (crossContainer) {
+    const won = await engine.failBranchJoinStep(runId, {
+      message:
+        `Branch workflow '${crossContainer.workflowId}' is on a different container than the parent. ` +
+        `joinBranches requires every branch target to share the parent's container ` +
+        `(same eventBus + repository) — cross-container joins park forever with no error. ` +
+        `Create the branch workflows with the same createWorkflow() container as the parent.`,
+      code: 'BRANCH_JOIN_CROSS_CONTAINER',
+    });
+    // Defensive: a prior partial fan-out could have started same-container
+    // children before this guard ran (it cannot on first entry, since the
+    // check precedes the start loop, but re-entries are claim-guarded). Mirror
+    // the policy:'all' fail path so we don't orphan running branch children.
+    if (won) await cancelLosers(data.branches);
+    return;
+  }
+
   const stepIndex = run.steps.findIndex((s) => s.stepId === run.currentStepId);
 
   // ---- Start any branch that has no childRunId yet (first entry / recovery) ----
@@ -455,8 +488,11 @@ export async function cancelBranchChildren<TContext>(run: WorkflowRun<TContext>)
  * correctness path. Listeners are a same-process fast path; after a crash the
  * scheduler's branch-join sweep reclaims the wait.
  *
- * Subscribed on the parent's container bus AND the global bus so a child that
- * completes on either fires the re-drive; deduped by the resume claim.
+ * Subscribed on the parent's container bus only. Branch children always run on
+ * the SAME container as the parent (cross-container targets are rejected loudly
+ * at fan-out in `handleBranchJoinWait`), so their completion events fire on this
+ * exact bus. Re-drives are deduped by the resume claim; after a crash the
+ * scheduler's branch-join sweep reclaims the wait regardless of listeners.
  */
 export function registerBranchCompletionListeners<TContext>(
   engine: BranchJoinEngine<TContext>,
