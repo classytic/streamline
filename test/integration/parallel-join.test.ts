@@ -495,4 +495,56 @@ describe('declarative parallel + durable join', () => {
     parent.shutdown();
     branch.shutdown();
   });
+
+  it('rejects a CROSS-CONTAINER branch target LOUDLY at fan-out (no silent forever-park)', async () => {
+    // Regression for the silent-hang DX trap: a branch whose engine lives on a
+    // DIFFERENT container than the parent emits completion on a bus the parent
+    // never subscribed to AND writes to a repository the parent's reconcile
+    // can't read — so the join would park forever with no error/log. The guard
+    // must fail the join at fan-out instead, and never start the branch child.
+    const parentContainer = createContainer();
+    const otherContainer = createContainer();
+    const branchWfId = uniqueId('pj-xcontainer-branch');
+    const parentWfId = uniqueId('pj-xcontainer-parent');
+
+    let branchRan = 0;
+    const branch = createWorkflow(branchWfId, {
+      steps: {
+        work: async () => {
+          branchRan++;
+          return { ok: true };
+        },
+      },
+      container: otherContainer, // <-- different container than the parent
+    });
+
+    const parent = createWorkflow(parentWfId, {
+      steps: {
+        fanout: async (ctx) =>
+          ctx.joinBranches([{ key: 'a', workflowId: branchWfId, input: {} }], { policy: 'all' }),
+        after: async () => 'unreached',
+      },
+      container: parentContainer,
+      defaults: { retries: 0 },
+    });
+
+    const run = await parent.start({});
+    const failed = await waitUntil(async () => {
+      const r = await parent.get(run._id);
+      return r?.status === 'failed' || r?.status === 'compensated';
+    }, 10_000);
+    expect(failed).toBe(true);
+
+    const final = await parent.get(run._id);
+    const fanout = final?.steps.find((s) => s.stepId === 'fanout');
+    expect(fanout?.status).toBe('failed');
+    expect((fanout?.error as { code?: string } | undefined)?.code).toBe(
+      'BRANCH_JOIN_CROSS_CONTAINER',
+    );
+    // The guard runs BEFORE the start loop — the branch child is never spawned.
+    expect(branchRan).toBe(0);
+
+    parent.shutdown();
+    branch.shutdown();
+  });
 });
