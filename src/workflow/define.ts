@@ -759,6 +759,14 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     ...(config.migrateRun !== undefined && { migrateRun: config.migrateRun }),
     ...(config.scheduler !== undefined && { scheduler: config.scheduler }),
     ...(config.maxStepLogs !== undefined && { maxStepLogs: config.maxStepLogs }),
+    // Only strict-concurrency workflows need the engine's terminal-event
+    // slot-release listeners. Gating their registration keeps non-strict
+    // workflows at zero engine bus listeners — which is what stops N
+    // workflows on a shared `eventBus: 'global'` bus from tripping Node's
+    // per-event MaxListenersExceededWarning. Behavior-preserving: a
+    // non-strict run never carries the `concurrencyCounterId` marker those
+    // listeners act on.
+    usesStrictConcurrency: Boolean(config.concurrency?.strict),
   });
 
   const waitFor = async (

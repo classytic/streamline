@@ -36,17 +36,41 @@ export { createWorkflow } from './workflow/define.js';
 // ============================================================================
 
 export { GotoSignal, WaitSignal } from './execution/context.js';
-export type { HookOptions, HookResult } from './features/hooks.js';
+export type { HookOptions, HookResult, PendingHook } from './features/hooks.js';
 /**
- * Create hooks for pausing workflows and resuming them from webhooks/APIs.
+ * Create hooks for pausing workflows and resuming them from webhooks/APIs,
+ * plus read-only inspection of pending hooks for approval dashboards + authz.
  *
  * @example
  * ```typescript
  * const hook = createHook(ctx, 'awaiting-approval');
  * await resumeHook(hook.token, { approved: true });
+ *
+ * // Operator/UI side — inspect without resuming:
+ * const pending = await listPendingHooks({ workflowId: 'doc-approval' });
+ * const one = await getHookByToken(token); // null unless still waiting on that token
  * ```
  */
-export { createHook, hookToken, resumeHook } from './features/hooks.js';
+export {
+  cancelHook,
+  createHook,
+  getHookByToken,
+  hookToken,
+  listPendingHooks,
+  resumeHook,
+} from './features/hooks.js';
+export type { WaitResolution, WaitResolutionKind } from './features/wait-resolution.js';
+/**
+ * Wait-resolution sentinels — detect in the step AFTER a human wait whether it
+ * resolved normally, timed out (`expiresAt`), or was cancelled (`cancelHook`).
+ *
+ * @example
+ * ```typescript
+ * const resolution = getWaitResolution(ctx.getOutput('request'));
+ * if (resolution?.__waitResolved === 'timeout') return autoReject(ctx);
+ * ```
+ */
+export { getWaitResolution } from './features/wait-resolution.js';
 
 // ============================================================================
 // Storage & Database - MongoDB Models & Repositories

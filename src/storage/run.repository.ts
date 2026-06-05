@@ -13,10 +13,14 @@
  * prismakit is one file (this one) instead of ~21 call sites scattered
  * across the engine.
  *
- * The atomic-claim path (`updateOne`) intentionally manually applies tenant
- * scope before delegating to `super.findOneAndUpdate`. The tenant-filter
- * plugin doesn't yet hook `before:findOneAndUpdate`; manual application is
- * defense-in-depth and explicit.
+ * The atomic-claim path (`updateOne`) also applies tenant scope manually
+ * before delegating to `super.findOneAndUpdate`. This is redundant
+ * belt-and-suspenders: the tenant-filter plugin DOES hook
+ * `before:findOneAndUpdate` (see `tenant-filter.plugin.ts`), and mongokit
+ * emits that hook for every op, so the plugin already scopes the claim. The
+ * manual merge is kept as defense-in-depth + explicitness (the filter merge is
+ * idempotent — both set the same `tenantField` — so there's no double-scoping
+ * hazard).
  */
 
 import {
@@ -30,7 +34,7 @@ import type {
   KeysetPaginationResult,
   OffsetPaginationResult,
 } from '@classytic/repo-core/pagination';
-import type { WorkflowRun } from '../core/types.js';
+import type { WaitingFor, WorkflowRun } from '../core/types.js';
 import { type TenantFilterOptions, tenantFilterPlugin } from '../plugins/tenant-filter.plugin.js';
 import { CommonQueries } from './query-builder.js';
 import { WorkflowRunModel } from './run.model.js';
@@ -368,6 +372,26 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
   }
 
   /**
+   * Runs whose `human`/`webhook` wait has hit its `expiresAt` deadline. The
+   * scheduler's expiry sweep hands each to the engine to resume with a timeout
+   * sentinel so an unanswered approval can't park a long-running workflow
+   * forever. Mirrors `getReadyToResume` — same `queryLean` pagination,
+   * `updatedAt: 1` sort (oldest-first fairness), and tenant conventions.
+   */
+  async getExpiredWaits(
+    now: Date,
+    limit = 100,
+    options?: AtomicUpdateOptions,
+  ): Promise<LeanWorkflowRun[]> {
+    return this.queryLean(
+      CommonQueries.expiredWaits(now, options?.workflowId),
+      { updatedAt: 1 },
+      limit,
+      options,
+    );
+  }
+
+  /**
    * Runs blocked on a `childWorkflow` wait that are due for crash-durable
    * reconciliation (`waitingFor.nextReconcileAt <= now`).
    *
@@ -630,6 +654,49 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
         ...(options?.bypassTenant ? { bypassTenant: true } : {}),
       },
     );
+  }
+
+  /**
+   * Runs currently parked on a wait — the hands-off / "pending approvals"
+   * queue. Read-only operator + UI surface (an approval dashboard, a
+   * "who's waiting on me" view).
+   *
+   * Matches runs in `status: 'waiting'` whose waiting step is a `human`
+   * wait (the default — the only kind a person resumes), or any wait type
+   * when `waitType: 'any'`. `paused` runs are excluded (operationally
+   * parked, not awaiting input). Routes through the inherited `findAll` so
+   * tenant scope + audit/cache plugins fire; `lean` for a cheap list.
+   * Sorted oldest-first so the longest-waiting run surfaces first — the
+   * natural review order for an approvals queue.
+   *
+   * Note: the per-step `$elemMatch` predicate isn't covered by a dedicated
+   * index, but `status: 'waiting'` is already selective (waiting runs are a
+   * small slice of the collection) and this is a low-frequency operator
+   * read, not a hot path.
+   */
+  async getWaitingRuns(
+    waitType: WaitingFor['type'] | 'any' = 'human',
+    limit = 100,
+    options?: AtomicUpdateOptions,
+  ): Promise<LeanWorkflowRun[]> {
+    const stepMatch: Record<string, unknown> = { status: 'waiting' };
+    if (waitType !== 'any') stepMatch['waitingFor.type'] = waitType;
+
+    return (await this.findAll(
+      {
+        status: 'waiting',
+        paused: { $ne: true },
+        steps: { $elemMatch: stepMatch },
+        ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
+      },
+      {
+        sort: { updatedAt: 1 },
+        limit,
+        lean: true,
+        ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+        ...(options?.bypassTenant ? { bypassTenant: true } : {}),
+      } as Parameters<Repository<WorkflowRun>['findAll']>[1],
+    )) as LeanWorkflowRun[];
   }
 
   async hasWaitingWorkflows(options?: AtomicUpdateOptions): Promise<boolean> {

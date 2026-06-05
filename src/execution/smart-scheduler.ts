@@ -209,6 +209,7 @@ export class SmartScheduler {
   private staleRecoveryCallback?: (runId: string, thresholdMs: number) => Promise<unknown>;
   private retryCallback?: (runId: string) => Promise<unknown>;
   private compensationRecoveryCallback?: (runId: string, thresholdMs: number) => Promise<unknown>;
+  private expiryCallback?: (runId: string) => Promise<unknown>;
 
   /**
    * Engine-scoping filter (v2.4.0 distributed-correctness fix). Every engine
@@ -272,6 +273,17 @@ export class SmartScheduler {
     callback: (runId: string, thresholdMs: number) => Promise<unknown>,
   ): void {
     this.compensationRecoveryCallback = callback;
+  }
+
+  /**
+   * Set callback for resuming a `human`/`webhook` wait that has hit its
+   * `expiresAt` deadline. Separate from `resumeCallback` because it must
+   * resume WITH a timeout sentinel payload (so the next step can branch on the
+   * timeout), whereas the generic resume sweep passes none. The engine wires
+   * this to `resume(runId, timeoutSentinel)`.
+   */
+  setExpiryCallback(callback: (runId: string) => Promise<unknown>): void {
+    this.expiryCallback = callback;
   }
 
   /**
@@ -600,6 +612,25 @@ export class SmartScheduler {
           }
         } else {
           logger.warn(`Retry workflow detected but no retry callback set`, { runId: run._id });
+        }
+      }
+
+      // Expire human/webhook waits that have hit their `expiresAt` deadline.
+      // Hands each to expiryCallback → engine.resume(runId, timeoutSentinel),
+      // completing the waiting step with `{ __waitResolved: 'timeout' }` so the
+      // next step can branch on the timeout — an unanswered approval can't park
+      // a long-running workflow forever. The waiting→running CAS inside resume
+      // makes this race-safe against a concurrent resumeHook (whichever wins,
+      // the other is a no-op). Cross-tenant sweep; per-row writes are id-scoped.
+      if (this.expiryCallback) {
+        const expired = await this.repository.getExpiredWaits(now, limit, this.scopedOpts);
+        for (const run of expired) {
+          try {
+            await this.expiryCallback(run._id);
+            resumedCount++;
+          } catch (err) {
+            this.emitError('expire-wait', err, run._id);
+          }
         }
       }
 

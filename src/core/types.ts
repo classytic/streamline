@@ -270,6 +270,18 @@ export interface WaitingFor {
   type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow' | 'branchJoin';
   reason: string;
   resumeAt?: Date;
+  /**
+   * Deadline for a `human` / `webhook` wait. When set and reached, the
+   * scheduler's expiry sweep resumes the step with a timeout sentinel
+   * (`{ __waitResolved: 'timeout' }`, see `getWaitResolution`) instead of
+   * leaving it parked forever — so an unanswered approval can't wedge a
+   * long-running workflow. Distinct from `resumeAt` (which is the *normal*
+   * wake time for a `timer`/sleep wait); a human wait that also wants a
+   * scheduled nudge would use its own hook. Promoted from
+   * `ctx.wait(reason, { expiresAt })` data by the executor. Default-absent:
+   * a wait without it parks indefinitely (the prior behaviour).
+   */
+  expiresAt?: Date;
   eventName?: string;
   data?: unknown;
   /**

@@ -9,6 +9,7 @@ import type {
   WorkflowHandlers,
   WorkflowRun,
 } from '../core/types.js';
+import { makeWaitTimeout } from '../features/wait-resolution.js';
 import { runSet } from '../storage/update-builders.js';
 import {
   InvalidStateError,
@@ -119,6 +120,32 @@ export interface WorkflowEngineOptions {
     | null
     | undefined
     | Promise<Partial<WorkflowRun<unknown>> | null | undefined>;
+  /**
+   * Register the strict-concurrency slot-release listeners on the bus.
+   *
+   * The engine's 5 lifecycle listeners (`workflow:completed` / `:failed` /
+   * `:cancelled` / `:compensated` / `:compensation_failed`) exist ONLY to
+   * decrement the atomic counter for `concurrency.strict` workflows. They
+   * are a provable no-op for any run WITHOUT a `meta.concurrencyCounterId`
+   * — and that marker is stamped exclusively by the strict-concurrency
+   * claim path in `define.ts`. So a non-strict workflow's listeners do a
+   * `repository.getById` on every terminal event and then discard it.
+   *
+   * `createWorkflow` sets this to `true` only when the workflow declares
+   * `concurrency.strict`. Default `false` ⇒ no listeners registered.
+   *
+   * Why the gate matters on a SHARED bus (`createContainer({ eventBus:
+   * 'global' })`): without it, EVERY engine registers all 5 listeners on
+   * the one bus, so N workflows put N listeners on each of those 5 event
+   * names — crossing Node's 10-listener-per-event soft cap and emitting a
+   * `MaxListenersExceededWarning` at boot. Worse, each terminal event then
+   * fans out to an O(N) `getById` storm that every non-owning engine
+   * immediately drops on the `run.workflowId !== this.definition.id`
+   * guard. Registering only for strict workflows keeps the overwhelmingly
+   * common (non-strict) case at ZERO engine bus listeners and zero
+   * wasted reads.
+   */
+  usesStrictConcurrency?: boolean;
 }
 
 /**
@@ -223,6 +250,21 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       return this.recoverCompensation(runId, thresholdMs);
     });
 
+    // Resume human/webhook waits that hit their `expiresAt` deadline WITH a
+    // timeout sentinel, so the next step branches on the timeout. The
+    // `waiting → running` claim inside `resume` makes this race-safe against a
+    // concurrent `resumeHook`; if the run already moved on (external resume
+    // won, or it completed), `resume` throws InvalidStateError — swallow it as
+    // a no-op rather than surfacing a scheduler error.
+    this.scheduler.setExpiryCallback(async (runId) => {
+      try {
+        await this.resume(runId, makeWaitTimeout());
+      } catch (err) {
+        if (err instanceof InvalidStateError) return;
+        throw err;
+      }
+    });
+
     // Smart start: Only start polling if workflows exist
     this.scheduler.startIfNeeded().catch((err) => {
       this.container.eventBus.emit('engine:error', {
@@ -242,79 +284,89 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // executor failed path, engine.cancel, engine.failCorruption); event
     // emission is the single fan-in. Listening here means we never miss
     // a release no matter which path produced the terminal state.
-    const releaseSlotOnTerminal = async (payload: { runId?: string }) => {
-      if (!payload.runId) return;
-      try {
-        const run = await this.container.repository.getById(payload.runId);
-        if (!run) return;
+    //
+    // GATED on `usesStrictConcurrency` (set by `createWorkflow` only for
+    // workflows that declare `concurrency.strict`). A non-strict workflow
+    // never stamps `meta.concurrencyCounterId`, so these listeners would
+    // always early-return — pure overhead. Skipping registration is
+    // behavior-preserving and, on a shared/global bus, is what keeps N
+    // workflows from crossing Node's per-event listener cap (and from an
+    // O(N) getById fan-out per terminal event). See `usesStrictConcurrency`
+    // on WorkflowEngineOptions.
+    if (options.usesStrictConcurrency) {
+      const releaseSlotOnTerminal = async (payload: { runId?: string }) => {
+        if (!payload.runId) return;
+        try {
+          const run = await this.container.repository.getById(payload.runId);
+          if (!run) return;
 
-        // (H3) Multi-engine guard: on a SHARED container / global bus, every
-        // engine's listener receives every terminal event. Without this guard
-        // two engines would both decrement the counter for ONE terminal event
-        // (double-release). Only the engine that OWNS the workflow releases.
-        if (run.workflowId !== this.definition.id) return;
+          // (H3) Multi-engine guard: on a SHARED container / global bus, every
+          // engine's listener receives every terminal event. Without this guard
+          // two engines would both decrement the counter for ONE terminal event
+          // (double-release). Only the engine that OWNS the workflow releases.
+          if (run.workflowId !== this.definition.id) return;
 
-        // Saga slot timing: a saga run emits `workflow:failed` and then enters
-        // `compensating` (which STILL holds its slot — see SLOT_HOLDING_STATUSES).
-        // Releasing on `failed` would free the slot mid-rollback and
-        // oversubscribe a strict cap. So:
-        //   - `failed` releases ONLY when the run will NOT compensate
-        //     (no compensation handlers configured). With handlers, the slot
-        //     is released later on `compensated`/`compensation_failed`.
-        //   - `compensating` never releases (slot held through rollback).
-        //   - all other terminal states (done/cancelled/compensated/
-        //     compensation_failed) release.
-        if (run.status === 'compensating') return;
-        if (run.status === 'failed' && this.options.compensationHandlers) return;
+          // Saga slot timing: a saga run emits `workflow:failed` and then enters
+          // `compensating` (which STILL holds its slot — see SLOT_HOLDING_STATUSES).
+          // Releasing on `failed` would free the slot mid-rollback and
+          // oversubscribe a strict cap. So:
+          //   - `failed` releases ONLY when the run will NOT compensate
+          //     (no compensation handlers configured). With handlers, the slot
+          //     is released later on `compensated`/`compensation_failed`.
+          //   - `compensating` never releases (slot held through rollback).
+          //   - all other terminal states (done/cancelled/compensated/
+          //     compensation_failed) release.
+          if (run.status === 'compensating') return;
+          if (run.status === 'failed' && this.options.compensationHandlers) return;
 
-        const counterId = (run.meta as Record<string, unknown> | undefined)?.concurrencyCounterId as
-          | string
-          | undefined;
-        if (!counterId) return;
+          const counterId = (run.meta as Record<string, unknown> | undefined)
+            ?.concurrencyCounterId as string | undefined;
+          if (!counterId) return;
 
-        // Idempotent per run: a run's slot is released AT MOST ONCE, even
-        // though several terminal-ish events can fire for it (failed→compensated,
-        // or a re-emit after crash-recovery). releaseSlot itself is guarded
-        // (count > 0), but this Set stops a legitimate later run reusing the
-        // same counterId bucket from being decremented by THIS run's stale event.
-        if (this.releasedSlots.has(payload.runId)) return;
-        this.releasedSlots.add(payload.runId);
-        // Bound memory on a long-lived engine: a run's terminal events all fire
-        // within a short window, so evicting the oldest entries once the Set is
-        // large (10k runs) cannot cause a re-release of a still-relevant run.
-        if (this.releasedSlots.size > 10_000) {
-          const oldest = this.releasedSlots.values().next().value as string | undefined;
-          if (oldest !== undefined) this.releasedSlots.delete(oldest);
+          // Idempotent per run: a run's slot is released AT MOST ONCE, even
+          // though several terminal-ish events can fire for it (failed→compensated,
+          // or a re-emit after crash-recovery). releaseSlot itself is guarded
+          // (count > 0), but this Set stops a legitimate later run reusing the
+          // same counterId bucket from being decremented by THIS run's stale event.
+          if (this.releasedSlots.has(payload.runId)) return;
+          this.releasedSlots.add(payload.runId);
+          // Bound memory on a long-lived engine: a run's terminal events all fire
+          // within a short window, so evicting the oldest entries once the Set is
+          // large (10k runs) cannot cause a re-release of a still-relevant run.
+          if (this.releasedSlots.size > 10_000) {
+            const oldest = this.releasedSlots.values().next().value as string | undefined;
+            if (oldest !== undefined) this.releasedSlots.delete(oldest);
+          }
+
+          await this.container.concurrencyCounterRepository.releaseSlot(counterId);
+        } catch (err) {
+          // Release failures are diagnostic — the counter will drift +1 until
+          // reconciled. Don't crash the event-bus listener loop.
+          this.container.eventBus.emit('engine:error', {
+            runId: payload.runId,
+            error: err instanceof Error ? err : new Error(String(err)),
+            context: 'concurrency-counter-release',
+          });
         }
-
-        await this.container.concurrencyCounterRepository.releaseSlot(counterId);
-      } catch (err) {
-        // Release failures are diagnostic — the counter will drift +1 until
-        // reconciled. Don't crash the event-bus listener loop.
-        this.container.eventBus.emit('engine:error', {
-          runId: payload.runId,
-          error: err instanceof Error ? err : new Error(String(err)),
-          context: 'concurrency-counter-release',
-        });
-      }
-    };
-    this.container.eventBus.on('workflow:completed', releaseSlotOnTerminal);
-    this.container.eventBus.on('workflow:failed', releaseSlotOnTerminal);
-    this.container.eventBus.on('workflow:cancelled', releaseSlotOnTerminal);
-    this.container.eventBus.on('workflow:compensated', releaseSlotOnTerminal);
-    this.container.eventBus.on('workflow:compensation_failed', releaseSlotOnTerminal);
-    // Store a teardown so shutdown() removes these 5 listeners. Without it,
-    // recreating an engine for the same workflowId leaves the OLD engine's
-    // listener live on the shared bus — it still matches the H3
-    // `run.workflowId === this.definition.id` guard and would double-release a
-    // slot for a NEW run, undercounting the strict counter.
-    this.removeSlotReleaseListeners = () => {
-      this.container.eventBus.off('workflow:completed', releaseSlotOnTerminal);
-      this.container.eventBus.off('workflow:failed', releaseSlotOnTerminal);
-      this.container.eventBus.off('workflow:cancelled', releaseSlotOnTerminal);
-      this.container.eventBus.off('workflow:compensated', releaseSlotOnTerminal);
-      this.container.eventBus.off('workflow:compensation_failed', releaseSlotOnTerminal);
-    };
+      };
+      this.container.eventBus.on('workflow:completed', releaseSlotOnTerminal);
+      this.container.eventBus.on('workflow:failed', releaseSlotOnTerminal);
+      this.container.eventBus.on('workflow:cancelled', releaseSlotOnTerminal);
+      this.container.eventBus.on('workflow:compensated', releaseSlotOnTerminal);
+      this.container.eventBus.on('workflow:compensation_failed', releaseSlotOnTerminal);
+      // Store a teardown so shutdown() removes these 5 listeners. Without it,
+      // recreating an engine for the same workflowId leaves the OLD engine's
+      // listener live on the shared bus — it still matches the H3
+      // `run.workflowId === this.definition.id` guard and would double-release a
+      // slot for a NEW run, undercounting the strict counter.
+      this.removeSlotReleaseListeners = () => {
+        this.container.eventBus.off('workflow:completed', releaseSlotOnTerminal);
+        this.container.eventBus.off('workflow:failed', releaseSlotOnTerminal);
+        this.container.eventBus.off('workflow:cancelled', releaseSlotOnTerminal);
+        this.container.eventBus.off('workflow:compensated', releaseSlotOnTerminal);
+        this.container.eventBus.off('workflow:compensation_failed', releaseSlotOnTerminal);
+      };
+    }
 
     this.options = { autoExecute: true, ...options };
   }
@@ -847,7 +899,20 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       return false;
     }
 
-    // Human input wait - break and let external resume
+    // Human / webhook wait — break and let an external resume drive it.
+    //
+    // If the wait carries an `expiresAt` deadline, ensure the scheduler is
+    // polling so its expiry sweep can auto-resume the run with a timeout
+    // sentinel once the deadline passes. A human wait otherwise never arms the
+    // poller (unlike timer/sleep waits, which call `scheduleResume`), so
+    // without this an `expiresAt` would silently never fire on a scheduler
+    // that booted idle. We deliberately ensure POLLING (the durable DB sweep)
+    // rather than arming an in-memory `scheduleResume` timer: that timer
+    // resumes with NO payload, which would complete the wait as an empty
+    // answer instead of the `{ __waitResolved: 'timeout' }` sentinel.
+    if (stepState.waitingFor?.expiresAt) {
+      this.scheduler.start();
+    }
     return false;
   }
 
