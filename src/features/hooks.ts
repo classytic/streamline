@@ -30,10 +30,28 @@ import { randomBytes } from 'node:crypto';
 import type { StepContext, WorkflowRun } from '../core/types.js';
 import { hookRegistry, workflowRegistry } from '../execution/engine.js';
 import { workflowRunRepository } from '../storage/run.repository.js';
+import { makeWaitCancelled } from './wait-resolution.js';
 
 export interface HookOptions {
   /** Custom token (default: auto-generated with crypto-random suffix) */
   token?: string;
+  /**
+   * Opaque host metadata carried alongside the wait — surfaced by
+   * `getHookByToken` / `listPendingHooks` so an approval UI or an
+   * authorization check can read it WITHOUT resuming. Common uses:
+   * `{ allowedReviewers: [...] }` for authz, or `{ title, dueAt }` for a
+   * review card. Pass it through to `ctx.wait` (see the example) so it
+   * lands on the waiting step.
+   */
+  metadata?: unknown;
+  /**
+   * Deadline for the wait. If no one resumes by `expiresAt`, the scheduler
+   * auto-resumes the step with a timeout sentinel (`getWaitResolution(...)
+   * === { __waitResolved: 'timeout' }`) so an unanswered approval can't park
+   * a long-running workflow forever. Forward it to `ctx.wait` (see the
+   * example). Omit for a wait that parks indefinitely (the default).
+   */
+  expiresAt?: Date;
 }
 
 export interface HookResult {
@@ -41,6 +59,32 @@ export interface HookResult {
   token: string;
   /** URL path for webhook (if using webhook manager) */
   path: string;
+  /** Human-readable reason — echo into `ctx.wait` so it lands on the waiting step. */
+  reason: string;
+  /** Host metadata from {@link HookOptions.metadata} — echo into `ctx.wait`. */
+  metadata?: unknown;
+  /** Deadline from {@link HookOptions.expiresAt} — echo into `ctx.wait`. */
+  expiresAt?: Date;
+}
+
+/**
+ * A pending hook — a run parked on a human wait, awaiting external resume.
+ * Returned by {@link getHookByToken} / {@link listPendingHooks} for
+ * approval dashboards and pre-resume authorization, WITHOUT mutating the run.
+ */
+export interface PendingHook {
+  /** The resume token (what you pass to {@link resumeHook}). */
+  token: string;
+  runId: string;
+  workflowId: string;
+  /** The waiting step's id. */
+  stepId: string;
+  /** Human-readable reason passed to `ctx.wait(reason, …)`. */
+  reason: string;
+  /** Host metadata attached via {@link HookOptions.metadata}. */
+  metadata?: unknown;
+  /** When the run entered the wait (waiting step's `startedAt`, else `updatedAt`). */
+  waitingSince?: Date;
 }
 
 /**
@@ -53,18 +97,36 @@ export interface HookResult {
  * matched, so a forgotten `hookToken` was a security hole, not just a
  * style nit.
  *
+ * `reason` (and any `metadata`) are echoed back on the result so you can
+ * forward them to `ctx.wait` in one place — that's what makes them visible
+ * to `getHookByToken` / `listPendingHooks` for approval UIs + authz.
+ *
  * @example
  * ```typescript
- * const hook = createHook(ctx, 'waiting-for-approval');
- * return ctx.wait(hook.token, { hookToken: hook.token }); // <-- mandatory
+ * const hook = createHook(ctx, 'manager approval', {
+ *   metadata: { allowedReviewers: ['u_42'] },
+ *   expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // auto-reject after 24h
+ * });
+ * // Forward reason + token + metadata + deadline onto the waiting step:
+ * return ctx.wait(hook.reason, {
+ *   hookToken: hook.token,
+ *   metadata: hook.metadata,
+ *   expiresAt: hook.expiresAt,
+ * });
  * ```
  */
-export function createHook(ctx: StepContext, _reason: string, options?: HookOptions): HookResult {
+export function createHook(ctx: StepContext, reason: string, options?: HookOptions): HookResult {
   const randomSuffix = randomBytes(16).toString('hex');
   const token = options?.token ?? `${ctx.runId}:${ctx.stepId}:${randomSuffix}`;
   const path = `/hooks/${token}`;
 
-  return { token, path };
+  return {
+    token,
+    path,
+    reason,
+    ...(options?.metadata !== undefined ? { metadata: options.metadata } : {}),
+    ...(options?.expiresAt !== undefined ? { expiresAt: options.expiresAt } : {}),
+  };
 }
 
 /**
@@ -103,6 +165,32 @@ export async function resumeHook(
 
   // Fallback: DB-based resume (cross-process / post-restart)
   return resumeViaDb(runId, token, payload);
+}
+
+/**
+ * Cancel (withdraw) a pending hook — the approval is no longer wanted
+ * (superseded, escalated, the underlying request was deleted). Resumes the
+ * waiting step with a cancellation sentinel and lets the workflow proceed down
+ * its handled-cancellation path; the NEXT step detects it via
+ * `getWaitResolution(...) === { __waitResolved: 'cancelled', reason }`.
+ *
+ * This withdraws THE WAIT, not the whole run — to abort the entire workflow,
+ * call `engine.cancel(runId)` / `wf.cancel(runId)` instead.
+ *
+ * Token-validated and fail-closed exactly like {@link resumeHook} (it IS a
+ * `resumeHook` with a cancel-sentinel payload). Throws if the hook is no
+ * longer pending (already resumed/cancelled, or the run isn't waiting).
+ *
+ * @example
+ * ```typescript
+ * await cancelHook(token, { reason: 'request was deleted' });
+ * ```
+ */
+export async function cancelHook(
+  token: string,
+  options?: { reason?: string },
+): Promise<{ runId: string; run: WorkflowRun }> {
+  return resumeHook(token, makeWaitCancelled(options?.reason));
 }
 
 /** Resume using the in-memory engine reference (fast path) */
@@ -245,6 +333,101 @@ async function resumeViaDb(
   }
 
   return { runId, run: updated as WorkflowRun };
+}
+
+// ============================================================================
+// Read-only inspection — surface pending hooks for approval UIs + authz
+// WITHOUT resuming. These NEVER mutate the run (resuming is resumeHook).
+// ============================================================================
+
+/**
+ * Build a {@link PendingHook} from a run and its waiting step. When `token`
+ * is given, only the step that stored THAT exact token matches (fail-closed,
+ * mirrors `validateHookToken`); otherwise the first human wait carrying a
+ * `hookToken` is used.
+ */
+function toPendingHook(run: WorkflowRun, token?: string): PendingHook | null {
+  const step = run.steps.find((s) => {
+    if (s.status !== 'waiting' || !s.waitingFor) return false;
+    const data = s.waitingFor.data as { hookToken?: string } | undefined;
+    return token ? data?.hookToken === token : s.waitingFor.type === 'human' && !!data?.hookToken;
+  });
+  if (!step?.waitingFor) return null;
+
+  const data = step.waitingFor.data as { hookToken?: string; metadata?: unknown } | undefined;
+  if (!data?.hookToken) return null;
+
+  return {
+    token: data.hookToken,
+    runId: run._id,
+    workflowId: run.workflowId,
+    stepId: step.stepId,
+    reason: step.waitingFor.reason,
+    ...(data.metadata !== undefined ? { metadata: data.metadata } : {}),
+    waitingSince: step.startedAt ?? run.updatedAt,
+  };
+}
+
+/**
+ * Inspect a pending hook by token WITHOUT resuming it — for a pre-resume
+ * authorization check or to render an approval card.
+ *
+ * Returns `null` unless the token matches a run currently waiting on exactly
+ * that hook (run missing, not waiting, already resumed, or token mismatch all
+ * return `null`). Mirrors `resumeHook`'s fail-closed token check: only the
+ * step that stored THIS exact token is returned, so a guessed `<runId>:…`
+ * token reveals nothing.
+ *
+ * @example
+ * ```typescript
+ * const hook = await getHookByToken(token);
+ * if (!hook) return res.status(404).end();
+ * const reviewers = (hook.metadata as { allowedReviewers?: string[] })?.allowedReviewers;
+ * if (reviewers && !reviewers.includes(req.user.id)) return res.status(403).end();
+ * await resumeHook(token, req.body);
+ * ```
+ */
+export async function getHookByToken(token: string): Promise<PendingHook | null> {
+  const [runId] = token.split(':');
+  if (!runId) return null;
+
+  const run = await workflowRunRepository.getById(runId);
+  if (!run || run.status !== 'waiting') return null;
+
+  return toPendingHook(run as WorkflowRun, token);
+}
+
+/**
+ * List runs currently parked on a human wait — the "pending approvals" queue
+ * for an operator dashboard. Read-only. Each entry carries the resume `token`,
+ * `reason`, and host `metadata` so a UI can render + route the approval
+ * without a second fetch. Oldest wait first (longest-waiting surfaces first).
+ *
+ * Uses the default repository singleton (single-tenant / cross-process, same
+ * as `resumeHook`'s durable path). Multi-tenant hosts should scope the query
+ * through their container's repository instead:
+ * `container.repository.getWaitingRuns('human', limit, { tenantId })`.
+ *
+ * @example
+ * ```typescript
+ * const pending = await listPendingHooks({ workflowId: 'doc-approval' });
+ * // [{ token, runId, stepId, reason: 'manager approval', metadata, waitingSince }]
+ * ```
+ */
+export async function listPendingHooks(options?: {
+  workflowId?: string;
+  limit?: number;
+}): Promise<PendingHook[]> {
+  const runs = await workflowRunRepository.getWaitingRuns('human', options?.limit ?? 100, {
+    ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
+  });
+
+  const hooks: PendingHook[] = [];
+  for (const run of runs) {
+    const hook = toPendingHook(run as WorkflowRun);
+    if (hook) hooks.push(hook);
+  }
+  return hooks;
 }
 
 /**

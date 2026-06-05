@@ -347,6 +347,17 @@ WorkflowRunSchema.index({
 WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: -1, _id: -1 });
 WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: 1, _id: 1 });
 
+// Workflow-SCOPED keyset variant (v2.4.0 engine scoping). The scheduler sweeps
+// (getReadyForRetry / getReadyToResume / getChildWaitingRuns / getStaleRunning /
+// scheduledReady) are scoped to the engine's own `workflowId`, so their keyset
+// query filters `{ status, paused, workflowId }` and sorts `updatedAt: 1`. The
+// unscoped pair above can't back that (a `workflowId` equality term not in the
+// index prefix bars its use), so MongoKit warned + Mongo full-scanned on EVERY
+// poll tick. This mirrors 347-348 with `workflowId` in the prefix — the exact
+// index MongoKit's keyset detector asks for. The `notPaused()` sweeps all sort
+// ascending, so one asc variant suffices.
+WorkflowRunSchema.index({ status: 1, paused: 1, workflowId: 1, updatedAt: 1, _id: 1 });
+
 // Same prefix + the `steps` multikey position. Used by `readyForRetry` /
 // `readyToResume` (CommonQueries.readyForRetry / readyToResume in
 // `query-builder.ts`) — both add a `steps.$elemMatch` clause on top of

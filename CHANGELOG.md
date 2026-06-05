@@ -5,6 +5,110 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [2.5.0] - 2026-06-05 — Hands-off human-in-the-loop + shared-bus listener fix
+
+A single release focused on making human-in-the-loop / approval ("hands-off")
+workflows production-grade, plus a shared-bus listener fix. All changes are
+additive (new API + a default-absent field); existing workflows behave
+byte-for-byte as before.
+
+### Added — inspect parked human waits without resuming (approval queues + authz)
+
+Building an approval UI / authorization gate previously meant hand-rolling
+queries against `workflow_runs`. Three read-only surfaces close that — none
+mutate a run (resuming is still `resumeHook`):
+
+- **`getHookByToken(token): Promise<PendingHook | null>`** — inspect one parked
+  approval before resuming (authorize a reviewer, render a card). Fail-closed
+  on the token (parity with `resumeHook`): only the step that stored that exact
+  token matches, so a guessed `<runId>:…` reveals nothing.
+- **`listPendingHooks({ workflowId?, limit? }): Promise<PendingHook[]>`** — the
+  pending-approvals queue, oldest-first, each entry carrying the resume `token`,
+  `reason`, and host `metadata` so a dashboard renders + routes without a
+  second fetch.
+- **`WorkflowRunRepository.getWaitingRuns(waitType?, limit?, options?)`** — the
+  tenant-aware query behind it, routed through inherited mongokit `findAll`
+  (tenant scope + plugins fire). Multi-tenant hosts call it on their container
+  repository with `{ tenantId }`; standalone `listPendingHooks` uses the
+  default singleton (same as `resumeHook`'s durable path).
+
+`createHook(ctx, reason, options)` now **uses** `reason` (it was the ignored
+`_reason` param) and accepts `options.metadata`; both are echoed on the
+`HookResult` so you forward them onto the waiting step in one place. They land
+on `waitingFor.reason` / `waitingFor.data.metadata` — exactly what the
+inspectors read. New exported type **`PendingHook`**.
+
+### Added — waits can time out (`expiresAt`) or be withdrawn (`cancelHook`)
+
+A `ctx.wait(...)` for approval previously parked **forever** if no one
+answered — a real hazard for long-running workflows. Now:
+
+- **`expiresAt`** on `createHook` / the wait data — when the deadline passes,
+  the scheduler's new expiry sweep auto-resumes the step with a timeout
+  sentinel:
+
+  ```ts
+  const hook = createHook(ctx, 'manager approval', {
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+  });
+  return ctx.wait(hook.reason, { hookToken: hook.token, expiresAt: hook.expiresAt });
+  ```
+
+  Lands on `waitingFor.expiresAt`; the scheduler matches `expiresAt <= now`
+  (new `getExpiredWaits` repo query, mirrors the timer-ready sweep) and resumes
+  via `engine.resume(runId, timeoutSentinel)`. Race-safe against a concurrent
+  `resumeHook` via the existing `waiting → running` CAS (whichever wins, the
+  other is a no-op). A human wait with `expiresAt` also ensures the scheduler is
+  polling, so the deadline fires even on an engine that booted idle.
+
+- **`cancelHook(token, { reason? })`** — withdraw a pending wait (superseded /
+  escalated / source deleted). Resumes with a cancellation sentinel;
+  token-validated + fail-closed exactly like `resumeHook`. Withdraws THE WAIT,
+  not the run — to abort the whole workflow use `wf.cancel(runId)`.
+
+- **`getWaitResolution(output)`** + **`WaitResolution`** type — in the step
+  AFTER the wait, discriminate a normal answer (real payload → `null`) from a
+  `timeout` (`{ __waitResolved: 'timeout' }`) or `cancelled`
+  (`{ __waitResolved: 'cancelled', reason }`). Sentinels never leak into the
+  happy path. New `WaitingFor.expiresAt` field is default-absent (no migration).
+
+### Fixed — engine slot-release listeners registered unconditionally on a shared bus (perf + warning)
+
+`WorkflowEngine`'s constructor attached 5 lifecycle listeners
+(`workflow:completed` / `:failed` / `:cancelled` / `:compensated` /
+`:compensation_failed`) to its container's event bus **unconditionally**. Those
+listeners exist only to release `concurrency.strict` slots and early-return for
+any run without a `meta.concurrencyCounterId` — i.e. for every non-strict
+workflow. On a shared bus (`createContainer({ eventBus: 'global' })`, the
+standard multi-workflow wiring) every engine piled its 5 onto the one bus, so N
+workflows crossed Node's 10-listener-per-event cap (a boot-time
+`MaxListenersExceededWarning`) AND every terminal event fanned out to an O(N)
+`getById` storm that each non-owning engine immediately discarded.
+
+Registration is now gated on a new `usesStrictConcurrency` engine option, which
+`createWorkflow` sets `true` only for workflows declaring `concurrency.strict`.
+Non-strict workflows register **zero** engine bus listeners. Behavior-preserving
+(a non-strict run never carries the marker those listeners act on); strict
+workflows are unchanged and `shutdown()` still tears their listeners down.
+
+## [2.4.1] - 2026-06-04 — Index fix: workflow-scoped keyset sweeps
+
+### Fixed — missing index for workflowId-scoped scheduler sweeps (perf)
+
+v2.4.0 scoped each engine's scheduler sweeps to its own `workflowId`, adding a
+leading `workflowId` equality term to the keyset-paginated pickup queries
+(`getReadyForRetry` / `getReadyToResume` / `getChildWaitingRuns` /
+`getStaleRunningWorkflows` / `scheduledReady`). v2.4.0 added `workflowId`-prefixed
+indexes for the *non*-keyset pickup queries but **missed the keyset ones** — so
+those sweeps filtered `{ status, paused, workflowId }` / sorted `updatedAt` with
+no matching schema-declared index. MongoKit logged a "no matching compound index"
+warning on **every poll tick** and MongoDB fell back to a wider scan.
+
+Added `WorkflowRunSchema.index({ status: 1, paused: 1, workflowId: 1, updatedAt: 1, _id: 1 })`
+— the exact index MongoKit's keyset detector asks for. Purely additive; no query
+or behavior change.
+
 ## [2.4.0] - 2026-06-01 — Durable saga · crash-recovery fix · output history · parallel/join · idempotency keys
 
 A capability release that makes streamline best-in-class for agentic, order, and

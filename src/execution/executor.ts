@@ -546,6 +546,11 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         type: signal.type,
         reason: signal.reason,
         resumeAt: signalData?.resumeAt,
+        // Promote a caller-provided deadline (`ctx.wait(reason, { expiresAt })`)
+        // to a first-class field so the scheduler's expiry sweep can match it
+        // by `waitingFor.expiresAt <= now`. Only meaningful for human/webhook
+        // waits; harmless on others (the sweep filters on type).
+        expiresAt: signalData?.expiresAt as Date | undefined,
         eventName: signalData?.eventName,
         data: signal.data,
         ...(needsReconcileSeed ? { nextReconcileAt: new Date() } : {}),

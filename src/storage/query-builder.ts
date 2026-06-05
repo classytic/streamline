@@ -107,6 +107,24 @@ export class WorkflowQueryBuilder {
   }
 
   /**
+   * Match runs whose `human`/`webhook` wait has hit its deadline
+   * (`waitingFor.expiresAt <= now`). The expiry sweep resumes these with a
+   * timeout sentinel so an unanswered approval can't park a long-running
+   * workflow forever. Mirrors {@link withTimerReady} but for human waits and
+   * keyed on `expiresAt` (the deadline) rather than `resumeAt` (a sleep wake).
+   */
+  withExpiredWait(now = new Date()) {
+    this.query.steps = {
+      $elemMatch: {
+        status: STEP_STATUS.WAITING,
+        'waitingFor.type': { $in: ['human', 'webhook'] },
+        'waitingFor.expiresAt': { $lte: now },
+      },
+    };
+    return this;
+  }
+
+  /**
    * Match runs blocked on a crash-recoverable `childWorkflow` wait that are
    * due for reconciliation.
    *
@@ -242,6 +260,16 @@ export const CommonQueries = {
   readyToResume: (now?: Date, workflowId?: string) =>
     withMaybeWorkflowId(
       WorkflowQueryBuilder.create().withStatus(RUN_STATUS.WAITING).notPaused().withTimerReady(now),
+      workflowId,
+    ).build(),
+
+  /**
+   * Runs whose human/webhook wait has expired (`waitingFor.expiresAt <= now`).
+   * The scheduler resumes each with a timeout sentinel. See `withExpiredWait`.
+   */
+  expiredWaits: (now?: Date, workflowId?: string) =>
+    withMaybeWorkflowId(
+      WorkflowQueryBuilder.create().withStatus(RUN_STATUS.WAITING).notPaused().withExpiredWait(now),
       workflowId,
     ).build(),
 
