@@ -24,6 +24,7 @@ export type {
   WaitForOptions,
   Workflow,
   WorkflowConfig,
+  WorkflowSteps,
 } from './workflow/define.js';
 /**
  * Main entry point for creating workflows.
@@ -227,12 +228,17 @@ export type {
 } from './scheduling/index.js';
 /**
  * Schedule workflows for future execution with full timezone support.
- * Handles DST transitions automatically.
+ * Handles DST transitions automatically. Recurring schedules (`daily` /
+ * `weekly` / `monthly` / cron) are driven by the engine: each scheduled
+ * pickup spawns the next occurrence as an idempotency-keyed draft.
+ * `computeNextOccurrence` lets hosts preview the next firing.
  */
 export {
+  computeNextOccurrence,
   SchedulingService,
   TimezoneHandler,
   timezoneHandler,
+  validateRecurrence,
 } from './scheduling/index.js';
 
 // ============================================================================

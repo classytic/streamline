@@ -1,3 +1,7 @@
+import { LIMITS } from '../config/constants.js';
+import { NonRetriableError } from './errors.js';
+import { logger } from './logger.js';
+
 /**
  * Calculate retry delay with exponential backoff and jitter
  *
@@ -46,4 +50,49 @@ export function resolveBackoffMultiplier(
   if (backoff === undefined || backoff === 'exponential') return defaultMultiplier;
   if (typeof backoff === 'number') return backoff;
   return 1; // linear / fixed
+}
+
+/**
+ * Approximate the persisted size of a JSON-document value in bytes (UTF-8
+ * JSON length — close enough to BSON for guard purposes). Returns `undefined`
+ * for values that can't be stringified (circular refs etc.); callers skip the
+ * guard in that case (Mongo will reject the write with its own error).
+ */
+export function approxByteSize(value: unknown): number | undefined {
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? 0 : Buffer.byteLength(json, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Guard a payload about to be persisted inline on the run document (step
+ * output / checkpoint). Warn-only past {@link LIMITS.PAYLOAD_WARN_BYTES}
+ * (1MB); throws {@link NonRetriableError} past the opt-in `maxPayloadBytes`
+ * hard cap — retrying cannot shrink the payload, and failing loudly here
+ * beats dying later at Mongo's 16MB BSON limit with an opaque driver error.
+ */
+export function guardPayloadSize(
+  kind: 'output' | 'checkpoint',
+  value: unknown,
+  info: { runId: string; stepId: string; maxPayloadBytes?: number },
+): void {
+  const size = approxByteSize(value);
+  if (size === undefined) return;
+  if (info.maxPayloadBytes !== undefined && size > info.maxPayloadBytes) {
+    throw new NonRetriableError(
+      `Step "${info.stepId}" (run ${info.runId}) ${kind} is ${size} bytes — exceeds ` +
+        `maxPayloadBytes (${info.maxPayloadBytes}). Store a reference/handle (e.g. an ` +
+        `object-store key), not the payload itself; run documents are capped at 16MB BSON.`,
+    );
+  }
+  if (size > LIMITS.PAYLOAD_WARN_BYTES) {
+    logger.warn(`Large ${kind} payload — run document growing toward Mongo's 16MB cap`, {
+      runId: info.runId,
+      stepId: info.stepId,
+      bytes: size,
+    });
+  }
 }

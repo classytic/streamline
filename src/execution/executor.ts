@@ -17,7 +17,12 @@ import {
   toError,
   WorkflowNotFoundError,
 } from '../utils/errors.js';
-import { calculateRetryDelay, resolveBackoffMultiplier } from '../utils/helpers.js';
+import {
+  calculateRetryDelay,
+  guardPayloadSize,
+  resolveBackoffMultiplier,
+} from '../utils/helpers.js';
+import { logger } from '../utils/logger.js';
 import type { WorkflowRegistry } from '../workflow/registry.js';
 import { GotoSignal, StepContextImpl, WaitSignal } from './context.js';
 
@@ -93,7 +98,38 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     private readonly signalStore?: import('../core/container.js').SignalStore,
     /** Ring-buffer cap for persisted stepLogs; threaded into each StepContextImpl. */
     private readonly maxStepLogs?: number,
+    /** Opt-in hard cap for step output/checkpoint payload bytes; warn-only when unset. */
+    private readonly maxPayloadBytes?: number,
+    /** Observability-only middleware chain (v2.6). Hook errors are swallowed. */
+    private readonly middleware?: ReadonlyArray<
+      import('../core/types.js').StepMiddleware<TContext>
+    >,
   ) {}
+
+  /**
+   * Run one middleware hook across the chain, in registration order.
+   * Observability-only contract: a hook that throws is logged and SWALLOWED —
+   * middleware can never veto, fail, or suspend a step.
+   */
+  private async runMiddlewareHook<K extends 'beforeStep' | 'afterStep' | 'onStepError' | 'onWait'>(
+    hook: K,
+    payload: Parameters<NonNullable<import('../core/types.js').StepMiddleware<TContext>[K]>>[0],
+  ): Promise<void> {
+    if (!this.middleware?.length) return;
+    for (const mw of this.middleware) {
+      const fn = mw[hook] as ((p: typeof payload) => void | Promise<void>) | undefined;
+      if (!fn) continue;
+      try {
+        await fn(payload);
+      } catch (err) {
+        logger.warn(`Step middleware "${mw.name ?? 'anonymous'}" ${hook} hook threw — ignored`, {
+          runId: (payload as { runId: string }).runId,
+          stepId: (payload as { stepId: string }).stepId,
+          error: String(err),
+        });
+      }
+    }
+  }
 
   /**
    * Abort any in-flight step execution for a workflow.
@@ -374,9 +410,21 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       abortController.signal,
       this.signalStore,
       this.maxStepLogs,
+      this.maxPayloadBytes,
     );
 
+    // Read-only facts every middleware hook receives. Computed once.
+    const middlewareInfo = {
+      runId: run._id,
+      workflowId: run.workflowId,
+      stepId,
+      attempt: stepState.attempts,
+      context: run.context,
+    };
+
     try {
+      await this.runMiddlewareHook('beforeStep', middlewareInfo);
+
       const output = await this.executeWithTimeout(
         handler,
         ctx,
@@ -384,6 +432,15 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         run._id,
         abortController,
       );
+
+      // Inline-payload guard: warn over 1MB, throw NON-retriable past the
+      // opt-in hard cap. Throwing here routes through handleFailure below,
+      // so the step fails cleanly instead of dying at Mongo's 16MB BSON cap.
+      guardPayloadSize('output', output, {
+        runId: run._id,
+        stepId,
+        ...(this.maxPayloadBytes !== undefined && { maxPayloadBytes: this.maxPayloadBytes }),
+      });
 
       // Success - update step with timing metrics
       const completedAt = new Date();
@@ -402,10 +459,18 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         retryAfter: undefined,
       });
 
+      // After the durable success write — output + timing are final.
+      await this.runMiddlewareHook('afterStep', { ...middlewareInfo, output, durationMs });
+
       this.eventBus.emit('step:completed', { runId: run._id, stepId, data: output });
       return await this.moveToNextStep(run);
     } catch (error) {
       if (error instanceof WaitSignal) {
+        await this.runMiddlewareHook('onWait', {
+          ...middlewareInfo,
+          waitType: error.type,
+          reason: error.reason,
+        });
         return await this.handleWait(run, stepId, error);
       } else if (error instanceof GotoSignal) {
         try {
@@ -418,6 +483,10 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         // Workflow was cancelled - don't treat as retriable failure, just rethrow
         throw error;
       } else {
+        await this.runMiddlewareHook('onStepError', {
+          ...middlewareInfo,
+          error: toError(error),
+        });
         return await this.handleFailure(run, stepId, error as Error);
       }
     } finally {
@@ -441,13 +510,35 @@ export class StepExecutor<TContext = Record<string, unknown>> {
 
     if (runId) {
       let consecutiveHeartbeatFailures = 0;
+      let heartbeatInFlight = false;
+      const writeHeartbeat = () =>
+        this.repository.updateOne(
+          { _id: runId },
+          { lastHeartbeat: new Date() },
+          { bypassTenant: true }, // Internal operation - already scoped by _id
+        );
       heartbeatTimer = setInterval(async () => {
+        // A slow/hung previous write must not pile up overlapping ticks —
+        // each stalled write would otherwise inflate the failure count and
+        // hammer a degraded DB with concurrent updates.
+        if (heartbeatInFlight) return;
+        heartbeatInFlight = true;
         try {
-          await this.repository.updateOne(
-            { _id: runId },
-            { lastHeartbeat: new Date() },
-            { bypassTenant: true }, // Internal operation - already scoped by _id
-          );
+          try {
+            await writeHeartbeat();
+          } catch (firstError) {
+            // One brief in-tick retry rides out transient blips (socket
+            // reset, stepdown election) without consuming a failure count —
+            // a single isolated write error should never move a step closer
+            // to the abort threshold.
+            if (abortController?.signal.aborted) throw firstError;
+            // Delay scales with the interval (1s at the default 30s cadence)
+            // so the retry never starves the failure counter when the
+            // interval is tuned down.
+            const retryDelayMs = Math.min(1_000, Math.max(10, TIMING.HEARTBEAT_INTERVAL_MS / 2));
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+            await writeHeartbeat();
+          }
           consecutiveHeartbeatFailures = 0;
         } catch (error) {
           consecutiveHeartbeatFailures++;
@@ -476,6 +567,8 @@ export class StepExecutor<TContext = Record<string, unknown>> {
               ),
             );
           }
+        } finally {
+          heartbeatInFlight = false;
         }
       }, TIMING.HEARTBEAT_INTERVAL_MS);
     }

@@ -26,6 +26,23 @@ export interface StepRetryPayload extends StepEventPayload {
   retryAfter: Date;
 }
 
+/**
+ * Non-durable streaming frame emitted via `ctx.stream(frame)` (v2.6).
+ *
+ * Contract: at-most-once, in-order per emitting process (`seq` is a
+ * per-step-execution counter), NEVER persisted, side-effect-free on run
+ * state. A crash loses unflushed frames; a retry restarts `seq` at 0.
+ * Use for live UI progress (LLM tokens, percent-complete), never for
+ * anything a later step depends on — durable data belongs in the step
+ * output / checkpoint.
+ */
+export interface StepStreamPayload extends StepEventPayload {
+  /** Monotonic per-step-execution frame counter (0-based; resets on retry). */
+  seq: number;
+  /** The host-supplied frame value. */
+  frame: unknown;
+}
+
 export interface WorkflowCompletedPayload extends BaseEventPayload {
   data?: unknown;
 }
@@ -55,6 +72,8 @@ export interface EventPayloadMap {
   'step:waiting': StepEventPayload & { data?: unknown };
   'step:skipped': StepEventPayload;
   'step:retry-scheduled': StepRetryPayload;
+  /** Non-durable streaming frames from `ctx.stream()` (v2.6, at-most-once). */
+  'step:stream': StepStreamPayload;
   'workflow:started': BaseEventPayload;
   'workflow:completed': WorkflowCompletedPayload;
   'workflow:failed': WorkflowFailedPayload;

@@ -37,6 +37,7 @@ import type {
   Step,
   StepContext,
   StepHandler,
+  StepMiddleware,
   WorkflowDefinition,
   WorkflowRun,
 } from '../core/types.js';
@@ -80,8 +81,12 @@ const toName = (id: string) =>
  * });
  * ```
  */
-export interface StepConfig<TOutput = unknown, TContext = Record<string, unknown>> {
-  handler: StepHandler<TOutput, TContext>;
+export interface StepConfig<
+  TOutput = unknown,
+  TContext = Record<string, unknown>,
+  TOutputs = Record<string, unknown>,
+> {
+  handler: StepHandler<TOutput, TContext, TOutputs>;
   timeout?: number;
   retries?: number;
   /**
@@ -118,7 +123,7 @@ export interface StepConfig<TOutput = unknown, TContext = Record<string, unknown
    * },
    * ```
    */
-  onCompensate?: StepHandler<unknown, TContext>;
+  onCompensate?: StepHandler<unknown, TContext, TOutputs>;
 
   /**
    * Max compensation attempts for this step's `onCompensate` handler when it
@@ -259,8 +264,30 @@ function toStepDef<TContext>(stepId: string, entry: StepConfig<unknown, TContext
  * };
  * ```
  */
-export interface WorkflowConfig<TContext, TInput = unknown> {
-  steps: Record<string, StepHandler<unknown, TContext> | StepConfig<unknown, TContext>>;
+/**
+ * Blocks generic inference at a use site (version-safe equivalent of TS 5.4's
+ * built-in `NoInfer`). `TOutputs` must come from the EXPLICIT type argument,
+ * never be inferred from the steps object — inferring it would be circular
+ * (handler ctx types depend on it) and collapses to implicit-any.
+ */
+type NoInferStrict<T> = [T][T extends unknown ? 0 : never];
+
+/**
+ * The steps map, keyed and return-type-checked by the declared `TOutputs`.
+ *
+ * With the default `TOutputs` (`Record<string, unknown>`) this is exactly the
+ * pre-2.6 shape — any step names, any return types. With a declared outputs
+ * interface, every key must exist, no extra keys are allowed, and each
+ * handler's resolved return type must match `TOutputs[K]`.
+ */
+export type WorkflowSteps<TContext, TOutputs = Record<string, unknown>> = {
+  [K in keyof TOutputs]:
+    | StepHandler<TOutputs[K], TContext, TOutputs>
+    | StepConfig<TOutputs[K], TContext, TOutputs>;
+};
+
+export interface WorkflowConfig<TContext, TInput = unknown, TOutputs = Record<string, unknown>> {
+  steps: WorkflowSteps<TContext, NoInferStrict<TOutputs>>;
   context?: (input: TInput) => TContext;
   version?: string;
   defaults?: {
@@ -289,6 +316,41 @@ export interface WorkflowConfig<TContext, TInput = unknown> {
    * {@link WorkflowEngineOptions.maxStepLogs}.
    */
   maxStepLogs?: number;
+
+  /**
+   * Opt-in HARD cap (bytes, JSON-approximated) for a single step output or
+   * `ctx.checkpoint()` payload. Exceeding it fails the step with a
+   * NON-retriable error (retrying can't shrink the payload) instead of
+   * letting the run document silently grow toward — and then die at —
+   * Mongo's 16MB BSON limit.
+   *
+   * Default: unset = warn-only. Payloads over 1MB log a warning naming the
+   * run/step; nothing is rejected, so existing workflows are unaffected.
+   *
+   * For large artifacts, persist a reference (object-store key, file path,
+   * doc id) and store only the reference in the output.
+   */
+  maxPayloadBytes?: number;
+
+  /**
+   * Observability-only step middleware (v2.6) — cross-cutting hooks awaited
+   * around every step execution: `beforeStep`, `afterStep` (durable output +
+   * durationMs), `onStepError`, `onWait`. Hooks run in array order; a hook
+   * that throws is logged and SWALLOWED — middleware can never veto, fail,
+   * or suspend a step. Use for metrics, tracing, token metering, structured
+   * logging.
+   *
+   * @example
+   * ```typescript
+   * createWorkflow('agent', {
+   *   steps: { ... },
+   *   middleware: [
+   *     { name: 'timing', afterStep: ({ stepId, durationMs }) => metrics.timing(stepId, durationMs) },
+   *   ],
+   * });
+   * ```
+   */
+  middleware?: ReadonlyArray<StepMiddleware<TContext>>;
 
   // ============ Distributed Primitives ============
 
@@ -630,13 +692,22 @@ export interface BindFailureToOptions<TContext = Record<string, unknown>> {
  * });
  * ```
  */
-export function createWorkflow<TContext = Record<string, unknown>, TInput = unknown>(
-  id: string,
-  config: WorkflowConfig<TContext, TInput>,
-): Workflow<TContext, TInput> {
+export function createWorkflow<
+  TContext = Record<string, unknown>,
+  TInput = unknown,
+  TOutputs = Record<string, unknown>,
+>(id: string, config: WorkflowConfig<TContext, TInput, TOutputs>): Workflow<TContext, TInput> {
   validateId(id, 'workflow');
 
-  const stepIds = Object.keys(config.steps);
+  // Internal view of the typed steps map. The TOutputs-keyed mapped type only
+  // exists for compile-time checking; at runtime it's a plain record. Same
+  // widening boundary as the TContext→unknown casts below.
+  const stepsRecord = config.steps as Record<
+    string,
+    StepHandler<unknown, TContext> | StepConfig<unknown, TContext>
+  >;
+
+  const stepIds = Object.keys(stepsRecord);
   if (stepIds.length === 0) {
     throw new Error('Workflow must have at least one step');
   }
@@ -703,8 +774,8 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
   const steps: Step[] = stepIds.map((stepId) => {
     validateId(stepId, 'step');
 
-    // stepId comes from Object.keys(config.steps) — always defined
-    const entry = config.steps[stepId]!;
+    // stepId comes from Object.keys(stepsRecord) — always defined
+    const entry = stepsRecord[stepId]!;
 
     if (isStepConfig(entry)) {
       validateRetryConfig(entry.retries, entry.timeout, entry.retryDelay, entry.retryBackoff);
@@ -759,6 +830,10 @@ export function createWorkflow<TContext = Record<string, unknown>, TInput = unkn
     ...(config.migrateRun !== undefined && { migrateRun: config.migrateRun }),
     ...(config.scheduler !== undefined && { scheduler: config.scheduler }),
     ...(config.maxStepLogs !== undefined && { maxStepLogs: config.maxStepLogs }),
+    ...(config.maxPayloadBytes !== undefined && { maxPayloadBytes: config.maxPayloadBytes }),
+    ...(config.middleware !== undefined && {
+      middleware: config.middleware as ReadonlyArray<StepMiddleware>,
+    }),
     // Only strict-concurrency workflows need the engine's terminal-event
     // slot-release listeners. Gating their registration keeps non-strict
     // workflows at zero engine bus listeners — which is what stops N

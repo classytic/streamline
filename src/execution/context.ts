@@ -10,6 +10,8 @@ import type {
   WorkflowRun,
 } from '../core/types.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
+import { NonRetriableError } from '../utils/errors.js';
+import { guardPayloadSize } from '../utils/helpers.js';
 import { logger } from '../utils/logger.js';
 
 export class WaitSignal extends Error {
@@ -34,7 +36,9 @@ export class GotoSignal extends Error {
   }
 }
 
-export class StepContextImpl<TContext = Record<string, unknown>> implements StepContext<TContext> {
+export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Record<string, unknown>>
+  implements StepContext<TContext, TOutputs>
+{
   public signal: AbortSignal;
   /** Buffered log entries — flushed to DB once after step completes */
   private readonly logBuffer: StepLogEntry[] = [];
@@ -55,8 +59,28 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
      * `WorkflowEngineOptions.maxStepLogs`; falls back to the default constant.
      */
     private maxStepLogs: number = LIMITS.MAX_STEP_LOGS,
+    /**
+     * Opt-in HARD cap (bytes) for a single step output / checkpoint payload.
+     * Threaded from `WorkflowEngineOptions.maxPayloadBytes`. Absent ⇒
+     * warn-only at {@link LIMITS.PAYLOAD_WARN_BYTES}.
+     */
+    private maxPayloadBytes?: number,
   ) {
     this.signal = signal ?? new AbortController().signal;
+  }
+
+  /**
+   * Typed, lazy view of step outputs — each property access resolves through
+   * `getOutput`, so it always reflects the loaded run's current state.
+   */
+  get outputs(): Partial<TOutputs> {
+    return new Proxy({} as Partial<TOutputs>, {
+      get: (_target, prop) => (typeof prop === 'string' ? this.getOutput(prop) : undefined),
+      has: (_target, prop) =>
+        typeof prop === 'string' && this.run.steps.some((s) => s.stepId === prop),
+      ownKeys: () => this.run.steps.map((s) => s.stepId),
+      getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }),
+    });
   }
 
   async set<K extends keyof TContext>(key: K, value: TContext[K]): Promise<void> {
@@ -133,6 +157,25 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     this.eventBus.emit(eventName as Parameters<typeof this.eventBus.emit>[0], payload);
     // Cross-process signal store (Redis/Kafka if configured)
     this.signalStore?.publish(`streamline:event:${eventName}`, payload);
+  }
+
+  /** Per-step-execution frame counter for ctx.stream (resets on retry). */
+  private streamSeq = 0;
+
+  stream(frame: unknown): void {
+    // Fire-and-forget by contract — no persistence, no abort error. A frame
+    // emitted after cancellation is simply dropped.
+    if (this.signal.aborted) return;
+    const payload = {
+      runId: this.runId,
+      stepId: this.stepId,
+      attempt: this.attempt,
+      seq: this.streamSeq++,
+      frame,
+      timestamp: new Date(),
+    };
+    this.eventBus.emit('step:stream', payload);
+    this.signalStore?.publish(`streamline:stream:${this.runId}`, payload);
   }
 
   log(message: string, data?: unknown): void {
@@ -324,6 +367,12 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
   async checkpoint<T = unknown>(value: T): Promise<void> {
     if (this.signal.aborted) return;
 
+    guardPayloadSize('checkpoint', value, {
+      runId: this.runId,
+      stepId: this.stepId,
+      ...(this.maxPayloadBytes !== undefined && { maxPayloadBytes: this.maxPayloadBytes }),
+    });
+
     const stepIndex = this.run.steps.findIndex((s) => s.stepId === this.stepId);
     if (stepIndex === -1) return;
 
@@ -350,6 +399,56 @@ export class StepContextImpl<TContext = Record<string, unknown>> implements Step
     const step = this.run.steps.find((s) => s.stepId === this.stepId);
     const output = step?.output as { __checkpoint?: T } | undefined;
     return output?.__checkpoint;
+  }
+
+  async loop<S>(
+    initial: S,
+    body: (state: S, iteration: number) => Promise<{ state: S; done: boolean }>,
+    options?: { maxIterations?: number },
+  ): Promise<S> {
+    const maxIterations = options?.maxIterations ?? 1000;
+    if (!Number.isInteger(maxIterations) || maxIterations < 1) {
+      throw new NonRetriableError(`ctx.loop: maxIterations must be a positive integer.`);
+    }
+
+    // Crash recovery: resume from the last committed iteration. The loop owns
+    // the step's checkpoint slot; a foreign checkpoint shape (no marker) means
+    // first execution — start from `initial`.
+    const saved = this.getCheckpoint<{ __loopIteration?: number; state?: S }>();
+    let state = initial;
+    let iteration = 0;
+    if (
+      saved &&
+      typeof saved === 'object' &&
+      typeof (saved as { __loopIteration?: unknown }).__loopIteration === 'number'
+    ) {
+      state = (saved as { state: S }).state;
+      iteration = (saved as { __loopIteration: number }).__loopIteration;
+    }
+
+    while (true) {
+      if (this.signal.aborted) {
+        throw new Error(`ctx.loop aborted: workflow ${this.runId} was cancelled or timed out`);
+      }
+      if (iteration >= maxIterations) {
+        throw new NonRetriableError(
+          `ctx.loop in step "${this.stepId}" exceeded maxIterations (${maxIterations}) ` +
+            `without body returning { done: true }. Raise maxIterations or fix the ` +
+            `termination condition.`,
+        );
+      }
+
+      const result = await body(state, iteration);
+      state = result.state;
+      iteration += 1;
+
+      // Durable commit of this iteration. checkpoint() also bumps the run's
+      // lastHeartbeat, so each iteration doubles as an automatic heartbeat —
+      // a long loop never trips the stale detector.
+      await this.checkpoint({ __loopIteration: iteration, state });
+
+      if (result.done) return state;
+    }
   }
 
   outputHistory<T = unknown>(stepId?: string): StepOutputVersion<T>[] {
