@@ -490,12 +490,97 @@ export interface WorkflowDefinition<TContext = Record<string, unknown>> {
   };
 }
 
-export interface StepContext<TContext = Record<string, unknown>> {
+/**
+ * Read-only facts about the step a middleware hook is observing.
+ */
+export interface StepMiddlewareInfo<TContext = Record<string, unknown>> {
+  runId: string;
+  workflowId: string;
+  stepId: string;
+  /** Attempt counter at hook time (1-based once the step is claimed). */
+  attempt: number;
+  context: TContext;
+}
+
+/**
+ * Cross-cutting observation seam around step execution (v2.6).
+ *
+ * Middleware is **observability-only**: hooks are awaited sequentially in
+ * registration order, but a hook that throws is logged and SWALLOWED — it
+ * cannot veto, retry, or mutate a step. This keeps the seam free of new
+ * control-flow failure modes; use it for metrics, tracing, token metering,
+ * structured logging, PII redaction sinks.
+ *
+ * Hook timing:
+ *   - `beforeStep`  — after the atomic claim, before the handler runs.
+ *   - `afterStep`   — after the success state is durably written
+ *                     (output + durationMs available).
+ *   - `onStepError` — handler threw a non-wait error (before retry
+ *                     scheduling / failure handling).
+ *   - `onWait`      — handler suspended (`ctx.wait` / `sleep` / `waitFor` /
+ *                     child / branch join).
+ *
+ * @example Token metering
+ * ```typescript
+ * const tokenMeter: StepMiddleware = {
+ *   name: 'token-meter',
+ *   afterStep: async ({ runId, stepId, output }) => {
+ *     const usage = (output as { usage?: { totalTokens?: number } })?.usage;
+ *     if (usage?.totalTokens) await meter.record(runId, stepId, usage.totalTokens);
+ *   },
+ * };
+ * createWorkflow('agent', { steps: { ... }, middleware: [tokenMeter] });
+ * ```
+ */
+export interface StepMiddleware<TContext = Record<string, unknown>> {
+  /** Identifier used in the swallowed-error log line. */
+  name?: string;
+  beforeStep?: (info: StepMiddlewareInfo<TContext>) => void | Promise<void>;
+  afterStep?: (
+    info: StepMiddlewareInfo<TContext> & { output: unknown; durationMs?: number },
+  ) => void | Promise<void>;
+  onStepError?: (info: StepMiddlewareInfo<TContext> & { error: Error }) => void | Promise<void>;
+  onWait?: (
+    info: StepMiddlewareInfo<TContext> & { waitType: string; reason: string },
+  ) => void | Promise<void>;
+}
+
+export interface StepContext<
+  TContext = Record<string, unknown>,
+  TOutputs = Record<string, unknown>,
+> {
   runId: string;
   stepId: string;
   context: TContext;
   input: unknown;
   attempt: number;
+
+  /**
+   * Typed, read-only view of completed step outputs.
+   *
+   * Each property is the output of the step with that ID, or `undefined` if
+   * the step hasn't completed yet (hence `Partial`). With a declared
+   * `TOutputs` interface on `createWorkflow<TContext, TInput, TOutputs>`,
+   * property access is fully typed and a typo on a step name is a compile
+   * error — no more manual `getOutput<T>('...')` casting:
+   *
+   * ```typescript
+   * interface Outputs {
+   *   fetch: { html: string };
+   *   parse: { items: number };
+   * }
+   * createWorkflow<Ctx, Input, Outputs>('scrape', {
+   *   steps: {
+   *     fetch: async (ctx) => ({ html: await get(ctx.context.url) }),
+   *     parse: async (ctx) => ({ items: count(ctx.outputs.fetch?.html) }),
+   *   },
+   * });
+   * ```
+   *
+   * Without a declared `TOutputs`, properties are `unknown` (same data as
+   * `getOutput`, which remains available for dynamic step IDs).
+   */
+  outputs: Partial<TOutputs>;
 
   /**
    * AbortSignal for step cancellation.
@@ -544,6 +629,31 @@ export interface StepContext<TContext = Record<string, unknown>> {
   log: (message: string, data?: unknown) => void;
 
   /**
+   * Emit a NON-durable streaming frame (v2.6) — live progress for UIs:
+   * LLM tokens, percent-complete, intermediate previews.
+   *
+   * Contract (deliberately weaker than everything else in streamline):
+   *   - **at-most-once** — frames are fire-and-forget on the event bus
+   *     (`step:stream`) + cross-process signal store; nothing is persisted.
+   *   - **side-effect-free on run state** — a crash loses unflushed frames,
+   *     a retry restarts `seq` at 0, and replays re-emit.
+   *   - **never load-bearing** — data a later step needs goes in the step
+   *     output or `ctx.checkpoint()`, not a stream frame.
+   *
+   * Consumers subscribe to `'step:stream'` on the container bus (arc's SSE
+   * endpoint delivers these to browsers) or `'streamline:step.stream'` on
+   * an arc-shape transport.
+   *
+   * @example
+   * ```typescript
+   * for await (const token of llm.stream(prompt)) {
+   *   ctx.stream({ token });
+   * }
+   * ```
+   */
+  stream: (frame: unknown) => void;
+
+  /**
    * Save a typed checkpoint for crash-safe batch processing (durable loop).
    * On crash recovery, `getCheckpoint<T>()` returns the last saved value.
    *
@@ -565,6 +675,46 @@ export interface StepContext<TContext = Record<string, unknown>> {
    * Use the same type parameter as your `checkpoint()` call for type safety.
    */
   getCheckpoint: <T = unknown>() => T | undefined;
+
+  /**
+   * Durable loop — the agent-loop primitive.
+   *
+   * Runs `body(state, iteration)` until it returns `{ done: true }`, durably
+   * checkpointing the state after EVERY iteration (each checkpoint write also
+   * bumps the run's heartbeat, so a long loop never trips the stale
+   * detector). On crash/restart the loop resumes from the last committed
+   * iteration — completed iterations never re-run; the interrupted iteration
+   * re-runs from its start (at-least-once per iteration, so pass
+   * `ctx.idempotencyKey(`iter:${i}`)` to external side effects).
+   *
+   * `maxIterations` (default 1000) is a hard cap: exceeding it fails the step
+   * with a NON-retriable error — a runaway agent can't spin forever.
+   *
+   * Owns the step's checkpoint slot — don't mix with `ctx.checkpoint()` /
+   * `ctx.scatter()` in the same step (same constraint scatter has).
+   *
+   * @example LLM agent loop
+   * ```typescript
+   * const final = await ctx.loop(
+   *   { messages: [seed], done: false },
+   *   async (state, i) => {
+   *     const reply = await llm.chat(state.messages, {
+   *       idempotencyKey: ctx.idempotencyKey(`iter:${i}`),
+   *     });
+   *     return {
+   *       state: { ...state, messages: [...state.messages, reply] },
+   *       done: reply.stopReason === 'end_turn',
+   *     };
+   *   },
+   *   { maxIterations: 50 },
+   * );
+   * ```
+   */
+  loop: <S>(
+    initial: S,
+    body: (state: S, iteration: number) => Promise<{ state: S; done: boolean }>,
+    options?: { maxIterations?: number },
+  ) => Promise<S>;
 
   /**
    * Start a child workflow and durably wait for it to complete.
@@ -766,9 +916,11 @@ export interface StepContext<TContext = Record<string, unknown>> {
   idempotencyKey: (scope?: string) => string;
 }
 
-export type StepHandler<TOutput = unknown, TContext = Record<string, unknown>> = (
-  ctx: StepContext<TContext>,
-) => Promise<TOutput>;
+export type StepHandler<
+  TOutput = unknown,
+  TContext = Record<string, unknown>,
+  TOutputs = Record<string, unknown>,
+> = (ctx: StepContext<TContext, TOutputs>) => Promise<TOutput>;
 
 export type WorkflowHandlers<TContext = Record<string, unknown>> = {
   [stepId: string]: StepHandler<unknown, TContext>;

@@ -19,6 +19,10 @@
  * ```
  */
 
+// Recurrence engine — next-occurrence math for recurring scheduled workflows.
+// `computeNextOccurrence` is exported for hosts that want to preview the next
+// firing; `validateRecurrence` is what `SchedulingService.schedule` enforces.
+export { computeNextOccurrence, validateRecurrence } from './recurrence.js';
 // Core scheduling service
 export {
   type GetScheduledWorkflowsOptions,

@@ -10,6 +10,7 @@ import type {
   WorkflowRun,
 } from '../core/types.js';
 import { makeWaitTimeout } from '../features/wait-resolution.js';
+import { computeNextOccurrence } from '../scheduling/recurrence.js';
 import { runSet } from '../storage/update-builders.js';
 import {
   InvalidStateError,
@@ -65,6 +66,19 @@ export interface WorkflowEngineOptions {
    * inline on the run doc) — store a reference/handle for large blobs.
    */
   maxStepLogs?: number;
+  /**
+   * Opt-in HARD cap (bytes, JSON-approximated) for a single step output or
+   * `ctx.checkpoint()` payload — exceeding it fails the step NON-retriably.
+   * Unset (default) = warn-only over 1MB. See `WorkflowConfig.maxPayloadBytes`.
+   */
+  maxPayloadBytes?: number;
+  /**
+   * Observability-only step middleware chain (v2.6) — beforeStep / afterStep /
+   * onStepError / onWait hooks awaited around every step execution. Hook
+   * errors are logged and SWALLOWED (middleware can never veto or fail a
+   * step). See `StepMiddleware`.
+   */
+  middleware?: ReadonlyArray<import('../core/types.js').StepMiddleware>;
   /**
    * Compensation handlers for saga pattern rollback.
    * Keyed by stepId. Called in reverse order when a later step fails.
@@ -212,6 +226,10 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       container.cache,
       container.signalStore,
       options.maxStepLogs,
+      options.maxPayloadBytes,
+      options.middleware as
+        | ReadonlyArray<import('../core/types.js').StepMiddleware<TContext>>
+        | undefined,
     );
 
     const schedulerConfig = {
@@ -1430,6 +1448,21 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         patch: { lastHeartbeat: now, startedAt: now, updatedAt: now },
         options: { bypassTenant: true },
       });
+
+      // Recurring schedule: the claim CAS guarantees exactly one worker won
+      // this occurrence, so the winner spawns the NEXT occurrence as a new
+      // draft. The deterministic idempotency key (`workflowId:recur:<nextISO>`)
+      // makes the spawn replay-safe — a crash-recovered or duplicate attempt
+      // dedupes against the active draft instead of double-creating.
+      if (claimed?.scheduling?.recurrence) {
+        await this.spawnNextRecurrence(claimed as WorkflowRun<TContext>).catch((err) => {
+          this.container.eventBus.emit('engine:error', {
+            runId,
+            error: toError(err),
+            context: 'recurrence-spawn',
+          });
+        });
+      }
     }
 
     // If no scheduled draft found, try to claim a concurrency-queued draft.
@@ -1483,6 +1516,46 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     this.container.eventBus.emit('workflow:retry', { runId });
 
     return this.execute(runId);
+  }
+
+  /**
+   * Create the next occurrence of a recurring scheduled run as a fresh draft.
+   *
+   * Called by `executeRetry` immediately after winning the scheduled-draft
+   * claim (exactly one worker per occurrence). The next draft:
+   *   - copies the prior run's `input`, persisted `context` (preserving any
+   *     tenant scoping already stamped into it), `priority`, `userId`, `tags`
+   *     and `meta`;
+   *   - carries `scheduling` advanced by `computeNextOccurrence` (DST-aware,
+   *     no catch-up of missed firings, `until`/`count` enforced);
+   *   - is deduplicated by a deterministic idempotency key, so replays of
+   *     this method can never double-spawn.
+   *
+   * Returns silently when the chain is finished (`computeNextOccurrence`
+   * yields null).
+   */
+  private async spawnNextRecurrence(prior: WorkflowRun<TContext>): Promise<void> {
+    if (!prior.scheduling) return;
+    const next = computeNextOccurrence(prior.scheduling);
+    if (!next) return;
+
+    const run = this.registry.createRun(prior.input, prior.meta);
+    run.status = 'draft';
+    // Preserve the persisted context (tenant scope, enrichment) rather than
+    // re-deriving from input — the prior run's context is the source of truth.
+    run.context = prior.context;
+    run.scheduling = next;
+    run.idempotencyKey = `${prior.workflowId}:recur:${next.executionTime.toISOString()}`;
+    if (prior.priority !== undefined) run.priority = prior.priority;
+    if (prior.userId !== undefined) run.userId = prior.userId;
+    if (prior.tags !== undefined) run.tags = prior.tags;
+
+    // bypassTenant: the copied context already carries the tenant field; the
+    // E11000/idempotency catch inside create() absorbs duplicate spawns.
+    await this.container.repository.create(run, { bypassTenant: true });
+
+    // Make sure something is polling to pick the new draft up when due.
+    this.scheduler.start();
   }
 
   /**

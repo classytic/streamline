@@ -25,6 +25,8 @@ export const STREAMLINE_EVENTS = {
   STEP_SKIPPED: 'streamline:step.skipped',
   STEP_RETRY_SCHEDULED: 'streamline:step.retry-scheduled',
   STEP_COMPENSATED: 'streamline:step.compensated',
+  /** Non-durable `ctx.stream()` frames (v2.6) — at-most-once, high-frequency. */
+  STEP_STREAM: 'streamline:step.stream',
 
   // Workflow lifecycle
   WORKFLOW_STARTED: 'streamline:workflow.started',
@@ -63,6 +65,7 @@ export const LEGACY_TO_CANONICAL: Readonly<Record<WorkflowEventName, StreamlineE
   'step:skipped': STREAMLINE_EVENTS.STEP_SKIPPED,
   'step:retry-scheduled': STREAMLINE_EVENTS.STEP_RETRY_SCHEDULED,
   'step:compensated': STREAMLINE_EVENTS.STEP_COMPENSATED,
+  'step:stream': STREAMLINE_EVENTS.STEP_STREAM,
   'workflow:started': STREAMLINE_EVENTS.WORKFLOW_STARTED,
   'workflow:completed': STREAMLINE_EVENTS.WORKFLOW_COMPLETED,
   'workflow:failed': STREAMLINE_EVENTS.WORKFLOW_FAILED,

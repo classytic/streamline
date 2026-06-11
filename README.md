@@ -80,6 +80,33 @@ const run = await scraper.start({ url: 'https://example.com' });
 // Auto-executes. Use `await scraper.waitFor(run._id)` to block until done.
 ```
 
+### Typed step outputs (v2.6)
+
+Declare an outputs interface once and every handler gets typed, typo-checked
+access to sibling step outputs via `ctx.outputs` — no `getOutput<T>()` casts:
+
+```typescript
+interface Outputs {
+  fetch: { html: string };
+  parse: { data: Item[] };
+  save:  { saved: boolean };
+}
+
+const scraper = createWorkflow<{ url: string }, { url: string }, Outputs>('web-scraper', {
+  steps: {
+    fetch: async (ctx) => ({ html: await fetch(ctx.context.url).then(r => r.text()) }),
+    parse: async (ctx) => ({ data: parseHTML(ctx.outputs.fetch?.html ?? '') }), // ← typed
+    save:  async (ctx) => ({ saved: await db.save(ctx.outputs.parse?.data) }),
+  },
+  context: (input) => ({ url: input.url }),
+});
+```
+
+Declared steps are checked both ways (missing/extra step = compile error,
+wrong return shape = compile error). Skip the third generic and everything
+behaves exactly as before — `ctx.outputs.x` is `unknown`, `getOutput`
+remains for dynamic step IDs.
+
 ## Step features
 
 ### Retries, timeouts, conditions
@@ -143,6 +170,39 @@ await executeParallel([
 await ctx.scatter({ a: () => fetchA(), b: () => fetchB() }, { concurrency: 4 });
 ```
 
+### Durable loop (agent loop)
+
+`ctx.loop` runs a body until it reports done, durably checkpointing state
+after **every** iteration (each checkpoint also heartbeats, so long loops
+never trip the stale detector). Crash/retry recovery resumes from the last
+committed iteration — completed iterations never re-run.
+
+```typescript
+steps: {
+  agent: async (ctx) => {
+    const final = await ctx.loop(
+      { messages: [seedPrompt] },                       // durable state
+      async (state, i) => {
+        const reply = await llm.chat(state.messages, {
+          idempotencyKey: ctx.idempotencyKey(`iter:${i}`), // effectively-once per iteration
+        });
+        return {
+          state: { messages: [...state.messages, reply] },
+          done: reply.stopReason === 'end_turn',
+        };
+      },
+      { maxIterations: 50 },  // hard cap — exceeding it fails NON-retriably
+    );
+    return { answer: final.messages.at(-1) };
+  },
+}
+```
+
+Each iteration is at-least-once (an interrupted iteration re-runs from its
+start) — pass `ctx.idempotencyKey('iter:N')` to external side effects.
+`ctx.loop` owns the step's checkpoint slot; don't mix it with
+`ctx.checkpoint()` / `ctx.scatter()` in the same step.
+
 ### Goto & rewind
 
 ```typescript
@@ -153,6 +213,65 @@ await workflow.rewindTo(runId, 'some-earlier');  // external rewind
 ### Long-running steps
 
 Heartbeats fire automatically every 30 s. Use `ctx.heartbeat()` inside tight loops to push a beat between batches. After `TIMING.HEARTBEAT_FAILURE_ABORT_THRESHOLD` (default 5) consecutive heartbeat-write failures, the executor aborts the step so the stale-detector can't cause a double execution.
+
+### Step middleware (observability seam)
+
+Cross-cutting hooks around every step — metrics, tracing, token metering,
+structured logging — without wrapping handlers. **Observability-only**: a
+hook that throws is logged and swallowed; middleware can never veto, fail,
+or suspend a step.
+
+```typescript
+createWorkflow('agent', {
+  steps: { /* ... */ },
+  middleware: [
+    {
+      name: 'token-meter',
+      beforeStep: ({ runId, stepId }) => tracer.startSpan(stepId),
+      afterStep: ({ stepId, output, durationMs }) => {
+        metrics.timing(stepId, durationMs);
+        const usage = (output as { usage?: { totalTokens?: number } })?.usage;
+        if (usage?.totalTokens) meter.record(stepId, usage.totalTokens);
+      },
+      onStepError: ({ stepId, error }) => alerting.report(stepId, error),
+      onWait: ({ stepId, waitType }) => metrics.inc(`wait.${waitType}`),
+    },
+  ],
+});
+```
+
+### Streaming progress (`ctx.stream`)
+
+Non-durable, at-most-once frames for live UIs — LLM tokens, percent-complete.
+Emitted as `step:stream` on the container bus (+ cross-process signal store);
+never persisted, never load-bearing. Arc's SSE endpoint delivers them to
+browsers out of the box.
+
+```typescript
+steps: {
+  generate: async (ctx) => {
+    for await (const token of llm.stream(prompt)) {
+      ctx.stream({ token }); // { runId, stepId, seq, frame } on 'step:stream'
+    }
+    return { text: full };
+  },
+}
+```
+
+### Payload limits (16MB doc safety)
+
+Outputs, checkpoints, context and history live inline on the run document
+(Mongo caps documents at 16MB BSON). Outputs/checkpoints over 1MB log a
+warning naming the run + step. Opt into a hard cap to fail loudly instead of
+dying later at the BSON limit:
+
+```typescript
+createWorkflow('render', {
+  steps: { /* ... */ },
+  maxPayloadBytes: 2_000_000, // over this → step fails NON-retriably
+});
+// For large artifacts store a reference (S3 key, file path, doc id), not the payload.
+```
 
 ### Non-retriable failures
 
@@ -482,6 +601,33 @@ configureStreamlineLogger({ transport: pinoAdapter });  // pino/winston/etc.
 
 Adaptive polling (10 s–5 min by load), circuit breaker, stale-running recovery, priority-ordered pickup, timezone-aware scheduling with DST handling (luxon).
 
+### Recurring schedules (v2.6)
+
+`SchedulingService` schedules one-shot AND recurring runs; the engine drives
+the chain — after the scheduler claims a recurring occurrence, the claim
+winner spawns the next one as an idempotency-keyed draft (crash- and
+multi-worker-safe; no double-spawn).
+
+```typescript
+import { SchedulingService } from '@classytic/streamline';
+
+const scheduler = new SchedulingService(workflow.definition, handlers);
+await scheduler.schedule({
+  scheduledFor: '2026-07-01T09:00:00',          // local wall-clock time
+  timezone: 'America/New_York',                  // stays 9am across DST
+  input: { report: 'weekly' },
+  recurrence: { pattern: 'weekly', daysOfWeek: [1] },  // Mondays
+  // or: { pattern: 'daily' } · { pattern: 'monthly', dayOfMonth: 31 } (clamped)
+  // or: { pattern: 'custom', cronExpression: '0 9 * * 1' } (tz-aware cron)
+  // end the chain with `until: Date` or `count: N`
+});
+```
+
+Semantics: no catch-up (occurrences missed while down are skipped, not
+replayed); occurrences are independent runs — add `concurrency: { limit: 1 }`
+to prevent overlap of long jobs. Malformed patterns throw at `schedule()`
+time. Preview the next firing with `computeNextOccurrence(run.scheduling)`.
+
 ```typescript
 workflow.engine.configure({ scheduler: { maxConcurrentExecutions: 10 } });
 // Cap concurrent runs. All slots full → scheduler skips the poll cycle.
@@ -493,10 +639,10 @@ workflow.engine.configure({ scheduler: { maxConcurrentExecutions: 10 } });
 `start(input, opts?)` · `execute(runId)` · `resume(runId, payload?)` · `get(runId)` · `cancel(runId)` · `pause(runId)` · `rewindTo(runId, stepId)` · `waitFor(runId, opts?)` · `shutdown()`
 
 **StepContext** (inside handlers):
-`ctx.set` · `ctx.getOutput` · `ctx.wait` · `ctx.waitFor` · `ctx.sleep` · `ctx.heartbeat` · `ctx.emit` · `ctx.log` · `ctx.checkpoint` · `ctx.getCheckpoint` · `ctx.scatter` · `ctx.goto` · `ctx.startChildWorkflow` · `ctx.signal` (AbortSignal)
+`ctx.outputs` (typed) · `ctx.set` · `ctx.getOutput` · `ctx.wait` · `ctx.waitFor` · `ctx.sleep` · `ctx.loop` · `ctx.stream` · `ctx.heartbeat` · `ctx.emit` · `ctx.log` · `ctx.checkpoint` · `ctx.getCheckpoint` · `ctx.scatter` · `ctx.joinBranches` · `ctx.goto` · `ctx.startChildWorkflow` · `ctx.outputHistory` · `ctx.pinOutput` · `ctx.idempotencyKey` · `ctx.signal` (AbortSignal)
 
 **Public exports** (main entry):
-`createWorkflow`, `WorkflowEngine`, `createContainer`, `createWorkflowRepository`, `WorkflowRunModel`, `WorkflowRunRepository`, `CommonQueries`, `executeParallel`, `createHook` / `resumeHook`, `globalEventBus`, `WorkflowEventBus`, `createEventSink`, `tenantFilterPlugin` / `singleTenantPlugin`, `SchedulingService`, `TimezoneHandler`. Update-doc builders: `MongoUpdate`, `normalizeUpdate`, `runSet`, `runSetUnset`, `buildStepUpdateOps`. Arc-compatible events: `InProcessStreamlineBus`, `createEvent`, `bridgeBusToTransport`, `STREAMLINE_EVENTS`, `LEGACY_TO_CANONICAL`, `DomainEvent`, `EventTransport`, `EventHandler`. Errors: `WorkflowError`, `WorkflowNotFoundError`, `StepNotFoundError`, `StepTimeoutError`, `InvalidStateError`, `DataCorruptionError`, `MaxRetriesExceededError`, `NonRetriableError`, `ErrorCode`.
+`createWorkflow`, `WorkflowEngine`, `createContainer`, `createWorkflowRepository`, `WorkflowRunModel`, `WorkflowRunRepository`, `CommonQueries`, `executeParallel`, `createHook` / `resumeHook`, `globalEventBus`, `WorkflowEventBus`, `createEventSink`, `tenantFilterPlugin` / `singleTenantPlugin`, `SchedulingService`, `TimezoneHandler`, `computeNextOccurrence` / `validateRecurrence`, `WorkflowSteps` (type). Update-doc builders: `MongoUpdate`, `normalizeUpdate`, `runSet`, `runSetUnset`, `buildStepUpdateOps`. Arc-compatible events: `InProcessStreamlineBus`, `createEvent`, `bridgeBusToTransport`, `STREAMLINE_EVENTS`, `LEGACY_TO_CANONICAL`, `DomainEvent`, `EventTransport`, `EventHandler`. Errors: `WorkflowError`, `WorkflowNotFoundError`, `StepNotFoundError`, `StepTimeoutError`, `InvalidStateError`, `DataCorruptionError`, `MaxRetriesExceededError`, `NonRetriableError`, `ErrorCode`.
 
 **Subpath entries**: `@classytic/streamline/fastify`, `@classytic/streamline/telemetry`.
 
@@ -567,6 +713,18 @@ npm run test:long   # nightly / slow CI — long-running scenarios only
 
 See [TESTING.md](./TESTING.md) for tier conventions + helpers, and
 [docs/contributing/PUBLISH_CHECKLIST.md](./docs/contributing/PUBLISH_CHECKLIST.md) for the release flow.
+
+## What's new in 2.6
+
+- **Typed step outputs** — declare a `TOutputs` interface once; `ctx.outputs.stepName` is fully typed and typo-checked, returns checked against the declaration. Zero change when undeclared.
+- **`ctx.loop`** — durable agent-loop primitive: per-iteration checkpoint + heartbeat, crash-resume from the last committed iteration, non-retriable `maxIterations` cap.
+- **Recurring schedules** — `daily`/`weekly`/`monthly`/cron recurrence is now *driven* by the engine (idempotency-keyed next-occurrence spawn; DST-aware; no catch-up; `until`/`count`).
+- **`maxPayloadBytes`** — opt-in hard cap on step output/checkpoint size (non-retriable failure with a clear message); 1MB warn-only by default.
+- **Heartbeat resilience** — in-tick retry + overlap guard; a single transient DB blip no longer counts toward the abort threshold.
+- **Step middleware** — observability-only `beforeStep`/`afterStep`/`onStepError`/`onWait` hooks (metrics, tracing, token metering); hook errors are swallowed, never affecting execution.
+- **`ctx.stream`** — non-durable, at-most-once progress frames (`step:stream` event) for live UIs; abort-safe (post-cancel frames are silently dropped).
+
+See [CHANGELOG.md](./CHANGELOG.md) for details.
 
 ## What's new in 2.2
 

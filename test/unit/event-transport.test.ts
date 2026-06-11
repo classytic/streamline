@@ -162,6 +162,7 @@ describe('STREAMLINE_EVENTS / LEGACY_TO_CANONICAL', () => {
       'step:skipped',
       'step:retry-scheduled',
       'step:compensated',
+      'step:stream',
       'workflow:started',
       'workflow:completed',
       'workflow:failed',

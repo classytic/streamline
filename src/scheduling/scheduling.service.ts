@@ -70,6 +70,7 @@ import type {
 import { hookRegistry, WorkflowEngine } from '../execution/engine.js';
 import type { TenantFilterOptions } from '../plugins/tenant-filter.plugin.js';
 import { logger } from '../utils/logger.js';
+import { validateRecurrence } from './recurrence.js';
 import { TimezoneHandler } from './timezone-handler.js';
 
 /**
@@ -285,6 +286,12 @@ export class SchedulingService<TContext = Record<string, unknown>> {
    * ```
    */
   async schedule(options: ScheduleWorkflowOptions): Promise<WorkflowRun<TContext>> {
+    // Fail loudly on a malformed recurrence at the API boundary — a bad
+    // pattern stored silently would fire once and never recur.
+    if (options.recurrence) {
+      validateRecurrence(options.recurrence);
+    }
+
     // Normalize scheduledFor to string format (if Date was provided)
     const scheduledForString =
       options.scheduledFor instanceof Date

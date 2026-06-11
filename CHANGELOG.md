@@ -6,6 +6,160 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.6.0] - 2026-06-11 — Typed outputs, durable loops, recurring schedules, payload guards
+
+One release, five additive capabilities. No behavior changes for existing
+workflows — every feature is opt-in or warn-only by default.
+
+### Added — typed step outputs (`ctx.outputs`)
+
+`createWorkflow` gains an optional third generic, `TOutputs`. Declare an
+outputs interface once and every handler gets typed, typo-checked access to
+sibling step outputs — no more `getOutput<T>('...')` casting:
+
+```ts
+interface Outputs {
+  fetch: { html: string };
+  parse: { items: number };
+}
+createWorkflow<Ctx, Input, Outputs>('scrape', {
+  steps: {
+    fetch: async (ctx) => ({ html: await get(ctx.context.url) }),
+    parse: async (ctx) => ({ items: count(ctx.outputs.fetch?.html) }),
+    //                                       ^ typed; typo = compile error
+  },
+});
+```
+
+With a declared `TOutputs`, the steps map is checked both ways: every
+declared step must exist, no extra steps are allowed, and each handler's
+resolved return type must match. Without the generic, behavior and types are
+byte-for-byte 2.5 (`ctx.outputs.x` is `unknown`); `getOutput` is unchanged
+and remains the dynamic-step-id path. `TOutputs` is deliberately
+non-inferable (`NoInfer`-guarded) — inferring it from the steps object would
+be circular and collapse to implicit-any. Runtime: `ctx.outputs` is a lazy
+proxy over the loaded run's steps (enumerable, `undefined` for incomplete
+steps). New export: `WorkflowSteps` type.
+
+### Added — `ctx.loop` (durable agent-loop primitive)
+
+```ts
+const final = await ctx.loop(
+  { messages: [seed] },
+  async (state, i) => {
+    const reply = await llm.chat(state.messages, {
+      idempotencyKey: ctx.idempotencyKey(`iter:${i}`),
+    });
+    return { state: { messages: [...state.messages, reply] }, done: reply.stop };
+  },
+  { maxIterations: 50 },
+);
+```
+
+Runs `body(state, iteration)` until `{ done: true }`, durably checkpointing
+state after EVERY iteration. Each checkpoint write also bumps the run's
+heartbeat, so a long loop never trips the stale detector. Crash/retry
+recovery resumes from the last committed iteration — completed iterations
+never re-run; the interrupted one re-runs from its start (at-least-once per
+iteration; pass `ctx.idempotencyKey('iter:N')` to external side effects).
+`maxIterations` (default 1000) fails the step NON-retriably — a runaway
+agent can't spin forever. Owns the step's checkpoint slot (same constraint
+as `ctx.scatter`).
+
+### Added — recurring schedules are now driven (daily/weekly/monthly/cron)
+
+`scheduling.recurrence` was stored but never acted on — recurring jobs
+required hand-rolled re-scheduling. Now the engine drives the chain: when
+the scheduler claims a recurring scheduled draft, the claim winner spawns
+the NEXT occurrence as a new draft with a deterministic idempotency key
+(`<workflowId>:recur:<nextFireISO>`), so a crash or duplicate pickup can
+never double-spawn.
+
+- Patterns: `daily` / `weekly` (`daysOfWeek`, 0=Sunday) / `monthly`
+  (`dayOfMonth`, clamped to short months) / `custom` (5-field cron via
+  `cron-parser`, evaluated in the schedule's IANA timezone).
+- Wall-clock semantics: "9am daily in New York" stays 9am across DST
+  (routes through the existing DST-aware `TimezoneHandler`).
+- No catch-up: occurrences missed while the engine was down are skipped,
+  not replayed.
+- `until` / `count` end the chain; `occurrences` counts firings.
+- Overlap policy: occurrences are independent runs — combine with
+  `concurrency: { limit: 1 }` to prevent overlap of long jobs.
+- `SchedulingService.schedule()` now VALIDATES `recurrence` and throws on
+  malformed patterns (was: stored silently, never fired).
+- **Legacy-data guard:** `recurrence` stored on pre-2.6 runs (when the field
+  was inert) only activates if its `pattern` is one of the four recognized
+  values (and `custom` has a `cronExpression`) — unknown shapes stay inert
+  rather than silently starting to fire. Migration note: if you DID store
+  valid recurrence data pre-2.6 expecting it to stay inert, strip it before
+  upgrading.
+- New exports: `computeNextOccurrence` (preview the next firing),
+  `validateRecurrence`. New runtime dependency: `cron-parser@^5`.
+- Dev/test matrix: built and verified against the published mongokit 3.16.0 +
+  repo-core 0.6.0 (also green on 3.14/0.5 and 3.15/0.5). Peer FLOORS are
+  unchanged (`mongokit >=3.14`, `repo-core >=0.5`, `primitives >=0.6`) —
+  streamline uses no 3.16/0.6-exclusive API, the floor stays at the versions
+  whose primitives it load-bears (`claim()`, `MongoOperatorUpdate`,
+  `HttpError`), and the open ranges already admit the new releases. Hosts on
+  mongokit 3.16 automatically get `repo.capabilities` / `watch()` on
+  streamline's repositories via inheritance.
+
+### Added — payload size guards (`maxPayloadBytes`)
+
+Step outputs, checkpoints, context and history all live inline on the run
+document; one oversized payload used to kill the run at Mongo's 16MB BSON
+cap with an opaque driver error. Now:
+
+- **Default (no config): warn-only.** Outputs/checkpoints over 1MB log a
+  warning naming the run + step. Nothing is rejected.
+- **Opt-in hard cap:** `createWorkflow('x', { maxPayloadBytes: 2_000_000 })`
+  fails the step NON-retriably (retrying can't shrink a payload) with a
+  message telling you to store a reference/handle instead.
+
+### Added — step middleware (observability seam)
+
+`createWorkflow('x', { middleware: [...] })` — cross-cutting hooks awaited
+around every step execution, in array order:
+
+- `beforeStep` — after the atomic claim, before the handler.
+- `afterStep` — after the durable success write (`output` + `durationMs`).
+- `onStepError` — handler threw a non-wait error (before retry handling).
+- `onWait` — handler suspended (`wait`/`sleep`/`waitFor`/child/branch join),
+  with `waitType` + `reason`.
+
+**Observability-only by contract:** a hook that throws is logged and
+SWALLOWED — middleware can never veto, fail, retry, or suspend a step, so
+the seam adds zero new control-flow failure modes. Use it for metrics,
+tracing, token metering, structured logging. New exports: `StepMiddleware`,
+`StepMiddlewareInfo`.
+
+### Added — `ctx.stream(frame)` (non-durable progress frames)
+
+Fire-and-forget streaming for live UIs (LLM tokens, percent-complete).
+Frames are emitted as `step:stream` on the container event bus (payload:
+`{ runId, stepId, attempt, seq, frame, timestamp }`) and republished on the
+cross-process signal store (`streamline:stream:<runId>`); the arc-shape
+transport maps it to canonical `streamline:step.stream`.
+
+Deliberately weaker contract than everything else in streamline —
+**at-most-once, never persisted, side-effect-free on run state**: a crash
+loses unflushed frames, a retry restarts `seq` at 0, and frames emitted
+after cancellation are dropped silently (abort ≠ error — same discipline as
+the AI SDK). Durable data belongs in step outputs / checkpoints, never in
+frames. Arc's SSE endpoint (`@classytic/arc/integrations/streamline`)
+delivers these to browsers. New event + payload type: `'step:stream'`,
+`StepStreamPayload`; new canonical constant `STREAMLINE_EVENTS.STEP_STREAM`.
+
+### Fixed — heartbeat resilience under transient DB blips
+
+The heartbeat loop now (a) skips a tick while the previous write is still
+in flight — a hung write no longer piles up overlapping updates or inflates
+the failure count — and (b) retries once in-tick (delay scales with the
+interval; 1s at the default 30s cadence) before counting a failure, so a
+single socket reset / replica-set stepdown no longer moves a step toward
+the abort threshold. The abort semantics past
+`HEARTBEAT_FAILURE_ABORT_THRESHOLD` are unchanged.
+
 ## [2.5.0] - 2026-06-05 — Hands-off human-in-the-loop + shared-bus listener fix
 
 A single release focused on making human-in-the-loop / approval ("hands-off")

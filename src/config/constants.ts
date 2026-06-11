@@ -84,6 +84,16 @@ export const LIMITS = {
    * (e.g. an S3 key) in context/output, not the payload itself.
    */
   MAX_STEP_LOGS: 1000,
+
+  /**
+   * Warn threshold (bytes, JSON-approximated) for a single step output /
+   * checkpoint payload. Crossing it logs a warning naming the run/step —
+   * the early signal that a workflow is growing its run document toward
+   * Mongo's 16MB BSON cap (outputs, checkpoints, context and history are
+   * all inline). A HARD cap is opt-in via `WorkflowConfig.maxPayloadBytes`
+   * (default: warn-only, no behavior change).
+   */
+  PAYLOAD_WARN_BYTES: 1_048_576, // 1MB
 } as const;
 
 export const RETRY = {
