@@ -129,7 +129,7 @@ export interface StreamlineContainer {
    * and stops it on `dispose()` — the host normally never touches it,
    * but it's exposed for tests + manual sweep triggers.
    */
-  readonly staleRunSweeper?: StaleRunSweeper;
+  readonly staleRunSweeper?: StaleRunSweeper | undefined;
   /**
    * Build retention indexes (TTL on terminal runs + tenant-prefixed
    * compound) idempotently against the live mongoose connection.
@@ -168,7 +168,7 @@ export interface ContainerOptions {
    * - If WorkflowRepositoryConfig: creates a new repository with the config
    * - If undefined: uses the default singleton repository
    */
-  repository?: WorkflowRunRepository | WorkflowRepositoryConfig;
+  repository?: WorkflowRunRepository | WorkflowRepositoryConfig | undefined;
 
   /**
    * Custom event bus instance
@@ -176,20 +176,20 @@ export interface ContainerOptions {
    * - If 'global': uses the globalEventBus (for telemetry integration)
    * - If undefined: creates a new isolated event bus
    */
-  eventBus?: WorkflowEventBus | 'global';
+  eventBus?: WorkflowEventBus | 'global' | undefined;
 
   /**
    * Custom cache instance
    * If undefined: creates a new isolated cache
    */
-  cache?: WorkflowCache;
+  cache?: WorkflowCache | undefined;
 
   /**
    * Custom signal store for durable cross-process event delivery.
    * - If SignalStore: uses the provided instance (e.g., Redis, Kafka, BullMQ adapter)
    * - If undefined: uses default in-memory store (process-local)
    */
-  signalStore?: SignalStore;
+  signalStore?: SignalStore | undefined;
 
   /**
    * Custom strict-concurrency counter repository — only consulted when a
@@ -198,7 +198,7 @@ export interface ContainerOptions {
    * `workflow_concurrency_counters`). Override for tests or to point at
    * a custom collection.
    */
-  concurrencyCounterRepository?: WorkflowConcurrencyCounterRepository;
+  concurrencyCounterRepository?: WorkflowConcurrencyCounterRepository | undefined;
 
   /**
    * Arc-compatible event transport (from `@classytic/arc/events` or any
@@ -213,7 +213,7 @@ export interface ContainerOptions {
    * primitives' `matchEventPattern` and mirrors arc's
    * `MemoryEventTransport` semantics.
    */
-  eventTransport?: EventTransport;
+  eventTransport?: EventTransport | undefined;
 
   /**
    * Retention block — TTL on terminal runs, tenant-prefixed compound
@@ -226,7 +226,7 @@ export interface ContainerOptions {
    * call `container.syncRetentionIndexes()` from a deploy script after
    * mongoose connects (PACKAGE_RULES §32).
    */
-  retention?: RetentionOptions;
+  retention?: RetentionOptions | undefined;
 }
 
 /**

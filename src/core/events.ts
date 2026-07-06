@@ -56,6 +56,17 @@ export interface WorkflowResumedPayload extends BaseEventPayload {
   data?: unknown;
 }
 
+/**
+ * Operator pause (v2.7). Emitted by `engine.pause(runId, { reason })` when it
+ * successfully transitions a running/waiting run to `paused`. Carries the
+ * optional operator reason. Distinct from `workflow:resumed`, which is reused
+ * for operator resume (and hook resume) — see the honesty note on
+ * `engine.pause`: pause takes effect at the NEXT step boundary, not mid-step.
+ */
+export interface WorkflowPausedPayload extends BaseEventPayload {
+  reason?: string;
+}
+
 export interface EngineErrorPayload {
   runId?: string;
   error: Error;
@@ -79,7 +90,10 @@ export interface EventPayloadMap {
   'workflow:failed': WorkflowFailedPayload;
   'workflow:waiting': BaseEventPayload & { data?: unknown };
   'workflow:resumed': WorkflowResumedPayload;
-  'workflow:cancelled': BaseEventPayload;
+  /** Operator pause of a running/waiting run (v2.7). */
+  'workflow:paused': WorkflowPausedPayload;
+  /** `data.reason` present when `engine.cancel(runId, { reason })` supplied one (v2.7). */
+  'workflow:cancelled': BaseEventPayload & { data?: { reason?: string } };
   'workflow:recovered': BaseEventPayload;
   'workflow:retry': BaseEventPayload;
   'workflow:compensating': BaseEventPayload & { data?: { steps: string[] } };
@@ -94,6 +108,65 @@ export interface EventPayloadMap {
 }
 
 export type WorkflowEventName = keyof EventPayloadMap;
+
+/**
+ * Compile-time-exhaustive registry of every workflow event name.
+ *
+ * `Record<WorkflowEventName, true>` is the exhaustiveness guard: adding an
+ * event to `EventPayloadMap` without listing it here is a type error, so
+ * runtime consumers that need "all events" (the event sink's default list)
+ * can never silently drop a new event — the drift class that made the
+ * pre-2.7 hand-rolled sink default miss `workflow:retry`, the saga
+ * lifecycle events, `step:compensated`, `step:stream`, `engine:error`, and
+ * `scheduler:*`. Same pattern as `LEGACY_TO_CANONICAL` in
+ * `events/event-constants.ts` (kept local to avoid a circular import).
+ */
+const WORKFLOW_EVENT_NAME_REGISTRY: Readonly<Record<WorkflowEventName, true>> = {
+  'step:started': true,
+  'step:completed': true,
+  'step:failed': true,
+  'step:waiting': true,
+  'step:skipped': true,
+  'step:retry-scheduled': true,
+  'step:stream': true,
+  'workflow:started': true,
+  'workflow:completed': true,
+  'workflow:failed': true,
+  'workflow:waiting': true,
+  'workflow:resumed': true,
+  'workflow:paused': true,
+  'workflow:cancelled': true,
+  'workflow:recovered': true,
+  'workflow:retry': true,
+  'workflow:compensating': true,
+  'step:compensated': true,
+  'workflow:compensated': true,
+  'workflow:compensation_failed': true,
+  'engine:error': true,
+  'scheduler:error': true,
+  'scheduler:circuit-open': true,
+};
+
+/** Every workflow event name, derived from the exhaustive registry above. */
+export const ALL_WORKFLOW_EVENT_NAMES: readonly WorkflowEventName[] = Object.keys(
+  WORKFLOW_EVENT_NAME_REGISTRY,
+) as WorkflowEventName[];
+
+/**
+ * Events EXCLUDED from the event sink's default subscription (explicit
+ * named set — subtracted from the exhaustive list, never hand-rolled):
+ *
+ *   - `step:stream` — non-durable, at-most-once, high-frequency frames
+ *     (`ctx.stream()`, potentially one per LLM token). Forwarding them to a
+ *     webhook/queue sink by default would flood it; hosts that want frames
+ *     opt in via `options.events`.
+ *
+ * Everything else — including telemetry (`engine:error`, `scheduler:*`) and
+ * the saga lifecycle — IS forwarded by default.
+ */
+export const EVENT_SINK_DEFAULT_EXCLUSIONS: ReadonlySet<WorkflowEventName> = new Set([
+  'step:stream',
+]);
 
 /**
  * Type-safe event bus with explicit payload types
@@ -185,31 +258,25 @@ export function createEventSink(
   options: EventSinkOptions,
   handler: EventSinkHandler,
 ): () => void {
-  const allEvents: WorkflowEventName[] = options.events ?? [
-    'step:started',
-    'step:completed',
-    'step:failed',
-    'step:waiting',
-    'step:skipped',
-    'step:retry-scheduled',
-    'workflow:started',
-    'workflow:completed',
-    'workflow:failed',
-    'workflow:waiting',
-    'workflow:resumed',
-    'workflow:cancelled',
-    'workflow:recovered',
-  ];
+  // Default: the compile-time-exhaustive event list minus the named
+  // exclusion set (see EVENT_SINK_DEFAULT_EXCLUSIONS). Pre-2.7 this was a
+  // hand-rolled 13-event array that had silently drifted behind the event
+  // map (missing workflow:retry, saga lifecycle, step:compensated,
+  // step:stream, engine:error, scheduler:*).
+  const allEvents: readonly WorkflowEventName[] =
+    options.events ??
+    ALL_WORKFLOW_EVENT_NAMES.filter((event) => !EVENT_SINK_DEFAULT_EXCLUSIONS.has(event));
 
-  const listeners: Array<{ event: WorkflowEventName; fn: (payload: any) => void }> = [];
+  const listeners: Array<{ event: WorkflowEventName; fn: (payload: unknown) => void }> = [];
 
   for (const event of allEvents) {
-    const fn = (payload: any) => {
+    const fn = (payload: unknown) => {
       // Filter by runId if specified
-      if (options.runId && payload?.runId !== options.runId) return;
+      if (options.runId && (payload as { runId?: string } | undefined)?.runId !== options.runId)
+        return;
       // Fire-and-forget: don't let sink errors crash the engine
       try {
-        const result = handler(event, payload);
+        const result = handler(event, payload as EventPayloadMap[typeof event]);
         if (result && typeof (result as Promise<void>).catch === 'function') {
           (result as Promise<void>).catch(() => {});
         }

@@ -352,6 +352,35 @@ export interface WorkflowConfig<TContext, TInput = unknown, TOutputs = Record<st
    */
   middleware?: ReadonlyArray<StepMiddleware<TContext>>;
 
+  /**
+   * Generalized per-step / per-scatter-task guard + recording middleware
+   * (v2.7). Unlike `middleware` (observability-only), a `taskMiddleware.before`
+   * hook can REJECT a step/task non-retriably; `after` records the outcome
+   * (result/error + durationMs). The engine ships NO policy — this is the seam
+   * a host composes recipes on.
+   *
+   * **Budget recipe (documented, not shipped):** track spend in an external
+   * store keyed by `runId`; in `before`, read the running total and return
+   * `{ allow: false, reason }` when it would exceed the cap; in `after`, add
+   * the just-finished unit's `actualCost` (and optionally persist it to
+   * `StepState.cost` for `getRunMetrics`). This gives per-run budget
+   * enforcement without the engine knowing what a "budget" is.
+   *
+   * @example
+   * ```typescript
+   * createWorkflow('agent', {
+   *   steps: { ... },
+   *   taskMiddleware: [{
+   *     before: ({ runId }) => spent.get(runId) >= CAP
+   *       ? { allow: false, reason: 'budget exceeded' }
+   *       : { allow: true },
+   *     after: ({ runId, result }) => { spent.add(runId, costOf(result)); },
+   *   }],
+   * });
+   * ```
+   */
+  taskMiddleware?: ReadonlyArray<import('../core/types.js').TaskMiddleware>;
+
   // ============ Distributed Primitives ============
 
   /**
@@ -554,10 +583,23 @@ export interface Workflow<TContext, TInput = unknown> {
   get: (runId: string) => Promise<WorkflowRun<TContext> | null>;
   execute: (runId: string) => Promise<WorkflowRun<TContext>>;
   resume: (runId: string, payload?: unknown) => Promise<WorkflowRun<TContext>>;
-  cancel: (runId: string) => Promise<WorkflowRun<TContext>>;
-  pause: (runId: string) => Promise<WorkflowRun<TContext>>;
+  /** Cancel a run. `{ reason }` (v2.7) persists on the run + `workflow:cancelled` payload. */
+  cancel: (runId: string, options?: { reason?: string }) => Promise<WorkflowRun<TContext>>;
+  /** Operator-pause a run at the next step boundary. `{ reason }` (v2.7) echoed in `workflow:paused`. */
+  pause: (runId: string, options?: { reason?: string }) => Promise<WorkflowRun<TContext>>;
+  /** Operator-resume a paused run from the same step (v2.7). Symmetric with `pause`. */
+  resumeOperator: (runId: string, options?: { data?: unknown }) => Promise<WorkflowRun<TContext>>;
   rewindTo: (runId: string, stepId: string) => Promise<WorkflowRun<TContext>>;
   waitFor: (runId: string, options?: WaitForOptions) => Promise<WorkflowRun<TContext>>;
+  /** Latest queryable progress for one step (v2.7). */
+  getStepProgress: (
+    runId: string,
+    stepId: string,
+  ) => Promise<import('../core/types.js').StepProgress | undefined>;
+  /** Current status + latest progress of every step (v2.7). */
+  getRunProgress: (runId: string) => Promise<import('../core/types.js').RunProgress | null>;
+  /** Aggregated run metrics — durations, attempts, cost (v2.7). */
+  getRunMetrics: (runId: string) => Promise<import('../core/types.js').RunMetrics | null>;
   shutdown: () => void;
   definition: WorkflowDefinition<TContext>;
   engine: WorkflowEngine<TContext>;
@@ -834,6 +876,7 @@ export function createWorkflow<
     ...(config.middleware !== undefined && {
       middleware: config.middleware as ReadonlyArray<StepMiddleware>,
     }),
+    ...(config.taskMiddleware !== undefined && { taskMiddleware: config.taskMiddleware }),
     // Only strict-concurrency workflows need the engine's terminal-event
     // slot-release listeners. Gating their registration keeps non-strict
     // workflows at zero engine bus listeners — which is what stops N
@@ -1161,10 +1204,14 @@ export function createWorkflow<
     get: (runId) => engine.get(runId),
     execute: (runId) => engine.execute(runId),
     resume: (runId, payload) => engine.resume(runId, payload),
-    cancel: (runId) => engine.cancel(runId),
-    pause: (runId) => engine.pause(runId),
+    cancel: (runId, options) => engine.cancel(runId, options),
+    pause: (runId, options) => engine.pause(runId, options),
+    resumeOperator: (runId, options) => engine.resumeOperator(runId, options),
     rewindTo: (runId, stepId) => engine.rewindTo(runId, stepId),
     waitFor,
+    getStepProgress: (runId, stepId) => engine.getStepProgress(runId, stepId),
+    getRunProgress: (runId) => engine.getRunProgress(runId),
+    getRunMetrics: (runId) => engine.getRunMetrics(runId),
     shutdown: () => {
       // Remove only THIS workflow's trigger listener (safe for shared buses)
       if (config.trigger?.event && triggerListener) {

@@ -94,6 +94,29 @@ export const LIMITS = {
    * (default: warn-only, no behavior change).
    */
   PAYLOAD_WARN_BYTES: 1_048_576, // 1MB
+
+  /**
+   * Throttle interval (ms) for `ctx.reportProgress()` durable persistence
+   * (v2.7). At most one `StepState.lastProgress` DB write per step per this
+   * window; rapid calls coalesce latest-wins in memory. The final value is
+   * always flushed on step completion regardless of the window.
+   */
+  PROGRESS_PERSIST_THROTTLE_MS: 1000,
+
+  /**
+   * Max serialized size (bytes, JSON-approximated) for a single
+   * `StepProgress` snapshot (v2.7). Over budget, `message` is truncated so the
+   * inline `lastProgress` subdoc stays bounded (~1KB).
+   */
+  PROGRESS_MAX_BYTES: 1024,
+
+  /**
+   * Max total serialized size (bytes) of a single step's `ctx.dedupe` cache
+   * (v2.7). A value that would push the step's cache over this budget is NOT
+   * cached — `fn` runs and a warning is logged — so a large memoized value
+   * degrades to "run every time" instead of growing the run doc.
+   */
+  DEDUPE_MAX_BYTES: 10 * 1024, // 10KB
 } as const;
 
 export const RETRY = {

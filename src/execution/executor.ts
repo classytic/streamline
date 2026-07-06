@@ -13,6 +13,7 @@ import {
 } from '../storage/update-builders.js';
 import {
   InvalidStateError,
+  NonRetriableError,
   StepNotFoundError,
   toError,
   WorkflowNotFoundError,
@@ -104,7 +105,93 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     private readonly middleware?: ReadonlyArray<
       import('../core/types.js').StepMiddleware<TContext>
     >,
+    /**
+     * Generalized guard/record middleware (v2.7) for steps AND scatter tasks.
+     * `before` can reject non-retriably; `after` records outcome + durationMs.
+     */
+    private readonly taskMiddleware?: ReadonlyArray<import('../core/types.js').TaskMiddleware>,
   ) {}
+
+  /**
+   * Run the `before` guards of the task-middleware chain (v2.7) for a step or
+   * scatter task. Returns the FIRST `{ allow: false }` reason, or `undefined`
+   * when every guard allows (or no middleware is configured). A guard that
+   * THROWS is treated as a rejection carrying its message — fail-closed, since
+   * a guard is a policy gate (unlike observability middleware, which swallows).
+   */
+  async runTaskBefore(
+    info: import('../core/types.js').TaskHookContext,
+  ): Promise<{ rejected: false } | { rejected: true; reason?: string }> {
+    if (!this.taskMiddleware?.length) return { rejected: false };
+    for (const mw of this.taskMiddleware) {
+      if (!mw.before) continue;
+      let result: import('../core/types.js').TaskGuardResult;
+      try {
+        result = await mw.before(info);
+      } catch (err) {
+        return { rejected: true, reason: toError(err).message };
+      }
+      if (!result.allow) {
+        return {
+          rejected: true,
+          ...(result.reason !== undefined ? { reason: result.reason } : {}),
+        };
+      }
+    }
+    return { rejected: false };
+  }
+
+  /**
+   * Run the `after` recording hooks of the task-middleware chain (v2.7). Errors
+   * thrown by `after` are logged and SWALLOWED — recording is best-effort and
+   * must never fail a step/task.
+   */
+  async runTaskAfter(
+    info: import('../core/types.js').TaskHookContext & {
+      result?: unknown;
+      error?: unknown;
+      durationMs: number;
+    },
+  ): Promise<void> {
+    if (!this.taskMiddleware?.length) return;
+    for (const mw of this.taskMiddleware) {
+      if (!mw.after) continue;
+      try {
+        await mw.after(info);
+      } catch (err) {
+        logger.warn('[streamline] taskMiddleware after hook threw — ignored', {
+          runId: info.runId,
+          stepId: info.stepId,
+          ...(info.taskKey !== undefined ? { taskKey: info.taskKey } : {}),
+          error: String(err),
+        });
+      }
+    }
+  }
+
+  /** Whether any task-middleware is configured (context uses this to gate scatter hooks). */
+  get hasTaskMiddleware(): boolean {
+    return !!this.taskMiddleware?.length;
+  }
+
+  /**
+   * Best-effort tenant id for the task-middleware `TaskHookContext` (v2.7).
+   * Reads the repository's configured `tenantField` (default `context.tenantId`)
+   * off the run. Returns `undefined` when absent — the field is optional.
+   */
+  private readTenantId(run: WorkflowRun<TContext>): string | undefined {
+    const field = (this.repository as { tenantField?: string }).tenantField ?? 'context.tenantId';
+    const parts = field.split('.');
+    let cursor: unknown = run;
+    for (const p of parts) {
+      if (cursor && typeof cursor === 'object' && p in (cursor as Record<string, unknown>)) {
+        cursor = (cursor as Record<string, unknown>)[p];
+      } else {
+        return undefined;
+      }
+    }
+    return typeof cursor === 'string' ? cursor : undefined;
+  }
 
   /**
    * Run one middleware hook across the chain, in registration order.
@@ -398,6 +485,40 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     this.activeControllers.set(run._id, abortController);
 
     const { step: stepState } = this.findStepOrThrow(run, stepId);
+
+    // Facts for the generalized task-middleware (v2.7). `taskKey` is absent at
+    // the STEP level (set only for scatter sub-tasks). `tenantId` is read from
+    // the configured tenant field on the run context when present.
+    const tenantId = this.readTenantId(run);
+    const taskInfo: import('../core/types.js').TaskHookContext = {
+      runId: run._id,
+      workflowId: run.workflowId,
+      stepId,
+      attempt: stepState.attempts,
+      ...(tenantId !== undefined ? { tenantId } : {}),
+    };
+    const taskStartedAt = Date.now();
+
+    // Per-scatter-task hooks (v2.7) — only supplied when task-middleware exists,
+    // so the default scatter path stays untouched. Each scatter task reuses the
+    // step's attempt/tenant and stamps its own `taskKey`.
+    const taskHooks = this.hasTaskMiddleware
+      ? {
+          workflowId: run.workflowId,
+          ...(tenantId !== undefined ? { tenantId } : {}),
+          before: (taskKey: string) =>
+            this.runTaskBefore({ ...taskInfo, taskKey }).then((r) =>
+              r.rejected
+                ? { rejected: true, ...(r.reason !== undefined ? { reason: r.reason } : {}) }
+                : { rejected: false },
+            ),
+          after: (
+            taskKey: string,
+            outcome: { result?: unknown; error?: unknown; durationMs: number },
+          ) => this.runTaskAfter({ ...taskInfo, taskKey, ...outcome }),
+        }
+      : undefined;
+
     const ctx = new StepContextImpl(
       run._id,
       stepId,
@@ -411,6 +532,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       this.signalStore,
       this.maxStepLogs,
       this.maxPayloadBytes,
+      taskHooks,
     );
 
     // Read-only facts every middleware hook receives. Computed once.
@@ -424,6 +546,14 @@ export class StepExecutor<TContext = Record<string, unknown>> {
 
     try {
       await this.runMiddlewareHook('beforeStep', middlewareInfo);
+
+      // Generalized guard (v2.7): a `before` rejection fails the step
+      // NON-retriably with the supplied reason (routes through handleFailure,
+      // which honors `retriable: false`).
+      const guard = await this.runTaskBefore(taskInfo);
+      if (guard.rejected) {
+        throw new NonRetriableError(guard.reason ?? `Step "${stepId}" rejected by task guard`);
+      }
 
       const output = await this.executeWithTimeout(
         handler,
@@ -462,9 +592,25 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       // After the durable success write — output + timing are final.
       await this.runMiddlewareHook('afterStep', { ...middlewareInfo, output, durationMs });
 
+      // Generalized `after` recording hook (v2.7) — success outcome.
+      await this.runTaskAfter({
+        ...taskInfo,
+        result: output,
+        durationMs: Date.now() - taskStartedAt,
+      });
+
       this.eventBus.emit('step:completed', { runId: run._id, stepId, data: output });
       return await this.moveToNextStep(run);
     } catch (error) {
+      // Generalized `after` recording hook (v2.7) — error outcome. WaitSignal /
+      // GotoSignal are control flow, not failures, so skip them.
+      if (!(error instanceof WaitSignal) && !(error instanceof GotoSignal)) {
+        await this.runTaskAfter({
+          ...taskInfo,
+          error,
+          durationMs: Date.now() - taskStartedAt,
+        });
+      }
       if (error instanceof WaitSignal) {
         await this.runMiddlewareHook('onWait', {
           ...middlewareInfo,
@@ -490,8 +636,22 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         return await this.handleFailure(run, stepId, error as Error);
       }
     } finally {
-      // Flush buffered logs to DB in a single write (avoids N+1)
-      ctx.flushLogs().catch(() => {});
+      // Flush buffered logs to DB in a single write (avoids N+1).
+      // Fire-and-forget by design — a log-flush failure must not fail the
+      // step — but warn so dropped step logs are diagnosable.
+      ctx.flushLogs().catch((err: unknown) => {
+        logger.warn('[streamline] step log flush failed — buffered ctx.log entries dropped', {
+          runId: run._id,
+          stepId,
+          error: toError(err).message,
+        });
+      });
+      // Always flush the FINAL reported progress (v2.7) — coalesced snapshots
+      // inside the throttle window would otherwise be lost. AWAITED so the
+      // durable `lastProgress` is committed before the step returns (a caller
+      // reading `getStepProgress` right after must see the final value).
+      // Progress is advisory, so swallow failures.
+      await ctx.flushProgress().catch(() => {});
       // Unregister controller when step completes (success, failure, or wait)
       this.activeControllers.delete(run._id);
     }

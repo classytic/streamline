@@ -5,7 +5,7 @@
  *
  * @example
  * ```typescript
- * import { SchedulingService, TimezoneHandler } from '@classytic/streamline/scheduling';
+ * import { SchedulingService, TimezoneHandler } from '@classytic/streamline';
  *
  * // Create scheduling service
  * const scheduler = new SchedulingService(workflow, handlers);

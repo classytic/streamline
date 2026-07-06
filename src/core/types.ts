@@ -116,7 +116,7 @@ export interface Step {
    * })
    * ```
    */
-  condition?: (context: unknown, run: WorkflowRun) => boolean | Promise<boolean>;
+  condition?: ((context: unknown, run: WorkflowRun) => boolean | Promise<boolean>) | undefined;
 
   /**
    * Skip this step if the predicate returns true.
@@ -127,7 +127,7 @@ export interface Step {
    * step({ id: 'optional-step', name: 'Optional', skipIf: (ctx) => !ctx.featureEnabled })
    * ```
    */
-  skipIf?: (context: unknown) => boolean | Promise<boolean>;
+  skipIf?: ((context: unknown) => boolean | Promise<boolean>) | undefined;
 
   /**
    * Only run this step if the predicate returns true.
@@ -138,7 +138,7 @@ export interface Step {
    * step({ id: 'premium-feature', name: 'Premium', runIf: (ctx) => ctx.isPremiumUser })
    * ```
    */
-  runIf?: (context: unknown) => boolean | Promise<boolean>;
+  runIf?: ((context: unknown) => boolean | Promise<boolean>) | undefined;
 
   // ============ Versioned Output History (opt-in) ============
 
@@ -207,9 +207,40 @@ export interface StepLogEntry {
 
 export interface StepError {
   message: string;
-  code?: string;
-  retriable?: boolean;
-  stack?: string;
+  // `| undefined` (exactOptionalPropertyTypes): builders pass through
+  // possibly-absent `error.code` / `error.stack` values verbatim.
+  code?: string | undefined;
+  retriable?: boolean | undefined;
+  stack?: string | undefined;
+}
+
+/**
+ * Queryable, bounded step-progress snapshot (v2.7).
+ *
+ * Unlike `ctx.stream()` frames (non-durable, at-most-once, never persisted),
+ * `StepProgress` is the LATEST-WINS durable state a step reports via
+ * `ctx.reportProgress(p)`. It answers "what is this step doing RIGHT NOW?" for
+ * a UI page-refresh or a new client that has no stream history — read back via
+ * `engine.getStepProgress(runId, stepId)` / `engine.getRunProgress(runId)`.
+ *
+ * Every field is optional except `at`. Persistence is THROTTLED (at most one DB
+ * write per second per step, latest-wins-coalesced, always flushed on step
+ * completion) so a renderer emitting frames rapidly can't hammer Mongo. The
+ * serialized size is bounded (~1KB) — `message` is truncated if the snapshot
+ * would exceed the cap. All fields are host-defined semantics; the engine never
+ * interprets them for control flow.
+ */
+export interface StepProgress {
+  /** Coarse phase label (e.g. 'downloading', 'rendering'). Host-defined. */
+  phase?: string | undefined;
+  /** 0–100 completion percentage. Host-defined; not clamped by the engine. */
+  percent?: number | undefined;
+  /** Short human-readable status line. Truncated if the snapshot exceeds ~1KB. */
+  message?: string | undefined;
+  /** Host estimate of remaining time in seconds. */
+  estimatedSecondsRemaining?: number | undefined;
+  /** When this snapshot was reported (the only required field). */
+  at: Date;
 }
 
 export interface WorkflowError {
@@ -247,7 +278,9 @@ export interface JoinBranchResult {
   childRunId?: string;
   status: 'done' | 'failed' | 'cancelled';
   output?: unknown;
-  error?: StepError;
+  // `| undefined` (exactOptionalPropertyTypes): the join reconstructor maps
+  // a possibly-absent child `error` field through verbatim.
+  error?: StepError | undefined;
 }
 
 /**
@@ -269,7 +302,11 @@ export interface JoinResult {
 export interface WaitingFor {
   type: 'human' | 'webhook' | 'timer' | 'event' | 'childWorkflow' | 'branchJoin';
   reason: string;
-  resumeAt?: Date;
+  // Optional fields carry `| undefined` (exactOptionalPropertyTypes): the
+  // executor builds WaitingFor literals from possibly-absent signal fields
+  // and mongoose's $set drops explicit-undefined keys, so "explicitly
+  // undefined" and "absent" are the same persisted state here.
+  resumeAt?: Date | undefined;
   /**
    * Deadline for a `human` / `webhook` wait. When set and reached, the
    * scheduler's expiry sweep resumes the step with a timeout sentinel
@@ -281,8 +318,8 @@ export interface WaitingFor {
    * `ctx.wait(reason, { expiresAt })` data by the executor. Default-absent:
    * a wait without it parks indefinitely (the prior behaviour).
    */
-  expiresAt?: Date;
-  eventName?: string;
+  expiresAt?: Date | undefined;
+  eventName?: string | undefined;
   data?: unknown;
   /**
    * Reconciliation cadence gate for poll-recoverable waits (`childWorkflow`
@@ -304,19 +341,24 @@ export interface StepState<TOutput = unknown> {
   stepId: string;
   status: StepStatus;
   attempts: number;
-  startedAt?: Date;
-  completedAt?: Date;
-  endedAt?: Date;
+  // Lifecycle fields carry `| undefined` (exactOptionalPropertyTypes): the
+  // executor's retry/rewind paths deliberately CLEAR them by assigning
+  // `undefined` in `Partial<StepState>` patches (mongoose drops
+  // explicit-undefined keys on $set, i.e. field reset), so `undefined` is
+  // a legitimate write value, not just "absent".
+  startedAt?: Date | undefined;
+  completedAt?: Date | undefined;
+  endedAt?: Date | undefined;
   /**
    * Actual execution duration in milliseconds (completedAt - startedAt).
    * Only set when step completes (done/failed/skipped).
    * Useful for performance monitoring and SLA tracking.
    */
-  durationMs?: number;
+  durationMs?: number | undefined;
   output?: TOutput;
-  waitingFor?: WaitingFor;
-  error?: StepError;
-  retryAfter?: Date; // Exponential backoff - don't retry before this time
+  waitingFor?: WaitingFor | undefined;
+  error?: StepError | undefined;
+  retryAfter?: Date | undefined; // Exponential backoff - don't retry before this time
   /**
    * Bounded ring buffer of prior committed outputs, populated only when the
    * step opts in via `Step.outputHistory.keep > 0` AND the step is re-run
@@ -339,6 +381,31 @@ export interface StepState<TOutput = unknown> {
    * overlaps `output` (invariant #9). Default-absent on non-saga runs.
    */
   compensation?: StepCompensationState;
+  /**
+   * Latest queryable progress snapshot for this step (v2.7). Written via
+   * `ctx.reportProgress()` with THROTTLED, latest-wins persistence (≤1 DB
+   * write/second/step + a final flush on completion). Read back via
+   * `engine.getStepProgress` / `engine.getRunProgress`. Bounded (~1KB). NEVER
+   * overlaps `output` (invariant #9). Default-absent on steps that never
+   * report progress (no schema growth, no migration).
+   */
+  lastProgress?: StepProgress | undefined;
+  /**
+   * Durable per-step memoization cache for `ctx.dedupe()` (v2.7). Maps a
+   * host-chosen key to the resolved value, committed to the run doc so a retry
+   * / crash-replay returns the cached value WITHOUT re-running the producer.
+   * Bounded (~10KB serialized per step); an over-budget value is not cached.
+   * NEVER overlaps `output` (invariant #9). Default-absent on steps that never
+   * call `ctx.dedupe`.
+   */
+  dedupeCache?: Record<string, unknown> | undefined;
+  /**
+   * Host-recorded per-step cost (v2.7) — an arbitrary numeric weight (tokens,
+   * dollars, credits). Populated ONLY when a host writes it, typically from a
+   * `taskMiddleware.after` hook. `engine.getRunMetrics` sums it across steps.
+   * The engine never interprets it. Default-absent (no schema growth).
+   */
+  cost?: number | undefined;
 }
 
 /**
@@ -360,9 +427,9 @@ export interface SchedulingInfo {
   /** Whether this time falls during a DST transition */
   isDSTTransition: boolean;
   /** Human-readable note about DST adjustments (if any) */
-  dstNote?: string;
+  dstNote?: string | undefined;
   /** Optional recurrence pattern for repeating workflows */
-  recurrence?: RecurrencePattern;
+  recurrence?: RecurrencePattern | undefined;
 }
 
 /**
@@ -394,11 +461,14 @@ export interface WorkflowRun<TContext = Record<string, unknown>> {
   context: TContext;
   input: unknown;
   output?: unknown;
-  error?: WorkflowError; // Set when workflow fails due to unrecoverable error
+  // `| undefined` (exactOptionalPropertyTypes): rewind/goto paths CLEAR
+  // completion fields by assigning `undefined` (mongoose drops
+  // explicit-undefined keys on $set — a field reset, not a value).
+  error?: WorkflowError | undefined; // Set when workflow fails due to unrecoverable error
   createdAt: Date;
   updatedAt: Date;
-  startedAt?: Date;
-  endedAt?: Date;
+  startedAt?: Date | undefined;
+  endedAt?: Date | undefined;
   lastHeartbeat?: Date; // For detecting stale/stuck running workflows
   paused?: boolean; // User-initiated pause - scheduler skips paused workflows
   /** Timezone-aware scheduling metadata (optional - only for scheduled workflows) */
@@ -422,9 +492,17 @@ export interface WorkflowRun<TContext = Record<string, unknown>> {
   priority?: number;
   /** Concurrency grouping key (set by engine when concurrency config is active) */
   concurrencyKey?: string;
-  userId?: string;
-  tags?: string[];
-  meta?: Record<string, unknown>;
+  userId?: string | undefined;
+  tags?: string[] | undefined;
+  meta?: Record<string, unknown> | undefined;
+  /**
+   * Operator-supplied cancellation reason (v2.7). Persisted by
+   * `engine.cancel(runId, { reason })` and echoed in the `workflow:cancelled`
+   * event payload. Optional + default-absent — `cancel(runId)` with no reason
+   * leaves it unset (byte-for-byte the pre-2.7 shape). Never overwritten on a
+   * terminal-run cancel no-op.
+   */
+  cancellationReason?: string | undefined;
   /**
    * Snapshot of the workflow definition's `version` at the time the run
    * was created. Required for in-flight runs to resume on the version
@@ -460,34 +538,36 @@ export interface WorkflowDefinition<TContext = Record<string, unknown>> {
    * Default values for all steps in this workflow.
    * Individual steps can override these defaults.
    */
-  defaults?: {
-    /**
-     * Maximum number of execution attempts for each step (including initial attempt).
-     * @default 3
-     */
-    retries?: number;
-    /**
-     * Maximum execution time in milliseconds for each step.
-     * @default undefined (no timeout)
-     */
-    timeout?: number;
-    /**
-     * Base delay in milliseconds before the first retry.
-     * @default 1000 (1 second)
-     */
-    retryDelay?: number;
-    /**
-     * Backoff strategy for retries.
-     * @default 'exponential'
-     */
-    retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
-    /**
-     * Workflow-wide default for the opt-in output-history ring buffer.
-     * Per-step `Step.outputHistory` overrides this. `keep` 0/undefined ⇒
-     * disabled (byte-for-byte v2.3.4 — no new writes, no schema growth).
-     */
-    outputHistory?: { keep: number };
-  };
+  defaults?:
+    | {
+        /**
+         * Maximum number of execution attempts for each step (including initial attempt).
+         * @default 3
+         */
+        retries?: number;
+        /**
+         * Maximum execution time in milliseconds for each step.
+         * @default undefined (no timeout)
+         */
+        timeout?: number;
+        /**
+         * Base delay in milliseconds before the first retry.
+         * @default 1000 (1 second)
+         */
+        retryDelay?: number;
+        /**
+         * Backoff strategy for retries.
+         * @default 'exponential'
+         */
+        retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+        /**
+         * Workflow-wide default for the opt-in output-history ring buffer.
+         * Per-step `Step.outputHistory` overrides this. `keep` 0/undefined ⇒
+         * disabled (byte-for-byte v2.3.4 — no new writes, no schema growth).
+         */
+        outputHistory?: { keep: number };
+      }
+    | undefined;
 }
 
 /**
@@ -537,12 +617,101 @@ export interface StepMiddleware<TContext = Record<string, unknown>> {
   name?: string;
   beforeStep?: (info: StepMiddlewareInfo<TContext>) => void | Promise<void>;
   afterStep?: (
-    info: StepMiddlewareInfo<TContext> & { output: unknown; durationMs?: number },
+    info: StepMiddlewareInfo<TContext> & { output: unknown; durationMs?: number | undefined },
   ) => void | Promise<void>;
   onStepError?: (info: StepMiddlewareInfo<TContext> & { error: Error }) => void | Promise<void>;
   onWait?: (
     info: StepMiddlewareInfo<TContext> & { waitType: string; reason: string },
   ) => void | Promise<void>;
+}
+
+/**
+ * Read-only facts a {@link TaskMiddleware} hook observes (v2.7).
+ *
+ * Fires around each STEP and each SCATTER TASK. `taskKey` is set only for a
+ * scatter sub-task (the task's key/index); it is absent for a plain step.
+ */
+export interface TaskHookContext {
+  runId: string;
+  stepId: string;
+  workflowId: string;
+  /** Set for a scatter sub-task (its key); absent for a whole-step invocation. */
+  taskKey?: string | undefined;
+  /** Attempt counter at hook time (1-based once the step is claimed). */
+  attempt: number;
+  tenantId?: string | undefined;
+}
+
+/**
+ * Result of a {@link TaskMiddleware} `before` guard.
+ *
+ * `{ allow: false, reason }` rejects the step/task with a NON-RETRIABLE error
+ * carrying `reason` — the step fails without retry, or the single scatter task
+ * is rejected while its siblings proceed.
+ */
+export type TaskGuardResult = { allow: true } | { allow: false; reason?: string | undefined };
+
+/**
+ * General per-step / per-scatter-task guard + recording middleware (v2.7).
+ *
+ * A GENERALIZED seam — the engine bakes in NO policy (no budget, no cost model).
+ * Hosts compose recipes on top: e.g. a spend budget = read the running total in
+ * `before` and reject when over; record `actualCost` in `after`. See the
+ * `taskMiddleware` config field and the CHANGELOG "budget recipe".
+ *
+ * Timing:
+ *   - `before` — before each step handler AND before each scatter task. Return
+ *     `{ allow: false, reason }` to reject that unit non-retriably. Absent /
+ *     `{ allow: true }` ⇒ proceed. Multiple middlewares run in order; the FIRST
+ *     `allow: false` short-circuits.
+ *   - `after`  — after each step/task settles, with `result` (on success) or
+ *     `error` (on failure) plus `durationMs`. The recording hook (write cost
+ *     here). Errors thrown by `after` are logged and swallowed.
+ */
+export interface TaskMiddleware {
+  before?: (ctx: TaskHookContext) => Promise<TaskGuardResult> | TaskGuardResult;
+  after?: (
+    ctx: TaskHookContext & {
+      result?: unknown;
+      error?: unknown;
+      durationMs: number;
+    },
+  ) => Promise<void> | void;
+}
+
+/**
+ * Aggregated run-level metrics (v2.7), returned by `engine.getRunMetrics`.
+ * Pure aggregation over the run doc's `StepState` — no new storage beyond the
+ * optional per-step `cost` field. Queryable for both terminal and in-flight
+ * runs.
+ */
+export interface RunMetrics {
+  runId: string;
+  status: RunStatus;
+  steps: Array<{
+    stepId: string;
+    durationMs?: number | undefined;
+    attempts: number;
+    cost?: number | undefined;
+  }>;
+  /** Sum of per-step `durationMs` (missing durations count as 0). */
+  totalDurationMs: number;
+  /** Sum of per-step `cost` when ANY step has a cost; otherwise `undefined`. */
+  totalCost?: number | undefined;
+}
+
+/**
+ * Queryable run-progress snapshot (v2.7), returned by `engine.getRunProgress`.
+ * A plain read off the run doc: the run status plus every step's status and
+ * latest {@link StepProgress}.
+ */
+export interface RunProgress {
+  status: RunStatus;
+  steps: Array<{
+    stepId: string;
+    status: StepStatus;
+    lastProgress?: StepProgress | undefined;
+  }>;
 }
 
 export interface StepContext<
@@ -652,6 +821,64 @@ export interface StepContext<
    * ```
    */
   stream: (frame: unknown) => void;
+
+  /**
+   * Report the step's LATEST queryable progress (v2.7) — durable, latest-wins.
+   *
+   * Unlike `ctx.stream()` (non-durable frames for a live subscriber),
+   * `reportProgress` persists a bounded {@link StepProgress} snapshot onto the
+   * run doc's `StepState.lastProgress`, so a UI page-refresh or a brand-new
+   * client can read "what is this step doing now?" WITHOUT replaying stream
+   * history — via `engine.getStepProgress` / `engine.getRunProgress`.
+   *
+   * Persistence is THROTTLED to protect Mongo: at most one write per second per
+   * step, coalescing rapid calls to the latest value in memory. The final value
+   * is ALWAYS flushed when the step completes, so the last snapshot never gets
+   * lost to the throttle window. `message` is truncated if the snapshot would
+   * exceed ~1KB serialized.
+   *
+   * Fire-and-forget: a persistence failure is swallowed (progress is advisory,
+   * never load-bearing). `at` is stamped for you if omitted.
+   *
+   * @example
+   * ```typescript
+   * for (let i = 0; i < total; i++) {
+   *   await process(items[i]);
+   *   ctx.reportProgress({ phase: 'processing', percent: (i / total) * 100 });
+   * }
+   * ```
+   */
+  reportProgress: (progress: Omit<StepProgress, 'at'> & { at?: Date }) => void;
+
+  /**
+   * Durable per-step memoization (v2.7) — the "run this side effect at most
+   * once, even across retries and crash-replay" primitive.
+   *
+   * Memoizes `fn`'s resolved value into the run doc keyed by `key` WITHIN this
+   * step. On the first call the fn runs and its result is committed durably; a
+   * later call (a retry, or a crash-recovery replay) with the SAME key returns
+   * the cached value WITHOUT re-running `fn`. Crash-safe: the cache write
+   * commits to the run document before the value is returned.
+   *
+   * The cache is bounded (~10KB total per step). If adding a value would exceed
+   * the budget, it is NOT cached — `fn` runs and a warning is logged (so a
+   * large value degrades to "run every time" rather than blowing the doc).
+   *
+   * This is the mechanism `ctx.scatter()` uses internally to short-circuit
+   * already-completed tasks on retry, but it is a general primitive: use it to
+   * make any expensive/side-effecting sub-operation crash-idempotent without a
+   * host-side dedup store.
+   *
+   * @param key - Stable per-step cache key. Same key ⇒ same cached value.
+   * @param fn  - Producer; run at most once per key across the step's lifetime.
+   *
+   * @example
+   * ```typescript
+   * const user = await ctx.dedupe('fetch-user', () => api.getUser(id));
+   * // On retry, api.getUser is NOT called again — the cached user is returned.
+   * ```
+   */
+  dedupe: <T>(key: string, fn: () => Promise<T>) => Promise<T>;
 
   /**
    * Save a typed checkpoint for crash-safe batch processing (durable loop).

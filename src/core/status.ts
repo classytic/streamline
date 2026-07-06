@@ -156,31 +156,57 @@ export function isValidRunTransition(from: RunStatus, to: RunStatus): boolean {
 }
 
 /**
+ * Exhaustive terminality classification for every run status.
+ *
+ * `Record<RunStatus, boolean>` is the compile-time exhaustiveness guard:
+ * adding a new status to `RunStatus` without classifying it here is a
+ * type error, so downstream consumers (retention TTL partial filter,
+ * `isTerminalState`) can never silently miss a new terminal status —
+ * the drift class that let `compensated` / `compensation_failed` runs
+ * escape the TTL sweep before 2.7.0.
+ *
+ * NOTE: `failed` is classified terminal for the NON-saga lifecycle
+ * (execution loop stops, scheduler ignores). The durable-saga path
+ * transitions `failed → compensating` BEFORE `isTerminalState` gates
+ * cleanup, so the engine re-enters the compensation phase instead of
+ * stopping. `compensating` is explicitly NOT terminal (the run is still
+ * active and must keep rolling back / be reclaimed after a crash).
+ */
+const RUN_STATUS_TERMINALITY: Readonly<Record<RunStatus, boolean>> = {
+  draft: false,
+  running: false,
+  waiting: false,
+  done: true,
+  failed: true,
+  cancelled: true,
+  compensating: false,
+  compensated: true,
+  compensation_failed: true,
+};
+
+/**
+ * Domain-terminal run statuses, derived from the exhaustive
+ * `RUN_STATUS_TERMINALITY` classification above. This is the single
+ * source of truth for "the run is finished" — the retention TTL index's
+ * `partialFilterExpression` and `isTerminalState` both consume it.
+ */
+export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = RUN_STATUS_VALUES.filter(
+  (status) => RUN_STATUS_TERMINALITY[status],
+);
+
+/**
  * Check if a workflow status represents a terminal (final) state.
  *
  * **Domain semantic, distinct from `RUN_MACHINE.isTerminal()`.** The state
  * machine allows `done → running` and `failed → running` for rewind
- * support, so structurally only `cancelled` is terminal. But the
- * streamline lifecycle treats all three (done/failed/cancelled) as
- * "complete" — the run is no longer active, the engine stops the
- * execution loop, scheduler ignores it. This helper preserves that
- * domain semantic; consumers that want the structural-terminal check
- * (only states with no outgoing transitions) can call
- * `RUN_MACHINE.isTerminal(status)` directly.
+ * support, so structurally only `cancelled` / `compensated` /
+ * `compensation_failed` are terminal. But the streamline lifecycle treats
+ * done/failed/cancelled (+ settled saga outcomes) as "complete" — the run
+ * is no longer active, the engine stops the execution loop, scheduler
+ * ignores it. This helper preserves that domain semantic; consumers that
+ * want the structural-terminal check (only states with no outgoing
+ * transitions) can call `RUN_MACHINE.isTerminal(status)` directly.
  */
 export function isTerminalState(status: RunStatus): boolean {
-  // NOTE: `failed` is treated as terminal here for the NON-saga lifecycle
-  // (execution loop stops, scheduler ignores). The durable-saga path
-  // transitions `failed → compensating` BEFORE this helper gates cleanup, so
-  // the engine re-enters the compensation phase instead of stopping. The
-  // genuinely terminal compensation outcomes are `compensated` /
-  // `compensation_failed`; `compensating` is explicitly NOT terminal (the run
-  // is still active and must keep rolling back / be reclaimed after a crash).
-  return (
-    status === 'done' ||
-    status === 'failed' ||
-    status === 'cancelled' ||
-    status === 'compensated' ||
-    status === 'compensation_failed'
-  );
+  return RUN_STATUS_TERMINALITY[status];
 }

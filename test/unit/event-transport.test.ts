@@ -168,6 +168,7 @@ describe('STREAMLINE_EVENTS / LEGACY_TO_CANONICAL', () => {
       'workflow:failed',
       'workflow:waiting',
       'workflow:resumed',
+      'workflow:paused',
       'workflow:cancelled',
       'workflow:recovered',
       'workflow:retry',

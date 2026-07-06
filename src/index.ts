@@ -156,13 +156,20 @@ export type {
   WorkflowCompletedPayload,
   WorkflowEventName,
   WorkflowFailedPayload,
+  WorkflowPausedPayload,
   WorkflowResumedPayload,
 } from './core/events.js';
 /**
  * Event bus for workflow lifecycle events.
  * Subscribe to workflow:started, step:completed, etc.
  */
-export { createEventSink, globalEventBus, WorkflowEventBus } from './core/events.js';
+export {
+  ALL_WORKFLOW_EVENT_NAMES,
+  createEventSink,
+  EVENT_SINK_DEFAULT_EXCLUSIONS,
+  globalEventBus,
+  WorkflowEventBus,
+} from './core/events.js';
 export type { StepTimeline, StepUIState, WorkflowProgress } from './utils/visualization.js';
 /**
  * Visualization helpers for building UIs.

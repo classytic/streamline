@@ -97,9 +97,15 @@ describe('Cancel workflow', () => {
     const done = await workflow.get(run._id);
     expect(done?.status).toBe('done');
 
-    // Cancel a completed workflow — should just return it
+    // Cancel a completed workflow — idempotent NO-OP as of 2.7.0: the run
+    // is returned UNCHANGED (still 'done'). Pre-2.7 this overwrote the
+    // terminal status with 'cancelled' — an illegal RUN_MACHINE transition
+    // that retroactively falsified a completed outcome.
     const result = await workflow.cancel(run._id);
-    expect(result.status).toBe('cancelled');
+    expect(result.status).toBe('done');
+
+    const persisted = await workflow.get(run._id);
+    expect(persisted?.status).toBe('done');
 
     workflow.shutdown();
   });

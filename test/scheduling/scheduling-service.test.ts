@@ -343,6 +343,82 @@ describe('SchedulingService', () => {
       expect(run._id).toBeDefined();
       expect(run.context.tenantId).toBe('tenant-123');
     });
+
+    it('should schedule under a strict-tenant repo: run is tenant-stamped and tenant-scoped-queryable', async () => {
+      const strictService = new SchedulingService(testWorkflow.definition, testHandlers, {
+        multiTenant: {
+          tenantField: 'context.tenantId',
+          strict: true,
+        },
+      });
+
+      const run = await strictService.schedule({
+        scheduledFor: new Date(2030, 6, 15, 9, 0, 0),
+        timezone: 'UTC',
+        input: { message: 'Strict tenant workflow' },
+        tenantId: 'strict-tenant-a',
+      });
+
+      // Tenant-stamped at the configured field.
+      expect(run.context.tenantId).toBe('strict-tenant-a');
+
+      // Tenant-scoped-queryable through the same strict repo.
+      const repo = strictService.container.repository;
+      const mine = await repo.findAll(
+        { _id: run._id },
+        { tenantId: 'strict-tenant-a', lean: true } as any,
+      );
+      expect(mine).toHaveLength(1);
+
+      const theirs = await repo.findAll(
+        { _id: run._id },
+        { tenantId: 'strict-tenant-b', lean: true } as any,
+      );
+      expect(theirs).toHaveLength(0);
+    });
+
+    it('should throw under a strict-tenant repo when tenantId is missing', async () => {
+      const strictService = new SchedulingService(testWorkflow.definition, testHandlers, {
+        multiTenant: {
+          tenantField: 'context.tenantId',
+          strict: true,
+        },
+      });
+
+      await expect(
+        strictService.schedule({
+          scheduledFor: new Date(2030, 6, 15, 9, 0, 0),
+          timezone: 'UTC',
+          input: { message: 'No tenant' },
+        }),
+      ).rejects.toThrow('Missing tenantId');
+    });
+
+    it('should stamp the CONFIGURED tenant field, not a hardcoded context.tenantId literal', async () => {
+      const metaService = new SchedulingService(testWorkflow.definition, testHandlers, {
+        multiTenant: {
+          tenantField: 'meta.orgId',
+          strict: true,
+        },
+      });
+
+      const run = await metaService.schedule({
+        scheduledFor: new Date(2030, 6, 15, 9, 0, 0),
+        timezone: 'UTC',
+        input: { message: 'Meta tenant workflow' },
+        tenantId: 'org-42',
+      });
+
+      // Stamped at meta.orgId by the plugin's before:create injection...
+      expect((run.meta as { orgId?: string } | undefined)?.orgId).toBe('org-42');
+      // ...and NOT force-written to the context.tenantId literal.
+      expect(run.context.tenantId).toBeUndefined();
+
+      // Tenant-scoped-queryable on the configured field.
+      const repo = metaService.container.repository;
+      const mine = await repo.findAll({ _id: run._id }, { tenantId: 'org-42', lean: true } as any);
+      expect(mine).toHaveLength(1);
+    });
   });
 
   describe('Edge Cases', () => {

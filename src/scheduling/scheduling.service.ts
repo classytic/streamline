@@ -13,7 +13,7 @@
  *
  * @example Basic Scheduling
  * ```typescript
- * import { SchedulingService } from '@classytic/streamline/scheduling';
+ * import { SchedulingService } from '@classytic/streamline';
  * import { myWorkflow, myHandlers } from './workflows';
  *
  * const service = new SchedulingService(myWorkflow, myHandlers);
@@ -321,11 +321,21 @@ export class SchedulingService<TContext = Record<string, unknown>> {
       });
     }
 
-    // Initialize context using workflow's createContext function
+    // Initialize context using workflow's createContext function.
+    // Tenant stamping uses the repository's CONFIGURED tenant field, not a
+    // hardcoded `context.tenantId` literal — when the tenant field lives
+    // under `context.*` we stamp the subpath here (same mechanism as
+    // `bumpDebounceDraft` in run.repository.ts); for non-`context.*`
+    // fields (e.g. `meta.orgId`) the tenant-filter plugin's
+    // `before:create` hook injects the value at the configured path from
+    // the `tenantId` forwarded to `create()` below.
     const baseContext = this.workflow.createContext(options.input);
+    const tenantField = this.repository.tenantField;
     const context = {
       ...baseContext,
-      ...(options.tenantId && { tenantId: options.tenantId }),
+      ...(options.tenantId !== undefined && tenantField.startsWith('context.')
+        ? { [tenantField.slice('context.'.length)]: options.tenantId }
+        : {}),
     };
 
     // Initialize steps from workflow definition (critical for execution)
@@ -363,8 +373,15 @@ export class SchedulingService<TContext = Record<string, unknown>> {
       meta: options.meta,
     };
 
-    // Create workflow run with scheduling metadata
-    const run = await this.repository.create(workflowRunData);
+    // Create workflow run with scheduling metadata. Tenant context is
+    // forwarded as repository options — same pattern as the engine's own
+    // `start()` write — so a strict-tenant repository's `before:create`
+    // hook sees the tenant instead of throwing, and the created run is
+    // tenant-stamped at the configured field.
+    const run = await this.repository.create(
+      workflowRunData,
+      options.tenantId !== undefined ? { tenantId: options.tenantId } : {},
+    );
 
     return run as WorkflowRun<TContext>;
   }
@@ -564,7 +581,9 @@ export class SchedulingService<TContext = Record<string, unknown>> {
       sort: { 'scheduling.executionTime': 1 } satisfies WorkflowSort, // Earliest first
       page,
       limit,
-      cursor: cursor ?? undefined,
+      // Conditional spread (exactOptionalPropertyTypes): mongokit's getAll
+      // types `cursor` as `string` when present — omit rather than pass undefined.
+      ...(cursor != null ? { cursor } : {}),
       ...(tenantId && { tenantId }), // Pass tenantId for multi-tenant plugin
     });
 

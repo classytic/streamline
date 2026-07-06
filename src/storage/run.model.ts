@@ -38,6 +38,19 @@ const StepStateSchema = new Schema<StepState>(
     // via `$slice:-keep`, never indexed (read by `_id`).
     outputHistory: { type: [Schema.Types.Mixed], default: undefined },
     pinnedVersion: { type: Number, required: false },
+    // Queryable latest-wins progress snapshot (v2.7). Mixed subdoc mirrors the
+    // `waitingFor`/`error` pattern — entirely absent on steps that never call
+    // `ctx.reportProgress()` (no migration, no schema growth). Written with
+    // throttled, latest-wins persistence; bounded ~1KB at write time.
+    lastProgress: { type: Schema.Types.Mixed, required: false },
+    // Durable `ctx.dedupe` memoization cache (v2.7). Mixed map; entirely
+    // absent on steps that never call `ctx.dedupe`. Bounded ~10KB at write
+    // time; NEVER overlaps `output`.
+    dedupeCache: { type: Schema.Types.Mixed, required: false },
+    // Host-recorded per-step cost (v2.7). Absent unless a host/middleware
+    // writes it (typically a `taskMiddleware.after` hook). Summed by
+    // `engine.getRunMetrics`; never interpreted by the engine.
+    cost: { type: Number, required: false },
   },
   { _id: false },
 );
@@ -126,6 +139,9 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
     userId: { type: String, index: true },
     tags: [String],
     meta: Schema.Types.Mixed,
+    // Operator cancellation reason (v2.7). Absent unless
+    // `engine.cancel(runId, { reason })` was called with a reason.
+    cancellationReason: { type: String, required: false },
     /**
      * Pinned definition version (semver). The engine snapshots
      * `WorkflowDefinition.version` at create-time so a run resumed weeks
@@ -240,7 +256,15 @@ WorkflowRunSchema.index({ workflowId: 1, concurrencyKey: 1, status: 1 });
 
 // Priority: scheduler picks highest priority first
 WorkflowRunSchema.index({ status: 1, priority: -1, updatedAt: 1 });
+
+// User-scoped history: "list this user's runs, newest first" —
+// CommonQueries.byUser (query-builder.ts) and host dashboards filtering
+// on the `userId` stamped by SchedulingService.schedule().
 WorkflowRunSchema.index({ userId: 1, createdAt: -1 });
+
+// Step-targeted lookups: host-side queries that select runs by an embedded
+// step id (multikey) — e.g. "which runs contain step X" operator views and
+// webhook/approval resolvers matching a run via its waiting step.
 WorkflowRunSchema.index({ 'steps.stepId': 1 });
 
 // Critical index for scheduler polling (prevents full collection scans)
