@@ -29,7 +29,8 @@
 import { randomBytes } from 'node:crypto';
 import type { StepContext, WorkflowRun } from '../core/types.js';
 import { hookRegistry, workflowRegistry } from '../execution/engine.js';
-import { workflowRunRepository } from '../storage/run.repository.js';
+import { workflowConcurrencyCounterRepository } from '../storage/concurrency-counter.repository.js';
+import { type WorkflowRunRepository, workflowRunRepository } from '../storage/run.repository.js';
 import { makeWaitCancelled } from './wait-resolution.js';
 
 export interface HookOptions {
@@ -149,6 +150,17 @@ export function createHook(ctx: StepContext, reason: string, options?: HookOptio
 export async function resumeHook(
   token: string,
   payload: unknown,
+  options?: {
+    /**
+     * Repository the DB-fallback resume writes through. Multi-tenant /
+     * custom-container hosts pass `container.repository` so the resume
+     * goes through THEIR plugin chain (audit, tenant, observability)
+     * instead of the module-level singleton. When omitted, the fallback
+     * resolves the registered engine's container repository, then the
+     * singleton (legacy default).
+     */
+    repository?: WorkflowRunRepository;
+  },
 ): Promise<{ runId: string; run: WorkflowRun }> {
   const [runId] = token.split(':');
 
@@ -164,7 +176,7 @@ export async function resumeHook(
   }
 
   // Fallback: DB-based resume (cross-process / post-restart)
-  return resumeViaDb(runId, token, payload);
+  return resumeViaDb(runId, token, payload, options?.repository);
 }
 
 /**
@@ -188,9 +200,18 @@ export async function resumeHook(
  */
 export async function cancelHook(
   token: string,
-  options?: { reason?: string },
+  options?: {
+    /** Free-form cancellation reason, surfaced via `getWaitResolution(...).reason`. */
+    reason?: string;
+    /** See {@link resumeHook} — repository for the DB-fallback path. */
+    repository?: WorkflowRunRepository;
+  },
 ): Promise<{ runId: string; run: WorkflowRun }> {
-  return resumeHook(token, makeWaitCancelled(options?.reason));
+  return resumeHook(
+    token,
+    makeWaitCancelled(options?.reason),
+    options?.repository !== undefined ? { repository: options.repository } : undefined,
+  );
 }
 
 /** Resume using the in-memory engine reference (fast path) */
@@ -219,13 +240,32 @@ async function resumeViaEngine(
 /**
  * Resume using direct MongoDB operations (durable fallback).
  * Works when the engine that started the workflow is gone (restart, different worker).
+ *
+ * 2.7.0 rework — three pre-existing defects closed:
+ *   1. Writes go through the OWNING repository (explicit injection >
+ *      registered engine's container repository > module-level singleton)
+ *      instead of always the singleton, so custom-container hosts keep
+ *      their plugin chain (audit, tenant, observability) on resume writes.
+ *   2. The step-done write and the `currentStepId` advance / completion
+ *      write are ONE atomic `findOneAndUpdate` behind a status+step CAS
+ *      guard — a crash can no longer leave `status: 'running'` pointing
+ *      at a done step.
+ *   3. The "no next step" completion path follows the engine's normal
+ *      completion contract (durable write first, then `workflow:completed`
+ *      emission on the container bus, whose `releaseSlotOnTerminal`
+ *      listener frees the strict-concurrency slot).
  */
 async function resumeViaDb(
   runId: string,
   token: string,
   payload: unknown,
+  repositoryOverride?: WorkflowRunRepository,
 ): Promise<{ runId: string; run: WorkflowRun }> {
-  const run = await workflowRunRepository.getById(runId);
+  // Bootstrap read: the run's workflowId (needed to resolve the owning
+  // engine) isn't known yet, so read via the override or the singleton —
+  // both wrap the same collection, and reads don't mutate.
+  const bootstrapRepo = repositoryOverride ?? workflowRunRepository;
+  const run = await bootstrapRepo.getById(runId);
 
   if (!run) {
     throw new Error(`Workflow not found for token: ${token}`);
@@ -237,6 +277,11 @@ async function resumeViaDb(
 
   validateHookToken(run as WorkflowRun, token);
 
+  // Resolve the owning repository for the WRITES: explicit injection wins,
+  // then the registered engine's container repository, then the singleton.
+  const engine = workflowRegistry.getEngine(run.workflowId);
+  const repository = repositoryOverride ?? engine?.container.repository ?? workflowRunRepository;
+
   // Find the waiting step and mark it done with the payload
   const stepIndex = run.steps.findIndex((s) => s.status === 'waiting');
   if (stepIndex === -1) {
@@ -246,8 +291,22 @@ async function resumeViaDb(
   const now = new Date();
   const stepId = run.steps[stepIndex]?.stepId;
 
-  // Atomic claim: only resume if still waiting (prevents concurrent double-resume)
-  const result = await workflowRunRepository.updateOne(
+  // Derive the advance target BEFORE the write so step completion and the
+  // `currentStepId` advance land in one update document.
+  const allStepIds = run.steps.map((s) => s.stepId);
+  const currentIndex = allStepIds.indexOf(stepId);
+  const nextStepId = currentIndex < allStepIds.length - 1 ? allStepIds[currentIndex + 1] : null;
+  const isCompletion = nextStepId === null;
+
+  // ONE atomic claim behind a status+step CAS guard: only resume if still
+  // waiting (prevents concurrent double-resume), and set BOTH the step-done
+  // fields AND the run-level advance (or completion) in the same round-trip
+  // so no crash window can expose `status: 'running'` at a done step.
+  //
+  // `lastHeartbeat`: with no engine in this process (true cross-process
+  // restart), stamp the epoch so stale recovery picks the run up on the
+  // next poll cycle instead of waiting out the full stale threshold.
+  const result = await repository.updateOne(
     {
       _id: runId,
       status: 'waiting',
@@ -255,12 +314,14 @@ async function resumeViaDb(
     },
     {
       $set: {
-        status: 'running',
         updatedAt: now,
-        lastHeartbeat: now,
+        lastHeartbeat: engine !== undefined || isCompletion ? now : new Date(0),
         [`steps.${stepIndex}.status`]: 'done',
         [`steps.${stepIndex}.endedAt`]: now,
         [`steps.${stepIndex}.output`]: payload,
+        ...(isCompletion
+          ? { status: 'done', currentStepId: null, endedAt: now, output: payload }
+          : { status: 'running', currentStepId: nextStepId }),
       },
       $unset: {
         [`steps.${stepIndex}.waitingFor`]: '',
@@ -273,61 +334,44 @@ async function resumeViaDb(
     throw new Error(`Failed to resume workflow ${runId} — already resumed or cancelled`);
   }
 
-  // Advance currentStepId to the next step in the sequence.
-  // Without this, the workflow is running but stuck at the completed step.
-  const allStepIds = run.steps.map((s) => s.stepId);
-  const currentIndex = allStepIds.indexOf(stepId);
-  const nextStepId = currentIndex < allStepIds.length - 1 ? allStepIds[currentIndex + 1] : null;
-
-  if (nextStepId) {
-    await workflowRunRepository.updateOne(
-      { _id: runId },
-      { $set: { currentStepId: nextStepId, updatedAt: new Date() } },
-      { bypassTenant: true },
-    );
-  } else {
-    // No next step — workflow is complete
-    await workflowRunRepository.updateOne(
-      { _id: runId },
-      {
-        $set: {
-          status: 'done',
-          currentStepId: null,
-          endedAt: new Date(),
-          updatedAt: new Date(),
-          output: payload,
-        },
-      },
-      { bypassTenant: true },
-    );
-  }
-
-  // Try to find an engine to continue execution (best-effort)
-  const engine = workflowRegistry.getEngine(run.workflowId);
+  // Invalidate cache so the engine reads fresh state from DB
   if (engine) {
-    // Invalidate cache so the engine reads fresh state from DB
     engine.container.cache.delete(runId);
-
-    if (nextStepId) {
-      // Engine available — continue execution asynchronously
-      setImmediate(() => {
-        engine.execute(runId).catch(() => {
-          // Execution failed — scheduler will pick it up via stale detection
-        });
-      });
-    }
-  } else if (nextStepId) {
-    // No engine in this process (true cross-process restart).
-    // Set lastHeartbeat to the past so stale recovery picks it up immediately
-    // on the next poll cycle instead of waiting for the full stale threshold.
-    await workflowRunRepository.updateOne(
-      { _id: runId },
-      { $set: { lastHeartbeat: new Date(0) } },
-      { bypassTenant: true },
-    );
   }
 
-  const updated = await workflowRunRepository.getById(runId);
+  if (isCompletion) {
+    // Mirror the engine's normal completion contract (executor.moveToNextStep):
+    // durable `{status:'done', output}` write FIRST (above), then emit
+    // `workflow:completed`. Emitting on the owning engine's container bus
+    // means the engine's `releaseSlotOnTerminal` listener performs the
+    // strict-concurrency slot release exactly like an in-engine completion.
+    if (engine) {
+      engine.container.eventBus.emit('workflow:completed', { runId, data: payload });
+    } else {
+      // No engine in this process — no bus listeners to notify, so
+      // replicate the slot release explicitly: read the strict-concurrency
+      // marker the engine stamps on gated runs and decrement the counter
+      // (same decrement `releaseSlotOnTerminal` performs; `releaseSlot`
+      // is `count > 0`-guarded). In-process `workflow:completed` observers
+      // don't exist by definition here; cross-process observers get the
+      // event via the host's transport bridge on the owning worker.
+      const counterId = (run.meta as Record<string, unknown> | undefined)?.concurrencyCounterId as
+        | string
+        | undefined;
+      if (counterId) {
+        await workflowConcurrencyCounterRepository.releaseSlot(counterId);
+      }
+    }
+  } else if (engine) {
+    // Engine available — continue execution asynchronously
+    setImmediate(() => {
+      engine.execute(runId).catch(() => {
+        // Execution failed — scheduler will pick it up via stale detection
+      });
+    });
+  }
+
+  const updated = await repository.getById(runId);
   if (!updated) {
     throw new Error(`Workflow ${runId} disappeared after resume`);
   }

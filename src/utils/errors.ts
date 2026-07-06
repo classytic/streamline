@@ -166,7 +166,7 @@ export class WorkflowError extends Error implements HttpError {
     message: string,
     code: ErrorCode,
     public readonly context: {
-      runId?: string;
+      runId?: string | undefined;
       workflowId?: string;
       stepId?: string;
       [key: string]: unknown;

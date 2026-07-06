@@ -117,16 +117,22 @@
  * security plugins (multi-tenant, soft-delete, audit) — that ordering
  * guarantee is the load-bearing reason this plugin uses hooks.
  *
- * The 13 enumerations below ARE intentional. New hook names get added
- * here as mongokit grows new ops; the silent-gap class is the trade-off
- * we accept for correct ordering.
+ * Hook coverage is DERIVED from mongokit's `OP_REGISTRY` (v2.7) — every
+ * op with a `query` / `filters` / `data` / `dataArray` / `operations`
+ * policy key is hooked automatically, so a new mongokit op can never be
+ * silently unscoped. (Pre-2.7 this was a hand-enumerated list of 16 hooks
+ * that had drifted: `cursor`, `claimVersion`, and `getOrCreate` were
+ * missing — reads/CAS writes through those ops ran tenant-UNSCOPED.)
  */
 
 import {
   HOOK_PRIORITY,
+  OP_REGISTRY,
+  operationsByPolicyKey,
   type Plugin,
   type RepositoryContext,
   type RepositoryInstance,
+  type RepositoryOperation,
 } from '@classytic/mongokit';
 
 /**
@@ -141,7 +147,7 @@ export interface TenantFilterOptions {
    * @example 'meta.orgId' → filters { 'meta.orgId': 'org-456' }
    * @default 'context.tenantId'
    */
-  tenantField?: string;
+  tenantField?: string | undefined;
 
   /**
    * Static tenant ID for single-tenant deployments
@@ -149,7 +155,7 @@ export interface TenantFilterOptions {
    *
    * @default undefined (multi-tenant mode - tenantId required per query)
    */
-  staticTenantId?: string;
+  staticTenantId?: string | undefined;
 
   /**
    * Strict mode - throws error if tenantId is missing and not bypassed
@@ -157,7 +163,7 @@ export interface TenantFilterOptions {
    *
    * @default true
    */
-  strict?: boolean;
+  strict?: boolean | undefined;
 
   /**
    * Enable bypass capability - allows queries to bypass tenant filter
@@ -165,7 +171,7 @@ export interface TenantFilterOptions {
    *
    * @default true (allows bypassTenant: true for admin operations)
    */
-  allowBypass?: boolean;
+  allowBypass?: boolean | undefined;
 }
 
 /**
@@ -204,6 +210,49 @@ interface TenantRepositoryContext extends RepositoryContext {
  * });
  * ```
  */
+/**
+ * Set `value` at a (possibly dotted) field path inside a document,
+ * building the nested object structure as needed. Shared by the
+ * `create` / `createMany` / `bulkWrite insertOne` data-injection paths —
+ * MongoDB reads accept dotted keys natively, but document WRITES need a
+ * real nested object (a flat `'context.tenantId'` key would store a
+ * literal dotted field name).
+ */
+function setNestedField(data: Record<string, unknown>, fieldPath: string, value: string): void {
+  const fieldParts = fieldPath.split('.');
+  if (fieldParts.length === 1) {
+    data[fieldPath] = value;
+    return;
+  }
+  let current = data;
+  for (let i = 0; i < fieldParts.length - 1; i++) {
+    const part = fieldParts[i];
+    if (!current[part] || typeof current[part] !== 'object') {
+      current[part] = {};
+    }
+    current = current[part] as Record<string, unknown>;
+  }
+  current[fieldParts[fieldParts.length - 1]] = value;
+}
+
+/** Sub-operation shape inside a `bulkWrite` operations array. */
+interface BulkWriteSubOp {
+  insertOne?: { document?: Record<string, unknown> };
+  updateOne?: { filter?: Record<string, unknown> };
+  updateMany?: { filter?: Record<string, unknown> };
+  deleteOne?: { filter?: Record<string, unknown> };
+  deleteMany?: { filter?: Record<string, unknown> };
+  replaceOne?: { filter?: Record<string, unknown> };
+}
+
+const BULK_FILTER_KEYS = [
+  'updateOne',
+  'updateMany',
+  'deleteOne',
+  'deleteMany',
+  'replaceOne',
+] as const;
+
 export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
   const tenantField = options.tenantField || 'context.tenantId';
   const staticTenantId = options.staticTenantId;
@@ -214,6 +263,27 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
     name: 'tenantFilter',
 
     apply(repo: RepositoryInstance): void {
+      // Op → injection-target sets, DERIVED from mongokit's `OP_REGISTRY`
+      // so a new mongokit op can never ship tenant-unscoped (the pre-2.7
+      // silent-gap class: `cursor`, `claimVersion`, `getOrCreate` were
+      // missing from a hand-enumerated list). The policyKey mapping
+      // mirrors mongokit's own `multiTenantPlugin`:
+      //   'filters' bag (paginated reads): getAll, aggregatePipelinePaginate,
+      //     lookupPopulate — except aggregatePaginate, which keeps
+      //     streamline's pipeline `$match`-prepend injection (see below).
+      //   'query' record (everything else with a filter): getById,
+      //     getByQuery, getOne, findAll, getOrCreate, count, exists,
+      //     distinct, aggregate, aggregatePipeline, cursor, watch, update,
+      //     delete, restore, updateMany, deleteMany, findOneAndUpdate,
+      //     claim, claimVersion.
+      //   'operations' (bulkWrite): per-sub-op filter/document injection.
+      //   'data' / 'dataArray' (create / createMany): dedicated
+      //     data-injection hooks below.
+      const filtersBagOps = new Set<RepositoryOperation>(
+        operationsByPolicyKey('filters').filter((op) => op !== 'aggregatePaginate'),
+      );
+      const queryRecordOps = new Set<RepositoryOperation>(operationsByPolicyKey('query'));
+
       /**
        * Inject tenant filter into context
        * Validates tenantId presence and builds filter object
@@ -251,29 +321,9 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
         // before-hook below MUST have a matching branch here — registering
         // a hook without a corresponding inject branch silently leaves the
         // op unscoped (the worst kind of tenant-isolation failure: the
-        // call still succeeds, the data still leaks).
-        //
-        // The op→target mapping mirrors mongokit's `OP_REGISTRY` policyKey:
-        //   'filters' bag (paginated reads): getAll, aggregatePaginate
-        //   'query' record (everything else with a filter):
-        //     getById, getByQuery, getOne, findAll, count, exists,
-        //     update, delete, updateMany, deleteMany, findOneAndUpdate
-        const filtersBagOps = new Set(['getAll']);
-        const queryRecordOps = new Set([
-          'getById',
-          'getByQuery',
-          'getOne',
-          'findAll',
-          'count',
-          'exists',
-          'update',
-          'delete',
-          'updateMany',
-          'deleteMany',
-          'findOneAndUpdate',
-        ]);
-
-        if (filtersBagOps.has(context.operation)) {
+        // call still succeeds, the data still leaks). The op sets are
+        // derived from `OP_REGISTRY` at `apply()` time — see above.
+        if (filtersBagOps.has(context.operation as RepositoryOperation)) {
           const existingFilters = (context as Record<string, unknown>).filters as
             | Record<string, unknown>
             | undefined;
@@ -281,7 +331,7 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
             ...existingFilters,
             ...tenantFilter,
           };
-        } else if (queryRecordOps.has(context.operation)) {
+        } else if (queryRecordOps.has(context.operation as RepositoryOperation)) {
           context.query = {
             ...(context.query || {}),
             ...tenantFilter,
@@ -298,43 +348,56 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
             // Initialize pipeline with tenant filter
             (context as Record<string, unknown>).pipeline = [{ $match: tenantFilter }];
           }
+        } else if (context.operation === 'bulkWrite') {
+          // Scope every sub-operation: filters get the tenant predicate
+          // merged (dotted keys are query-native), inserted documents get
+          // the tenant stamped at the nested path (same mechanism as the
+          // `before:create` data injection).
+          const operations = (context as Record<string, unknown>).operations as
+            | BulkWriteSubOp[]
+            | undefined;
+          if (Array.isArray(operations)) {
+            for (const subOp of operations) {
+              for (const key of BULK_FILTER_KEYS) {
+                const body = subOp[key];
+                if (body?.filter && typeof body.filter === 'object') {
+                  body.filter = { ...body.filter, ...tenantFilter };
+                }
+              }
+              const document = subOp.insertOne?.document;
+              if (document && typeof document === 'object') {
+                setNestedField(document, tenantField, tenantId);
+              }
+            }
+          }
         }
       };
 
-      // Register hooks for all read/write operations. `updateMany` and
-      // `deleteMany` are class primitives as of mongokit 3.11 — they MUST
-      // be hooked here or bulk ops bypass tenant scope entirely.
+      // Register a hook for EVERY registry op with an injectable policy
+      // key — the list is derived, not hand-enumerated, so a new mongokit
+      // op (the way `cursor` / `claimVersion` / `getOrCreate` arrived)
+      // gets tenant scope automatically. Notable members:
+      //   - `findOneAndUpdate`: streamline's `repository.updateOne` and
+      //     `bumpDebounceDraft` delegate to it. Defense in depth — the
+      //     manual `applyTenantFilter` in `updateOne` stays; the hook
+      //     covers writes from any future helper.
+      //   - `claim` / `claimVersion`: mongokit's CAS primitives, used by
+      //     scheduler/recovery for state transitions. Current scheduler
+      //     callers pass `bypassTenant: true`; per-tenant domain callers
+      //     are scoped here.
+      //   - `cursor`: streaming reads (`cursorStaleRunning`).
       //
       // Priority: POLICY (100) — must run BEFORE cache (200) /
       // observability (300) / default (500) so tenant scope is applied
       // before anything reads or records the filter. Matches mongokit's
       // own `multiTenantPlugin` priority tier.
       const policy = { priority: HOOK_PRIORITY.POLICY };
-      repo.on('before:getAll', injectTenantFilter, policy);
-      repo.on('before:getById', injectTenantFilter, policy);
-      repo.on('before:getByQuery', injectTenantFilter, policy);
-      repo.on('before:getOne', injectTenantFilter, policy);
-      repo.on('before:findAll', injectTenantFilter, policy);
-      repo.on('before:count', injectTenantFilter, policy);
-      repo.on('before:exists', injectTenantFilter, policy);
-      repo.on('before:update', injectTenantFilter, policy);
-      repo.on('before:delete', injectTenantFilter, policy);
-      repo.on('before:updateMany', injectTenantFilter, policy);
-      repo.on('before:deleteMany', injectTenantFilter, policy);
-      repo.on('before:aggregatePaginate', injectTenantFilter, policy);
-      // Atomic claim path: streamline's `repository.updateOne` and
-      // `bumpDebounceDraft` both delegate to `super.findOneAndUpdate`.
-      // Defense in depth — keep manual `applyTenantFilter` in `updateOne`,
-      // also hook the plugin so writes from any future helper are scoped.
-      repo.on('before:findOneAndUpdate', injectTenantFilter, policy);
-      // mongokit 3.13+ ships `Repository.claim()` as a class primitive.
-      // Streamline's scheduler/recovery paths use it for compound-filter
-      // CAS state transitions. `claim` registers with `policyKey: 'query'`
-      // in `OP_REGISTRY` and fires its own `before:claim` event — hook
-      // it here so tenant scope auto-injects when callers don't pass
-      // `bypassTenant: true` (current scheduler callers do, but any
-      // future per-tenant claim by a domain caller will be covered).
-      repo.on('before:claim', injectTenantFilter, policy);
+      for (const op of Object.keys(OP_REGISTRY) as RepositoryOperation[]) {
+        const policyKey = OP_REGISTRY[op].policyKey;
+        if (policyKey === 'query' || policyKey === 'filters' || policyKey === 'operations') {
+          repo.on(`before:${op}`, injectTenantFilter, policy);
+        }
+      }
 
       // For create operations: auto-inject tenantId into document data.
       // Same POLICY priority as the read/write hooks above.
@@ -355,26 +418,11 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
           }
 
           if (tenantId) {
-            // Inject tenant ID into document data
+            // Inject tenant ID into document data at the (possibly nested)
+            // configured field path (e.g., 'context.tenantId').
             const data = (context as Record<string, unknown>).data as Record<string, unknown>;
             if (data) {
-              // Handle nested fields (e.g., 'context.tenantId')
-              const fieldParts = tenantField.split('.');
-              if (fieldParts.length === 1) {
-                // Simple field
-                data[tenantField] = tenantId;
-              } else {
-                // Nested field - create nested object structure
-                let current = data;
-                for (let i = 0; i < fieldParts.length - 1; i++) {
-                  const part = fieldParts[i];
-                  if (!current[part] || typeof current[part] !== 'object') {
-                    current[part] = {};
-                  }
-                  current = current[part] as Record<string, unknown>;
-                }
-                current[fieldParts[fieldParts.length - 1]] = tenantId;
-              }
+              setNestedField(data, tenantField, tenantId);
             }
           }
         },
@@ -403,23 +451,9 @@ export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
               Record<string, unknown>
             >;
             if (Array.isArray(dataArray)) {
-              dataArray.forEach((data) => {
-                // Handle nested fields
-                const fieldParts = tenantField.split('.');
-                if (fieldParts.length === 1) {
-                  data[tenantField] = tenantId;
-                } else {
-                  let current = data;
-                  for (let i = 0; i < fieldParts.length - 1; i++) {
-                    const part = fieldParts[i];
-                    if (!current[part] || typeof current[part] !== 'object') {
-                      current[part] = {};
-                    }
-                    current = current[part] as Record<string, unknown>;
-                  }
-                  current[fieldParts[fieldParts.length - 1]] = tenantId;
-                }
-              });
+              for (const data of dataArray) {
+                setNestedField(data, tenantField, tenantId);
+              }
             }
           }
         },

@@ -6,6 +6,332 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.7.0] - 2026-07-06 — Tenant-scope hardening + queryable progress, task guards, durable dedupe, operator pause/resume, run metrics
+
+The next release after 2.6.0. Two bodies of work land together: an
+audit-driven hardening pass (one HIGH tenant-isolation fix, four MEDIUM
+correctness fixes, strictness + packaging + the mongokit 3.18 / repo-core
+0.7 / primitives 0.9 dependency bump) AND six additive, generalized
+features (queryable progress, task-guard middleware, durable dedupe,
+operator pause/resume, run metrics, cancel-with-reason). Every new
+`WorkflowEventName` is registered in the exhaustive event-sink registry +
+`STREAMLINE_EVENTS` + `LEGACY_TO_CANONICAL` (the no-drift guard proves it).
+All new fields are default-absent (no schema growth, no migration) and all
+new hooks are opt-in — existing workflows are unaffected. Three deliberate
+behavior changes are called out inline in the "Fixed" sections below (tenant
+hook coverage, event-sink defaults, terminal-cancel idempotency).
+
+## New features
+
+### Added — queryable step/run progress (`ctx.reportProgress`, throttled persistence)
+
+`ctx.stream()` frames are non-durable and invisible to a UI page-refresh or a
+new client with no stream history. `ctx.reportProgress(p)` persists the LATEST
+snapshot onto `StepState.lastProgress` (a bounded `StepProgress`:
+`{ phase?, percent?, message?, estimatedSecondsRemaining?, at }`, all optional
+but `at`). Persistence is **throttled** — at most one DB write per second per
+step, coalescing rapid calls latest-wins in memory, with the final value ALWAYS
+flushed on step completion. `message` is truncated if the serialized snapshot
+would exceed ~1KB. Read it back with:
+
+- `engine.getStepProgress(runId, stepId)` → `StepProgress | undefined`
+- `engine.getRunProgress(runId)` → `{ status, steps: [{ stepId, status, lastProgress? }] }`
+
+Both are plain, tenant-scoped reads off the run doc (through the repository, so
+a fresh engine after a restart returns persisted progress). Also exposed on the
+`Workflow` facade: `wf.getStepProgress` / `wf.getRunProgress`.
+
+### Added — generalized per-step / per-scatter-task guard middleware (`taskMiddleware`)
+
+A GENERAL seam — the engine bakes in **no** policy (no budget primitive).
+`taskMiddleware: TaskMiddleware[]` on the workflow config:
+
+```ts
+interface TaskMiddleware {
+  before?: (ctx: TaskHookContext) => Promise<TaskGuardResult> | TaskGuardResult;
+  after?:  (ctx: TaskHookContext & { result?, error?, durationMs }) => Promise<void> | void;
+}
+type TaskHookContext = { runId; stepId; workflowId; taskKey?; attempt; tenantId? };
+type TaskGuardResult = { allow: true } | { allow: false; reason? };
+```
+
+`before` fires before each STEP and before each SCATTER TASK (`taskKey` set for
+scatter sub-tasks). Returning `{ allow: false, reason }` rejects that unit with
+a **`NonRetriableError`** carrying the reason — the step fails without retry, or
+the single scatter task is rejected while its siblings proceed. `after` fires
+after each unit settles with `result` (success) or `error` (failure) plus
+`durationMs`; it is the recording hook. `after` errors are logged + swallowed;
+a `before` that THROWS is treated fail-closed as a rejection. Absent middleware
+= zero behavior change (default path untouched).
+
+**Budget is a RECIPE, not a primitive.** Enforce a per-run spend cap in host
+code: track spend in an external store keyed by `runId`; in `before`, read the
+running total and reject when it would exceed the cap; in `after`, add the
+just-finished unit's `actualCost` (optionally persisting it to `StepState.cost`
+via a repo write for `getRunMetrics`). The engine never learns what a "budget"
+is.
+
+### Added — durable per-step dedupe cache (`ctx.dedupe`)
+
+`ctx.dedupe<T>(key, fn): Promise<T>` memoizes `fn`'s resolved value into the run
+doc (`StepState.dedupeCache`) keyed by `key` within the step. On a retry or a
+crash-replay, an existing key returns the cached value WITHOUT re-running `fn` —
+the "run this side effect at most once, even across crashes" primitive. The
+cache write commits to the run doc **before** the value is returned (crash-safe).
+Bounded ~10KB per step: an over-budget value is NOT cached (fn runs, a warning
+is logged) so a large value degrades to "run every time" instead of growing the
+doc.
+
+`ctx.scatter()` already provides per-task failed-only retry via its checkpoint
+slot (a 20-task scatter where 18 succeeded re-runs only the 2 failures, with no
+host idempotency guard) — that behavior is unchanged and backward-compatible.
+`ctx.dedupe` generalizes the same guarantee to any sub-operation. See "solo
+decisions" note in the PR: scatter's per-task durability was kept on its
+existing checkpoint mechanism rather than rewritten onto `dedupe`, to preserve
+its exact tested semantics.
+
+### Added — operator pause / resume of a RUNNING run
+
+- `engine.pause(runId, { reason? })` — sets the durable `paused` flag (idempotent
+  no-op on terminal/already-paused runs, mirroring `cancel`). Emits
+  `workflow:paused` with the reason. **Honesty (rule 33):** pause takes effect at
+  the NEXT step boundary — the in-flight step handler is an in-flight promise and
+  is NOT interrupted; it finishes, then no further step is claimed. The
+  scheduler and `executeRetry` already skip `paused` runs (`.notPaused()` on
+  every pickup query).
+- `engine.resume(runId, { data? })` continues from the same step (existing);
+  `engine.resumeOperator(runId, { data? })` is the symmetric operator wrapper
+  that also synthesizes `workflow:resumed` for the paused-while-running case
+  (the waiting case already emits `workflow:resumed` via the executor, so no
+  double-emit).
+
+New event `workflow:paused` added to the exhaustive registry. `workflow:resumed`
+is REUSED for operator resume (it predates this release for hook/wait resume).
+
+### Added — run metrics aggregation (`engine.getRunMetrics`)
+
+`engine.getRunMetrics(runId)` → `RunMetrics` — pure aggregation over the run
+doc's `StepState` (`durationMs` + `attempts`, already present):
+
+```ts
+interface RunMetrics {
+  runId; status;
+  steps: Array<{ stepId; durationMs?; attempts; cost? }>;
+  totalDurationMs; totalCost?;
+}
+```
+
+`cost` is a new optional `StepState.cost` a host/`taskMiddleware.after` records;
+`totalCost` is the sum only when at least one step carries a cost, else
+`undefined`. Queryable for terminal AND in-flight runs.
+
+### Added — `cancel(runId, { reason })` (additive cancel reason)
+
+`engine.cancel` now accepts an optional `{ reason? }`. The reason persists on the
+run as `WorkflowRun.cancellationReason` and is echoed in the `workflow:cancelled`
+event payload (`data.reason`). Backward-compatible: `cancel(runId)` with no
+reason leaves the field unset (byte-for-byte the pre-2.7 shape). Preserves the
+idempotent-no-op-on-terminal behavior (see the tenant/cancel fixes below) — a
+terminal-run cancel never overwrites an existing reason.
+
+### Future (not implemented) — cross-workflow priority queueing
+
+Sketch for a later slice: a `priority` field already exists on `WorkflowRun`;
+cross-workflow priority scheduling would sort the scheduler pickup by
+`{ priority: -1, createdAt: 1 }` and add **aging** (periodically bump the
+effective priority of long-waiting drafts) to prevent starvation of low-priority
+work behind a flood of high-priority runs. Deliberately deferred — the current
+per-engine schedulers pick up their own workflow's runs, so a global priority
+queue needs a shared scheduler design first.
+
+### Public API added
+
+- `ctx.reportProgress(p)`, `ctx.dedupe(key, fn)`
+- `engine.getStepProgress`, `engine.getRunProgress`, `engine.getRunMetrics`,
+  `engine.pause(runId, { reason })`, `engine.resumeOperator(runId, { data })`,
+  `engine.cancel(runId, { reason })`
+- `wf.getStepProgress`, `wf.getRunProgress`, `wf.getRunMetrics`,
+  `wf.pause(runId, { reason })`, `wf.resumeOperator`, `wf.cancel(runId, { reason })`
+- Config: `WorkflowConfig.taskMiddleware`
+- Types: `StepProgress`, `RunProgress`, `RunMetrics`, `TaskMiddleware`,
+  `TaskHookContext`, `TaskGuardResult`, `WorkflowPausedPayload`
+- Fields: `StepState.lastProgress`, `StepState.dedupeCache`, `StepState.cost`,
+  `WorkflowRun.cancellationReason`
+- Event: `workflow:paused` (+ `streamline:workflow.paused`)
+
+## Audit hardening
+
+### Fixed — tenant-filter plugin hook coverage is now DERIVED from mongokit's `OP_REGISTRY` (HIGH)
+
+The plugin's hand-enumerated hook list had drifted behind mongokit:
+`before:cursor`, `before:claimVersion`, and `before:getOrCreate` were never
+registered, so reads through `cursor()` (including
+`cursorStaleRunning()`), CAS writes through `claimVersion()`, and
+`getOrCreate()` upserts ran **tenant-UNSCOPED** — the call succeeded and
+quietly crossed tenants. Hook registration is now derived from
+`OP_REGISTRY` policy keys (the same source mongokit's own
+`multiTenantPlugin` uses), so every current op — including `restore`,
+`distinct`, `aggregate`, `aggregatePipeline`, `watch`,
+`aggregatePipelinePaginate`, `lookupPopulate`, and `bulkWrite`
+(per-sub-op filter/document injection) — and every FUTURE op is scoped
+automatically. `cursorStaleRunning()`'s docstring claim ("routes through
+`before:cursor`") is finally true.
+
+**Behavior change (strict mode):** ops that previously ran unscoped now
+throw `Missing tenantId` on a strict-tenant repository unless the caller
+passes `tenantId` / `bypassTenant` — that throw is the isolation guarantee
+working. Non-tenant (default) repositories are unaffected.
+
+### Fixed — retention TTL covers ALL terminal statuses (saga outcomes included)
+
+The TTL index's `partialFilterExpression` hard-coded
+`['done','failed','cancelled']`, so terminal saga runs (`compensated` /
+`compensation_failed`) were **never TTL-purged** and accumulated forever.
+The filter now derives from the new `TERMINAL_RUN_STATUSES` export in
+`core/status.ts`, itself backed by an exhaustive
+`Record<RunStatus, boolean>` classification — adding a run status without
+classifying it is a compile error, so the TTL can never drift again.
+`isTerminalState()` reads the same classification.
+
+**Migration:** this changes the TTL index's `partialFilterExpression`, and
+MongoDB will not alter an existing index in place. Re-run
+`container.syncRetentionIndexes()` (or the module-level
+`syncRetentionIndexes(repository, options)`) after deploying 2.7.0 — it
+detects the spec conflict (codes 85/86) and drops + recreates
+`streamline_terminal_runs_ttl` automatically. Until you do, settled saga
+runs remain un-purged (the pre-2.7 behavior, no worse).
+
+### Fixed — `SchedulingService.schedule()` works under strict-tenant repositories
+
+`scheduleWorkflow` accepted `tenantId` but (a) never forwarded it as
+repository options — a strict-tenant repo's `before:create` hook threw —
+and (b) stamped a hard-coded `context.tenantId` key regardless of the
+plugin's configured `tenantField`. It now forwards `{ tenantId }` into
+`repository.create()` (same pattern as `engine.start()`), and stamps the
+context via the repository's configured `tenantField` (the
+`bumpDebounceDraft` mechanism); non-`context.*` fields (e.g. `meta.orgId`)
+are stamped by the plugin's `before:create` injection at the configured
+path.
+
+### Fixed — `resumeViaDb` (cross-process hook resume) rework
+
+Three defects in the durable `resumeHook` fallback:
+
+1. **Owning repository.** Writes always went through the module-level
+   repository singleton, bypassing a custom container's plugin chain
+   (audit, tenant, observability). Resolution order is now: explicit
+   injection → registered engine's container repository → singleton.
+   New optional arg: `resumeHook(token, payload, { repository })` /
+   `cancelHook(token, { reason, repository })`.
+2. **Atomic advance.** The step-done write and the `currentStepId`
+   advance (or completion) were two separate updates — a crash between
+   them left `status: 'running'` pointing at a done step. They are now
+   ONE `findOneAndUpdate` behind a `status + steps.<i>.status` CAS guard;
+   the intermediate state can no longer exist, and the epoch
+   `lastHeartbeat` stamp for engine-less resumes rides the same write.
+3. **Completion contract.** The "no next step" path marked the run done
+   via a raw write with NO `workflow:completed` emission and never
+   released the strict-concurrency slot (the counter leaked until
+   recount). It now mirrors the engine's completion contract: durable
+   write first, then `workflow:completed` on the owning container bus
+   (whose `releaseSlotOnTerminal` listener frees the slot); with no
+   engine in-process the slot is released explicitly against the counter
+   repository.
+
+### Fixed — `engine.cancel()` is an idempotent no-op on terminal runs
+
+`cancel(runId)` on an already-terminal run (`done` / `failed` /
+`cancelled` / `compensated` / `compensation_failed`) previously
+overwrote the terminal status with `cancelled` — an illegal
+`RUN_MACHINE` transition that retroactively falsified a completed
+outcome and re-fired terminal listeners. It now returns the run
+unchanged (no write, no `workflow:cancelled` emission), mirroring
+`pause()`'s guard. **Behavior change** for callers that relied on
+re-labelling finished runs; cancel before the run settles instead.
+
+### Changed — event-sink default list is compile-time exhaustive
+
+`createEventSink`'s default event array was hand-rolled and had drifted:
+`workflow:retry`, the saga lifecycle (`workflow:compensating` /
+`:compensated` / `:compensation_failed`), `step:compensated`,
+`step:stream`, `engine:error`, and `scheduler:*` were silently never
+forwarded. The default is now derived from an exhaustive
+`Record<WorkflowEventName, true>` registry (a new event that isn't
+classified is a compile error) minus one explicit named exclusion:
+`step:stream` (non-durable, high-frequency `ctx.stream()` frames — opt in
+via `options.events`). New exports: `ALL_WORKFLOW_EVENT_NAMES`,
+`EVENT_SINK_DEFAULT_EXCLUSIONS`.
+
+**Behavior change:** default sinks (no `options.events`) now receive the
+previously-dropped events above. Sinks that pass an explicit `events`
+list are unaffected.
+
+### Changed — `exactOptionalPropertyTypes: true`
+
+The compiler now distinguishes "absent" from "explicitly `undefined`".
+All fallout fixed by honest type widening (`T | undefined` on fields the
+engine deliberately clears, or that hosts build from possibly-absent
+values) — zero casts added. Host-facing option bags widened so
+`{ ...base, field: maybeUndefined }` spreads keep compiling:
+`TenantFilterOptions`, `RetentionOptions`, `ContainerOptions`,
+`WorkflowEngineOptions`, `engine.start()` options, plus the persistence
+shapes (`WorkflowRun`, `StepState`, `StepError`, `WaitingFor`,
+`SchedulingInfo`, `JoinBranchResult`). Type-level change only — no
+runtime behavior difference.
+
+### Changed — logged (still-swallowed) failure paths
+
+Three fire-and-forget catch sites now log at `warn` via the streamline
+logger (configure with `configureStreamlineLogger`) instead of swallowing
+silently: event-transport bridge publish failures (`events/bridge.ts`),
+`cancelOn`-triggered cancel failures (`engine.start` listener), and step
+log-flush failures (`executor`, buffered `ctx.log` entries dropped).
+Swallowing is still correct at all three sites — now it's diagnosable.
+
+### Changed — dependencies
+
+Dev/test matrix upgraded and verified: `@classytic/mongokit` `^3.18.0`,
+`@classytic/repo-core` `^0.7.0`, `@classytic/primitives` `^0.9.1`. No
+source changes required. `peerDependencies` floors are unchanged, but
+note: **mongokit 3.18 itself peer-requires `@classytic/repo-core >=0.7.0`**
+— hosts upgrading mongokit must bring repo-core along. The tenant-filter
+plugin's `OP_REGISTRY` derivation uses exports present since mongokit
+3.14 (the existing floor).
+
+### Packaging & docs
+
+- `publishConfig.access: "public"` declared explicitly; `CHANGELOG.md`
+  now ships in the npm tarball (`files`).
+- JSDoc `@example` imports referencing non-existent subpaths
+  (`@classytic/streamline/plugins`, `/scheduling`) corrected to root
+  imports — the package exports only `.`, `./fastify`, `./telemetry`.
+- Hand-rolled duplicate-key detector replaced with mongokit's
+  `isDuplicateKeyError` (also catches mongoose-wrapped shapes).
+- Every `schema.index()` in `run.model.ts` now names the query it serves.
+
+### Testing
+
+- Tenant plugin: `cursor` / `cursorStaleRunning` / `claimVersion` /
+  `getOrCreate` tenant-scoping + strict-throw coverage.
+- Retention: TTL filter includes all terminal statuses + a no-drift
+  assertion tying the index spec to the state machine's terminal set.
+- Scheduling: strict-tenant scheduling (stamped + scoped + strict-throw +
+  configured-field, not hard-coded literal).
+- `resumeViaDb`: injected-repository routing, single-round-trip atomic
+  advance (repo spy + CAS-guard shape), completion emission + strict-slot
+  release to zero.
+- Event sink: no-drift tests (registry ↔ constants map, default-vs-
+  exclusion completeness, `options.events` override).
+- Generalized API contracts: `wf.cancel` (mid-step abort via `ctx.signal`,
+  during-wait, terminal idempotency), `cancelHook` reason persistence +
+  event payload + late-resume rejection + saga-compensation composition,
+  step outputs rehydrating on a fresh engine after restart, `ctx.loop`
+  resuming at the committed iteration (with accumulator) on a NEW engine.
+- Type-level DX tests (`test/type-inference.test-d.ts`, now including
+  typed step outputs both-ways checking) are wired into the `unit`
+  project via vitest `typecheck` — previously nothing verified that file.
+
+
 ## [2.6.0] - 2026-06-11 — Typed outputs, durable loops, recurring schedules, payload guards
 
 One release, five additive capabilities. No behavior changes for existing

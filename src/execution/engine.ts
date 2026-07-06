@@ -3,6 +3,9 @@ import type { StreamlineContainer } from '../core/container.js';
 import { globalEventBus } from '../core/events.js';
 import { isTerminalState, RUN_MACHINE } from '../core/status.js';
 import type {
+  RunMetrics,
+  RunProgress,
+  StepProgress,
   StepState,
   WorkflowDefinition,
   WorkflowEventPayload,
@@ -53,9 +56,9 @@ export { hookRegistry, workflowRegistry } from './registries.js';
 
 export interface WorkflowEngineOptions {
   /** Auto-execute workflow after start (default: true) */
-  autoExecute?: boolean;
+  autoExecute?: boolean | undefined;
   /** Custom scheduler configuration */
-  scheduler?: Partial<SmartSchedulerConfig>;
+  scheduler?: Partial<SmartSchedulerConfig> | undefined;
   /**
    * Ring-buffer cap for persisted `stepLogs` (ctx.log()) on the run doc.
    * `flushLogs` writes with `$push: { $slice: -maxStepLogs }`, keeping only
@@ -65,38 +68,48 @@ export interface WorkflowEngineOptions {
    * bound arbitrary `context` / step `output` / `checkpoint` payloads (also
    * inline on the run doc) — store a reference/handle for large blobs.
    */
-  maxStepLogs?: number;
+  maxStepLogs?: number | undefined;
   /**
    * Opt-in HARD cap (bytes, JSON-approximated) for a single step output or
    * `ctx.checkpoint()` payload — exceeding it fails the step NON-retriably.
    * Unset (default) = warn-only over 1MB. See `WorkflowConfig.maxPayloadBytes`.
    */
-  maxPayloadBytes?: number;
+  maxPayloadBytes?: number | undefined;
   /**
    * Observability-only step middleware chain (v2.6) — beforeStep / afterStep /
    * onStepError / onWait hooks awaited around every step execution. Hook
    * errors are logged and SWALLOWED (middleware can never veto or fail a
    * step). See `StepMiddleware`.
    */
-  middleware?: ReadonlyArray<import('../core/types.js').StepMiddleware>;
+  middleware?: ReadonlyArray<import('../core/types.js').StepMiddleware> | undefined;
+  /**
+   * Generalized per-step / per-scatter-task guard + recording middleware
+   * (v2.7). `before` can REJECT a step/task non-retriably; `after` records the
+   * outcome (result/error + durationMs). The engine bakes in no policy —
+   * budget enforcement is a host recipe (read spend in `before`, record in
+   * `after`). See `TaskMiddleware`.
+   */
+  taskMiddleware?: ReadonlyArray<import('../core/types.js').TaskMiddleware> | undefined;
   /**
    * Compensation handlers for saga pattern rollback.
    * Keyed by stepId. Called in reverse order when a later step fails.
    */
-  compensationHandlers?: WorkflowHandlers<unknown>;
+  compensationHandlers?: WorkflowHandlers<unknown> | undefined;
   /**
    * Per-step compensation retry config (durable saga, v2.4). Keyed by stepId.
    * Absent → 1 attempt (no compensation retry). Threaded from
    * `StepConfig.compensateRetries`/`compensateRetryDelay`/`compensateRetryBackoff`.
    */
-  compensationConfigs?: Record<
-    string,
-    {
-      retries?: number;
-      retryDelay?: number;
-      retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
-    }
-  >;
+  compensationConfigs?:
+    | Record<
+        string,
+        {
+          retries?: number;
+          retryDelay?: number;
+          retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+        }
+      >
+    | undefined;
   /**
    * Optional migration hook for in-flight runs whose `definitionVersion`
    * doesn't match this engine AND whose original-version engine is not
@@ -134,6 +147,9 @@ export interface WorkflowEngineOptions {
     | null
     | undefined
     | Promise<Partial<WorkflowRun<unknown>> | null | undefined>;
+  // NOTE (exactOptionalPropertyTypes): optional props above carry
+  // `| undefined` because `createWorkflow` builds this options bag from
+  // possibly-absent config fields.
   /**
    * Register the strict-concurrency slot-release listeners on the bus.
    *
@@ -230,6 +246,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       options.middleware as
         | ReadonlyArray<import('../core/types.js').StepMiddleware<TContext>>
         | undefined,
+      options.taskMiddleware,
     );
 
     const schedulerConfig = {
@@ -404,19 +421,21 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   async start(
     input: unknown,
     options?: {
-      meta?: Record<string, unknown>;
-      idempotencyKey?: string;
-      priority?: number;
-      concurrencyKey?: string;
-      startAsDraft?: boolean;
+      // `| undefined` (exactOptionalPropertyTypes): define.ts builds this
+      // bag from possibly-absent StartOptions fields.
+      meta?: Record<string, unknown> | undefined;
+      idempotencyKey?: string | undefined;
+      priority?: number | undefined;
+      concurrencyKey?: string | undefined;
+      startAsDraft?: boolean | undefined;
       /**
        * Schedule this run to fire at a future time. Forces the run to start
        * as a draft with `scheduling.executionTime` set; the smart scheduler's
        * scheduled-draft pickup path transitions it to running when the time
        * passes. Used by throttle/debounce gates in `define.ts`.
        */
-      scheduledExecutionTime?: Date;
-      cancelOn?: Array<{ event: string }>;
+      scheduledExecutionTime?: Date | undefined;
+      cancelOn?: Array<{ event: string }> | undefined;
       /**
        * Tenant context forwarded to `repository.create` (and the idempotency
        * lookup). Required when the repository was constructed with
@@ -424,8 +443,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
        * `before:create` / `before:getOne` if missing. Single-tenant or
        * `staticTenantId` deployments can omit.
        */
-      tenantId?: string;
-      bypassTenant?: boolean;
+      tenantId?: string | undefined;
+      bypassTenant?: boolean | undefined;
     },
   ): Promise<WorkflowRun<TContext>> {
     const run = this.registry.createRun(input, options?.meta);
@@ -488,7 +507,17 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           const p = payload as { runId?: string } | undefined;
           // Cancel if: no runId filter, or runId matches, or broadcast
           if (!p?.runId || p.runId === run._id) {
-            this.cancel(run._id).catch(() => {});
+            // Fire-and-forget by design (an event listener can't await),
+            // but log — a cancelOn trigger that silently fails to cancel
+            // leaves the run alive with no operator signal.
+            this.cancel(run._id).catch((err: unknown) => {
+              logger.warn('[streamline] cancelOn-triggered cancel failed', {
+                runId: run._id,
+                workflowId: run.workflowId,
+                triggerEvent: trigger.event,
+                error: toError(err).message,
+              });
+            });
           }
         };
         this.container.eventBus.on(trigger.event, cancelListener);
@@ -608,6 +637,21 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         run = updatedRun;
 
         if (shouldBreak) break;
+
+        // Operator-pause boundary (v2.7). `pause()` sets the durable `paused`
+        // flag WITHOUT interrupting the in-flight step (rule 33 honesty). The
+        // just-finished step is the boundary — re-read the flag and stop
+        // claiming further steps if it flipped. A cheap probe (only when the
+        // run is still active); the scheduler/executeRetry skip paused runs so
+        // the run stays parked at this step until `resume()`.
+        if (run.status === 'running') {
+          const fresh = await this.container.repository.getById(runId, { bypassTenant: true });
+          if (fresh?.paused) {
+            this.container.cache.set(fresh as WorkflowRun<TContext>);
+            run = fresh as WorkflowRun<TContext>;
+            break;
+          }
+        }
 
         // Handle waiting state
         if (run.status === 'waiting') {
@@ -1630,11 +1674,26 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    * Cancel a running workflow.
    * Cleans up all resources and marks workflow as cancelled.
    *
+   * Idempotent on terminal runs (2.7.0): cancelling a run that is already
+   * `done` / `failed` / `cancelled` / `compensated` / `compensation_failed`
+   * returns it UNCHANGED — no write, no `workflow:cancelled` emission.
+   * Pre-2.7 this overwrote the terminal status with `cancelled`, an illegal
+   * `RUN_MACHINE` transition that retroactively falsified a completed
+   * outcome and re-fired terminal listeners. Mirrors `pause()`'s guard.
+   *
    * @param runId - Workflow run ID to cancel
-   * @returns The cancelled workflow run
+   * @param options - Optional `{ reason }` (v2.7) persisted on the run
+   *   (`cancellationReason`) and echoed in the `workflow:cancelled` event.
+   *   Omitting it leaves `cancellationReason` unset (pre-2.7 shape). Never
+   *   overwritten on a terminal-run no-op.
+   * @returns The cancelled workflow run (or the unchanged terminal run)
    */
-  async cancel(runId: string): Promise<WorkflowRun<TContext>> {
+  async cancel(runId: string, options?: { reason?: string }): Promise<WorkflowRun<TContext>> {
     const run = await this.getOrThrow(runId);
+
+    if (isTerminalState(run.status)) {
+      return run;
+    }
 
     // Abort any in-flight step handlers (fulfills ctx.signal contract)
     this.executor.abortWorkflow(runId);
@@ -1655,6 +1714,9 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       status: 'cancelled' as WorkflowRun<TContext>['status'],
       endedAt: new Date(),
       updatedAt: new Date(),
+      // Additive cancel reason (v2.7). Only stamped when supplied — absent
+      // reason leaves the field unset (byte-for-byte pre-2.7).
+      ...(options?.reason !== undefined ? { cancellationReason: options.reason } : {}),
     };
     await this.container.repository.updateById(runId, updates, { bypassTenant: true });
 
@@ -1664,21 +1726,37 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
     hookRegistry.unregister(runId);
     this.container.cache.delete(runId);
-    this.container.eventBus.emit('workflow:cancelled', { runId });
+    this.container.eventBus.emit('workflow:cancelled', {
+      runId,
+      ...(options?.reason !== undefined ? { data: { reason: options.reason } } : {}),
+    });
 
     return cancelledRun;
   }
 
   /**
-   * Pause a workflow run.
+   * Operator pause of a running / waiting run.
    *
-   * Sets the `paused` flag to prevent the scheduler from processing this workflow.
-   * Paused workflows can be resumed later with `resume()`.
+   * Sets the durable `paused` flag so the scheduler and `executeRetry` skip
+   * this run — no FURTHER step is claimed while paused. Idempotent, mirroring
+   * `cancel()`: a no-op on an already-terminal or already-paused run (returns
+   * it unchanged, no event).
+   *
+   * **Honesty note (rule 33): pause takes effect at the NEXT step boundary,
+   * not mid-step.** The step handler currently executing is an in-flight
+   * promise; it is NOT interrupted and runs to its natural end (success /
+   * failure / wait). Only after that boundary does the "paused" gate stop the
+   * engine from claiming the next step. Use `cancel()` if you need to abort the
+   * in-flight handler (it fires `ctx.signal`).
+   *
+   * Emits `workflow:paused` (with the optional `reason`) on a successful
+   * transition.
    *
    * @param runId - Workflow run ID to pause
-   * @returns The paused workflow run
+   * @param options - Optional `{ reason }` echoed in the `workflow:paused` event
+   * @returns The paused workflow run (or the unchanged terminal/paused run)
    */
-  async pause(runId: string): Promise<WorkflowRun<TContext>> {
+  async pause(runId: string, options?: { reason?: string }): Promise<WorkflowRun<TContext>> {
     const run = await this.getOrThrow(runId);
 
     // Don't pause terminal states
@@ -1686,7 +1764,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       return run;
     }
 
-    // Already paused - no-op
+    // Already paused - no-op (idempotent double-pause)
     if (run.paused) {
       return run;
     }
@@ -1706,7 +1784,137 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     this.scheduler.cancelSchedule(runId);
     this.container.cache.set(pausedRun);
 
+    this.container.eventBus.emit('workflow:paused', {
+      runId,
+      ...(options?.reason !== undefined ? { reason: options.reason } : {}),
+    });
+
     return pausedRun;
+  }
+
+  /**
+   * Operator resume of a paused run (v2.7) — the explicit counterpart to
+   * `pause()`. Clears the durable `paused` flag (via `resume()`'s atomic CAS)
+   * and continues the run from the SAME step it paused at: a paused-while-
+   * waiting run resumes its wait, a paused-while-running run re-enters
+   * execution at the next step boundary.
+   *
+   * Thin wrapper over `resume(runId, options?.data)` so hosts have a
+   * symmetric `pause` / `resume` operator API. Emits `workflow:resumed` (via
+   * the normal resume path when a waiting step completes).
+   *
+   * @param runId - Workflow run ID to resume
+   * @param options - Optional `{ data }` passed as the waiting step's payload
+   * @returns The resumed workflow run
+   */
+  async resumeOperator(
+    runId: string,
+    options?: { data?: unknown },
+  ): Promise<WorkflowRun<TContext>> {
+    const before = await this.get(runId);
+    // A waiting-step resume emits its own `workflow:resumed` (with stepId) via
+    // the executor's resumeStep. Only synthesize the event here for a
+    // paused-while-RUNNING resume, which otherwise has no natural resumed
+    // emit — this avoids a double `workflow:resumed` for the waiting case.
+    const willEmitViaResumeStep = before?.status === 'waiting';
+    const result = await this.resume(runId, options?.data);
+    if (!willEmitViaResumeStep) {
+      this.container.eventBus.emit('workflow:resumed', { runId, data: options?.data });
+    }
+    return result;
+  }
+
+  // ============ Queryable progress + metrics (v2.7) ============
+
+  /**
+   * Read the latest queryable progress snapshot for a step (v2.7) — a plain,
+   * tenant-scoped read off the run doc. Returns `undefined` when the run/step
+   * doesn't exist or the step never reported progress.
+   */
+  async getStepProgress(
+    runId: string,
+    stepId: string,
+    options?: { tenantId?: string; bypassTenant?: boolean },
+  ): Promise<StepProgress | undefined> {
+    const run = await this.readRun(runId, options);
+    return run?.steps.find((s) => s.stepId === stepId)?.lastProgress;
+  }
+
+  /**
+   * Read the current progress of every step in a run (v2.7) — the run status
+   * plus each step's status and latest reported progress. Plain read off the
+   * run doc; tenant-scoped like other reads.
+   */
+  async getRunProgress(
+    runId: string,
+    options?: { tenantId?: string; bypassTenant?: boolean },
+  ): Promise<RunProgress | null> {
+    const run = await this.readRun(runId, options);
+    if (!run) return null;
+    return {
+      status: run.status,
+      steps: run.steps.map((s) => ({
+        stepId: s.stepId,
+        status: s.status,
+        ...(s.lastProgress !== undefined ? { lastProgress: s.lastProgress } : {}),
+      })),
+    };
+  }
+
+  /**
+   * Aggregate run-level metrics (v2.7) — pure aggregation over the run doc's
+   * `StepState` (durations + attempts, plus host-recorded `cost`). Queryable
+   * for both terminal and in-flight runs. `totalCost` is the sum only when at
+   * least one step carries a `cost`; otherwise `undefined`.
+   */
+  async getRunMetrics(
+    runId: string,
+    options?: { tenantId?: string; bypassTenant?: boolean },
+  ): Promise<RunMetrics | null> {
+    const run = await this.readRun(runId, options);
+    if (!run) return null;
+
+    let totalDurationMs = 0;
+    let costSum = 0;
+    let anyCost = false;
+    const steps = run.steps.map((s) => {
+      totalDurationMs += s.durationMs ?? 0;
+      if (s.cost !== undefined) {
+        anyCost = true;
+        costSum += s.cost;
+      }
+      return {
+        stepId: s.stepId,
+        ...(s.durationMs !== undefined ? { durationMs: s.durationMs } : {}),
+        attempts: s.attempts,
+        ...(s.cost !== undefined ? { cost: s.cost } : {}),
+      };
+    });
+
+    return {
+      runId,
+      status: run.status,
+      steps,
+      totalDurationMs,
+      ...(anyCost ? { totalCost: costSum } : {}),
+    };
+  }
+
+  /**
+   * Tenant-scoped read for the progress/metrics accessors. Reads through the
+   * repository (bypassing the in-memory cache) so a fresh engine after a
+   * restart returns persisted state, and forwards tenant options so strict
+   * multi-tenant repos scope the read.
+   */
+  private async readRun(
+    runId: string,
+    options?: { tenantId?: string; bypassTenant?: boolean },
+  ): Promise<WorkflowRun<TContext> | null> {
+    const run = await this.container.repository.getById(runId, {
+      ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+      ...(options?.bypassTenant ? { bypassTenant: true } : {}),
+    });
+    return run as WorkflowRun<TContext> | null;
   }
 
   /**

@@ -7,11 +7,12 @@ import type {
   StepContext,
   StepLogEntry,
   StepOutputVersion,
+  StepProgress,
   WorkflowRun,
 } from '../core/types.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
 import { NonRetriableError } from '../utils/errors.js';
-import { guardPayloadSize } from '../utils/helpers.js';
+import { approxByteSize, guardPayloadSize } from '../utils/helpers.js';
 import { logger } from '../utils/logger.js';
 
 export class WaitSignal extends Error {
@@ -34,6 +35,23 @@ export class GotoSignal extends Error {
     super(`goto:${targetStepId}`);
     this.name = 'GotoSignal';
   }
+}
+
+/**
+ * Per-scatter-task guard/record hooks (v2.7), passed from the executor into the
+ * step context so `ctx.scatter()` can apply the same `taskMiddleware` chain to
+ * each sub-task that the executor applies to the whole step.
+ */
+export interface TaskHooks {
+  workflowId: string;
+  tenantId?: string | undefined;
+  /** Returns a rejection reason (or `undefined` to allow) for one task. */
+  before: (taskKey: string) => Promise<{ rejected: boolean; reason?: string }>;
+  /** Records one task's outcome (result/error + durationMs). */
+  after: (
+    taskKey: string,
+    outcome: { result?: unknown; error?: unknown; durationMs: number },
+  ) => Promise<void>;
 }
 
 export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Record<string, unknown>>
@@ -65,6 +83,14 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
      * warn-only at {@link LIMITS.PAYLOAD_WARN_BYTES}.
      */
     private maxPayloadBytes?: number,
+    /**
+     * Optional per-scatter-task guard/record hooks (v2.7). Supplied by the
+     * executor only when `taskMiddleware` is configured, so the default scatter
+     * path is unchanged. `before` returns a rejection reason (or undefined to
+     * allow); `after` records the task outcome. `workflowId` / `tenantId` are
+     * stamped once and reused for every task's `TaskHookContext`.
+     */
+    private taskHooks?: TaskHooks,
   ) {
     this.signal = signal ?? new AbortController().signal;
   }
@@ -176,6 +202,96 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     };
     this.eventBus.emit('step:stream', payload);
     this.signalStore?.publish(`streamline:stream:${this.runId}`, payload);
+  }
+
+  // ── Queryable progress (v2.7) — throttled, latest-wins persistence. ──
+  /** Latest reported snapshot not yet known to be persisted (coalesced). */
+  private pendingProgress: StepProgress | undefined;
+  /** The snapshot most recently written to the DB (dedup — skip re-writes). */
+  private lastFlushedProgress: StepProgress | undefined;
+  /** Wall-clock of the last durable progress write (throttle gate). */
+  private lastProgressWriteAt = 0;
+  /** Deferred-flush timer armed when a call arrives inside the throttle window. */
+  private progressTimer: NodeJS.Timeout | undefined;
+
+  reportProgress(progress: Omit<StepProgress, 'at'> & { at?: Date }): void {
+    // Advisory, never load-bearing — dropped after cancellation.
+    if (this.signal.aborted) return;
+
+    // Bound the serialized snapshot (~1KB): truncate `message` if needed so a
+    // verbose status line can't grow the inline `lastProgress` subdoc.
+    const snapshot: StepProgress = { ...progress, at: progress.at ?? new Date() };
+    if (snapshot.message !== undefined && approxByteSize(snapshot) !== undefined) {
+      let size = approxByteSize(snapshot) ?? 0;
+      if (size > LIMITS.PROGRESS_MAX_BYTES) {
+        // Trim the message down until the whole snapshot fits (or it's empty).
+        const overshoot = size - LIMITS.PROGRESS_MAX_BYTES;
+        const msg = snapshot.message;
+        snapshot.message =
+          msg.length > overshoot ? `${msg.slice(0, Math.max(0, msg.length - overshoot - 1))}…` : '';
+        size = approxByteSize(snapshot) ?? 0;
+        // Last resort: drop the message entirely if still over.
+        if (size > LIMITS.PROGRESS_MAX_BYTES) snapshot.message = undefined;
+      }
+    }
+
+    this.pendingProgress = snapshot;
+
+    const now = Date.now();
+    const elapsed = now - this.lastProgressWriteAt;
+    if (elapsed >= LIMITS.PROGRESS_PERSIST_THROTTLE_MS) {
+      // Outside the throttle window — persist immediately (fire-and-forget).
+      void this.writeProgress();
+    } else if (!this.progressTimer) {
+      // Inside the window — arm a single deferred flush for the tail value.
+      const delay = LIMITS.PROGRESS_PERSIST_THROTTLE_MS - elapsed;
+      this.progressTimer = setTimeout(() => {
+        this.progressTimer = undefined;
+        void this.writeProgress();
+      }, delay);
+      // Don't keep the process alive purely for a progress flush.
+      this.progressTimer.unref?.();
+    }
+    // else: a deferred flush is already armed; the coalesced `pendingProgress`
+    // (latest-wins) will be written when it fires.
+  }
+
+  /** Persist the pending progress snapshot (latest-wins). Fire-and-forget. */
+  private async writeProgress(): Promise<void> {
+    const snapshot = this.pendingProgress;
+    if (snapshot === undefined) return;
+    if (snapshot === this.lastFlushedProgress) return; // nothing new
+    this.lastProgressWriteAt = Date.now();
+    this.lastFlushedProgress = snapshot;
+
+    const stepIndex = this.run.steps.findIndex((s) => s.stepId === this.stepId);
+    if (stepIndex === -1) return;
+
+    try {
+      await this.repository.updateOne(
+        { _id: this.runId, status: { $ne: 'cancelled' } },
+        { $set: { [`steps.${stepIndex}.lastProgress`]: snapshot } },
+        { bypassTenant: true },
+      );
+      // Mirror in-memory so getRunProgress off the cached run is consistent.
+      const step = this.run.steps[stepIndex];
+      if (step) step.lastProgress = snapshot;
+    } catch {
+      // Progress is advisory — swallow persistence errors (stdout unaffected).
+    }
+  }
+
+  /**
+   * Flush the final progress snapshot regardless of the throttle window and
+   * clear any armed timer. Called by the executor after the step settles so the
+   * last reported value always lands even if it arrived inside the window.
+   */
+  async flushProgress(): Promise<void> {
+    if (this.progressTimer) {
+      clearTimeout(this.progressTimer);
+      this.progressTimer = undefined;
+    }
+    await this.writeProgress();
   }
 
   log(message: string, data?: unknown): void {
@@ -323,7 +439,21 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
       if (!taskFn) continue;
       let promise!: Promise<void>;
       promise = (async () => {
+        const taskStartedAt = Date.now();
         try {
+          // Per-task guard (v2.7): a `taskMiddleware.before` rejection fails
+          // ONLY this task with the reason; siblings proceed. Recorded as a
+          // failure so scatter throws (and the step retries) like any task
+          // failure — but the rejected task is not checkpointed done, so a
+          // retry re-runs exactly it.
+          if (this.taskHooks) {
+            const guard = await this.taskHooks.before(id);
+            if (guard.rejected) {
+              throw new NonRetriableError(
+                guard.reason ?? `Scatter task "${id}" rejected by task guard`,
+              );
+            }
+          }
           const value = await taskFn();
           results[id] = value;
           // Only successful tasks checkpoint `{done:true}`; a failed task is
@@ -332,10 +462,19 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
           checkpoint[id] = { done: true, value };
           // Persist after each SUCCESS — crash recovery resumes from here.
           await this.checkpoint(checkpoint);
+          if (this.taskHooks) {
+            await this.taskHooks.after(id, {
+              result: value,
+              durationMs: Date.now() - taskStartedAt,
+            });
+          }
         } catch (err) {
           // Record the failure independently of the gating set so it is
           // observed even though this promise has already left `executing`.
           failures.push(err);
+          if (this.taskHooks) {
+            await this.taskHooks.after(id, { error: err, durationMs: Date.now() - taskStartedAt });
+          }
         } finally {
           executing.delete(promise);
         }
@@ -399,6 +538,66 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     const step = this.run.steps.find((s) => s.stepId === this.stepId);
     const output = step?.output as { __checkpoint?: T } | undefined;
     return output?.__checkpoint;
+  }
+
+  async dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const step = this.run.steps.find((s) => s.stepId === this.stepId);
+    const cache = (step?.dedupeCache ?? {}) as Record<string, unknown>;
+
+    // Cache hit — return the memoized value WITHOUT re-running fn (crash/retry
+    // idempotency). `hasOwn` so a legitimately-cached `undefined` still hits.
+    if (step && Object.hasOwn(cache, key)) {
+      return cache[key] as T;
+    }
+
+    const value = await fn();
+
+    // Don't cache after cancellation (the run write would be rejected anyway).
+    if (this.signal.aborted || !step) return value;
+
+    // Budget guard: cache only if the step's total dedupe cache stays under
+    // ~10KB. Over budget ⇒ don't cache (run every time), warn once.
+    const candidate = { ...cache, [key]: value };
+    const size = approxByteSize(candidate);
+    if (size !== undefined && size > LIMITS.DEDUPE_MAX_BYTES) {
+      logger.warn(
+        '[streamline] ctx.dedupe cache over budget — value NOT cached (will re-run on retry)',
+        {
+          runId: this.runId,
+          stepId: this.stepId,
+          key,
+          bytes: size,
+          maxBytes: LIMITS.DEDUPE_MAX_BYTES,
+        },
+      );
+      return value;
+    }
+
+    const stepIndex = this.run.steps.findIndex((s) => s.stepId === this.stepId);
+    if (stepIndex === -1) return value;
+
+    try {
+      // Durable commit BEFORE returning — a crash after this point replays the
+      // step and reads the cached value instead of re-running fn.
+      await this.repository.updateOne(
+        { _id: this.runId, status: { $ne: 'cancelled' } },
+        {
+          $set: {
+            [`steps.${stepIndex}.dedupeCache.${key}`]: value,
+            updatedAt: new Date(),
+            lastHeartbeat: new Date(),
+          },
+        },
+        { bypassTenant: true },
+      );
+      // Mirror in-memory so a second dedupe(key) in the same execution hits.
+      step.dedupeCache = candidate;
+    } catch {
+      // If the durable write fails (e.g. run cancelled), still return the
+      // computed value — dedupe degrades to "no memoization" on write failure.
+    }
+
+    return value;
   }
 
   async loop<S>(

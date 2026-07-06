@@ -4,8 +4,8 @@ export interface StepTimeline {
   id: string;
   status: StepState['status'];
   duration: number | null;
-  startedAt?: Date;
-  endedAt?: Date;
+  startedAt?: Date | undefined;
+  endedAt?: Date | undefined;
 }
 
 export interface WorkflowProgress {

@@ -8,6 +8,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import mongoose from 'mongoose';
 import { Repository } from '@classytic/mongokit';
 import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { createWorkflowRepository } from '../../src/storage/run.repository.js';
 import {
   tenantFilterPlugin,
   singleTenantPlugin,
@@ -644,6 +645,161 @@ describe('TenantFilterPlugin', () => {
 
       expect(resultsB.data).toHaveLength(1);
       expect(resultsB.data[0].context.tenantId).toBe('concurrent-b');
+    });
+  });
+
+  describe('Derived Hook Coverage (2.7): cursor / claimVersion / getOrCreate', () => {
+    const strictOptions: TenantFilterOptions = {
+      tenantField: 'context.tenantId',
+      strict: true,
+    };
+
+    const seedRun = (id: string, tenantId: string, extra: Record<string, unknown> = {}) =>
+      WorkflowRunModel.create({
+        _id: id,
+        workflowId: 'test-workflow',
+        status: 'running',
+        steps: [],
+        currentStepId: null,
+        context: { tenantId },
+        input: {},
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        ...extra,
+      });
+
+    describe('cursor', () => {
+      it('should only yield the requesting tenant runs', async () => {
+        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        await seedRun('run-cursor-a', 'cursor-tenant-a');
+        await seedRun('run-cursor-b', 'cursor-tenant-b');
+
+        const seen: string[] = [];
+        for await (const doc of repo.cursor(
+          { status: 'running' },
+          { lean: true, tenantId: 'cursor-tenant-a' } as any,
+        )) {
+          seen.push((doc as any)._id);
+        }
+
+        expect(seen).toEqual(['run-cursor-a']);
+      });
+
+      it('should throw in strict mode without tenantId', async () => {
+        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        await seedRun('run-cursor-strict', 'cursor-tenant-strict');
+
+        await expect(
+          (async () => {
+            for await (const doc of repo.cursor({ status: 'running' })) {
+              void doc;
+              break;
+            }
+          })(),
+        ).rejects.toThrow('Missing tenantId');
+      });
+
+      it('cursorStaleRunning should be tenant-scoped and strict-throwing', async () => {
+        const repo = createWorkflowRepository({ multiTenant: strictOptions });
+        const staleHeartbeat = new Date(Date.now() - 60 * 60 * 1000);
+        await seedRun('run-stale-a', 'stale-tenant-a', { lastHeartbeat: staleHeartbeat });
+        await seedRun('run-stale-b', 'stale-tenant-b', { lastHeartbeat: staleHeartbeat });
+
+        const seen: string[] = [];
+        for await (const run of repo.cursorStaleRunning(60_000, {
+          tenantId: 'stale-tenant-a',
+        })) {
+          seen.push(run._id);
+        }
+        expect(seen).toEqual(['run-stale-a']);
+
+        await expect(
+          (async () => {
+            for await (const run of repo.cursorStaleRunning(60_000)) {
+              void run;
+              break;
+            }
+          })(),
+        ).rejects.toThrow('Missing tenantId');
+      });
+    });
+
+    describe('claimVersion', () => {
+      it('should be tenant-scoped the same way claim is', async () => {
+        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        await seedRun('run-cv-a', 'cv-tenant-a');
+
+        // Cross-tenant CAS misses — the injected tenant predicate excludes the doc.
+        const crossTenant = await repo.claimVersion(
+          'run-cv-a',
+          { from: undefined },
+          { $set: { status: 'waiting' } },
+          { tenantId: 'cv-tenant-b' } as any,
+        );
+        expect(crossTenant).toBeNull();
+
+        // Owning tenant claims successfully.
+        const owned = await repo.claimVersion(
+          'run-cv-a',
+          { from: undefined },
+          { $set: { status: 'waiting' } },
+          { tenantId: 'cv-tenant-a' } as any,
+        );
+        expect(owned).not.toBeNull();
+        expect((owned as any).status).toBe('waiting');
+      });
+
+      it('should throw in strict mode without tenantId', async () => {
+        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        await seedRun('run-cv-strict', 'cv-tenant-strict');
+
+        await expect(
+          repo.claimVersion('run-cv-strict', { from: undefined }, { $set: { status: 'done' } }),
+        ).rejects.toThrow('Missing tenantId');
+      });
+    });
+
+    describe('getOrCreate', () => {
+      it('should be tenant-scoped: owning tenant gets existing, other tenant creates fresh', async () => {
+        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        await seedRun('run-goc-a', 'goc-tenant-a', { workflowId: 'goc-workflow' });
+
+        const createData = {
+          steps: [],
+          currentStepId: null,
+          input: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        // Owning tenant — the query matches the seeded doc.
+        const existing = await repo.getOrCreate(
+          { workflowId: 'goc-workflow', status: 'running' },
+          { _id: 'run-goc-new-a', ...createData },
+          { tenantId: 'goc-tenant-a' } as any,
+        );
+        expect(existing.created).toBe(false);
+        expect((existing.doc as any)._id).toBe('run-goc-a');
+
+        // Other tenant — must NOT see tenant-a's doc; the upsert creates a
+        // fresh run stamped with tenant-b via the injected query predicate.
+        const other = await repo.getOrCreate(
+          { workflowId: 'goc-workflow', status: 'running' },
+          { _id: 'run-goc-new-b', ...createData },
+          { tenantId: 'goc-tenant-b' } as any,
+        );
+        expect(other.created).toBe(true);
+        expect((other.doc as any)._id).toBe('run-goc-new-b');
+        expect((other.doc as any).context?.tenantId).toBe('goc-tenant-b');
+      });
+
+      it('should throw in strict mode without tenantId', async () => {
+        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+
+        await expect(
+          repo.getOrCreate({ workflowId: 'goc-strict' }, { _id: 'run-goc-strict' }),
+        ).rejects.toThrow('Missing tenantId');
+      });
     });
   });
 });

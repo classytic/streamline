@@ -198,9 +198,11 @@ export const DEFAULT_SCHEDULER_CONFIG: SmartSchedulerConfig = {
 
 export class SmartScheduler {
   private timers = new Map<string, NodeJS.Timeout>();
-  private pollInterval?: NodeJS.Timeout;
-  private idleTimer?: NodeJS.Timeout;
-  private staleCheckTimer?: NodeJS.Timeout;
+  // `| undefined` (exactOptionalPropertyTypes): stop() clears these by
+  // assigning `undefined`.
+  private pollInterval: NodeJS.Timeout | undefined;
+  private idleTimer: NodeJS.Timeout | undefined;
+  private staleCheckTimer: NodeJS.Timeout | undefined;
   private isPolling = false;
   private isStaleCheckActive = false;
   private currentInterval: number;

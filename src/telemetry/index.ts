@@ -79,7 +79,10 @@ export function enableTelemetry(config: TelemetryConfig): void {
     const span = spans.get(`${runId}:${stepId}`);
     if (span) {
       const errorData = data as { error?: Error } | undefined;
-      span.setStatus({ code: 2, message: errorData?.error?.message });
+      const message = errorData?.error?.message;
+      // Conditional spread (exactOptionalPropertyTypes): SpanStatus types
+      // `message` as `string` when present — omit rather than pass undefined.
+      span.setStatus({ code: 2, ...(message !== undefined ? { message } : {}) });
       if (errorData?.error) span.recordException(errorData.error);
       span.end();
       spans.delete(`${runId}:${stepId}`);
@@ -101,7 +104,8 @@ export function enableTelemetry(config: TelemetryConfig): void {
     const span = spans.get(runId);
     if (span) {
       const errorData = data as { error?: Error } | undefined;
-      span.setStatus({ code: 2, message: errorData?.error?.message });
+      const message = errorData?.error?.message;
+      span.setStatus({ code: 2, ...(message !== undefined ? { message } : {}) });
       if (errorData?.error) span.recordException(errorData.error);
       span.end();
       spans.delete(runId);

@@ -1,6 +1,6 @@
 {
   "name": "@classytic/streamline",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "MongoDB-native durable workflow orchestration engine. Like Temporal but simpler - supports sleep, wait, retry, parallel execution, human-in-the-loop, and crash recovery. Perfect for payment gateways, approval flows, and scheduled tasks.",
   "type": "module",
   "sideEffects": false,
@@ -25,8 +25,12 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
@@ -101,9 +105,9 @@
   "devDependencies": {
     "@biomejs/biome": "^2.4.10",
     "@classytic/dev-tools": "^0.2.0",
-    "@classytic/mongokit": "^3.16.0",
-    "@classytic/primitives": "^0.7.2",
-    "@classytic/repo-core": "^0.6.0",
+    "@classytic/mongokit": "^3.18.0",
+    "@classytic/primitives": "^0.9.1",
+    "@classytic/repo-core": "^0.7.0",
     "@opentelemetry/api": "^1.9.0",
     "@types/luxon": "^3.7.1",
     "@types/node": "^25.0.0",

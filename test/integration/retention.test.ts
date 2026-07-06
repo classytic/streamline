@@ -20,6 +20,11 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { WorkflowEventBus, type WorkflowFailedPayload } from '../../src/core/events.js';
+import {
+  isTerminalState,
+  RUN_STATUS_VALUES,
+  TERMINAL_RUN_STATUSES,
+} from '../../src/core/status.js';
 import { WorkflowRunModel } from '../../src/storage/run.model.js';
 import {
   RETENTION_DEFAULTS,
@@ -86,8 +91,29 @@ describe('syncRetentionIndexes — TTL on terminal runs', () => {
     expect(ttl?.key).toEqual({ endedAt: 1 });
     expect(ttl?.partialFilterExpression).toEqual({
       endedAt: { $exists: true },
-      status: { $in: ['done', 'failed', 'cancelled'] },
+      // Full terminal set — including the saga outcomes `compensated` /
+      // `compensation_failed` that the pre-2.7 hand-rolled array missed.
+      status: {
+        $in: ['done', 'failed', 'cancelled', 'compensated', 'compensation_failed'],
+      },
     });
+  });
+
+  it('TTL partial filter cannot drift from the state machine terminal set', async () => {
+    await syncRetentionIndexes(repo, { terminalRunsTtlSeconds: 86400 });
+
+    const indexes = await WorkflowRunModel.collection.indexes();
+    const ttl = indexes.find((ix) => ix.name === 'streamline_terminal_runs_ttl');
+    const filterStatuses = (
+      ttl?.partialFilterExpression as { status: { $in: string[] } }
+    ).status.$in;
+
+    // Exactly the statuses `isTerminalState` classifies terminal — derived
+    // from the same `TERMINAL_RUN_STATUSES` source, so a new terminal
+    // status added to the state machine is TTL-eligible automatically.
+    const expected = RUN_STATUS_VALUES.filter((s) => isTerminalState(s));
+    expect([...filterStatuses].sort()).toEqual([...expected].sort());
+    expect([...filterStatuses].sort()).toEqual([...TERMINAL_RUN_STATUSES].sort());
   });
 
   it('is idempotent on repeated calls with the same TTL', async () => {

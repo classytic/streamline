@@ -24,6 +24,7 @@
  */
 
 import {
+  isDuplicateKeyError,
   type MongoOperatorUpdate,
   methodRegistryPlugin,
   mongoOperationsPlugin,
@@ -88,20 +89,11 @@ export interface WorkflowRepositoryConfig {
   multiTenant?: TenantFilterOptions;
 }
 
-/**
- * MongoDB duplicate-key error code. Surfaces from a partial unique index
- * collision — used in `create()` to translate idempotency races into a
- * "return the winning run" path instead of a thrown error.
- */
-const MONGO_DUPLICATE_KEY = 11000;
-
-function isDuplicateKeyError(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    (err as { code?: number }).code === MONGO_DUPLICATE_KEY
-  );
-}
+// Duplicate-key detection (E11000 from a partial-unique-index collision)
+// uses mongokit's `isDuplicateKeyError` — the hand-rolled `code === 11000`
+// check it replaces missed mongoose-wrapped error shapes. Used in
+// `create()` to translate idempotency races into a "return the winning
+// run" path instead of a thrown error.
 
 // ============================================================================
 // Repository
@@ -485,7 +477,11 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
    * one at a time via mongokit's `cursor()` instead of buffering the full
    * page. Routes through the standard `before:cursor` hook pipeline so
    * tenant scope (when not bypassed) and any future policy plugins are
-   * still applied.
+   * still applied. (True as of 2.7.0 — the tenant-filter plugin derives
+   * its hook list from mongokit's `OP_REGISTRY`, which includes
+   * `before:cursor`. Before 2.7.0 this claim was FALSE: the plugin's
+   * hand-enumerated hook list omitted `cursor` and this stream ran
+   * tenant-unscoped.)
    *
    * Why streaming wins here:
    *   - Lower memory peak when the fleet has many stale runs
@@ -628,7 +624,9 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
         sort: { 'scheduling.executionTime': 1 },
         page,
         limit,
-        cursor: cursor ?? undefined,
+        // Conditional spread (exactOptionalPropertyTypes): omit `cursor`
+        // rather than pass an explicit undefined into mongokit's getAll.
+        ...(cursor != null ? { cursor } : {}),
         ...(tenantId && { tenantId }),
       },
       {

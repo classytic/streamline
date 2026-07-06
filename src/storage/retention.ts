@@ -35,6 +35,7 @@
 import type { IndexSpecification } from 'mongodb';
 import type { Collection } from 'mongoose';
 import type { WorkflowEventBus } from '../core/events.js';
+import { TERMINAL_RUN_STATUSES } from '../core/status.js';
 import { toError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
 import { WorkflowRunModel } from './run.model.js';
@@ -46,8 +47,10 @@ import type { WorkflowRunRepository } from './run.repository.js';
 
 export interface RetentionOptions {
   /**
-   * TTL on terminal runs (`done` / `failed` / `cancelled`). Mongo's TTL
-   * monitor purges expired docs every ~60s. Pass `0` or omit to disable.
+   * TTL on terminal runs (`done` / `failed` / `cancelled` / `compensated` /
+   * `compensation_failed` — the full `TERMINAL_RUN_STATUSES` set from
+   * `core/status.ts`). Mongo's TTL monitor purges expired docs every ~60s.
+   * Pass `0` or omit to disable.
    *
    * Index shape: `{ endedAt: 1 }` with
    * `partialFilterExpression: { endedAt: { $exists: true }, status: { $in: [...] } }`.
@@ -62,7 +65,7 @@ export interface RetentionOptions {
    * createContainer({ retention: { terminalRunsTtlSeconds: 30 * 24 * 60 * 60 } });
    * ```
    */
-  terminalRunsTtlSeconds?: number;
+  terminalRunsTtlSeconds?: number | undefined;
 
   /**
    * Build the tenant-prefixed compound index when the repository was
@@ -73,7 +76,7 @@ export interface RetentionOptions {
    *
    * @default `true` when the repository is multi-tenant; `false` otherwise.
    */
-  multiTenantIndexes?: boolean;
+  multiTenantIndexes?: boolean | undefined;
 
   /**
    * Threshold in ms above which a `running` run with no recent heartbeat
@@ -87,7 +90,7 @@ export interface RetentionOptions {
    * terminated. A sensible floor is `5 * heartbeatIntervalMs`. The
    * default if you enable the sweeper without a value: 30 min.
    */
-  staleHeartbeatThresholdMs?: number;
+  staleHeartbeatThresholdMs?: number | undefined;
 
   /**
    * How often the sweep runs. Defaults to 60_000 (1 min) — matches Mongo's
@@ -96,7 +99,7 @@ export interface RetentionOptions {
    *
    * Only consulted when `staleHeartbeatThresholdMs` is set.
    */
-  staleRunSweepIntervalMs?: number;
+  staleRunSweepIntervalMs?: number | undefined;
 
   /**
    * Terminal status for stale runs.
@@ -107,7 +110,7 @@ export interface RetentionOptions {
    *
    * @default 'fail'
    */
-  staleRunAction?: 'fail' | 'cancel';
+  staleRunAction?: 'fail' | 'cancel' | undefined;
 
   /**
    * Max runs swept per sweep cycle. Bounds the per-cycle Mongo round-trips
@@ -115,7 +118,7 @@ export interface RetentionOptions {
    *
    * @default 100
    */
-  staleRunBatchSize?: number;
+  staleRunBatchSize?: number | undefined;
 
   /**
    * Cap on how many times the stale path (engine `recoverStale` +
@@ -132,7 +135,7 @@ export interface RetentionOptions {
    *
    * @default 5
    */
-  maxStaleRecoveries?: number;
+  maxStaleRecoveries?: number | undefined;
 }
 
 // ============================================================================
@@ -170,7 +173,12 @@ export async function syncRetentionIndexes(
         expireAfterSeconds: options.terminalRunsTtlSeconds,
         partialFilterExpression: {
           endedAt: { $exists: true },
-          status: { $in: ['done', 'failed', 'cancelled'] },
+          // Derived from the state machine's exhaustive terminality
+          // classification — a new terminal status is automatically TTL-
+          // eligible. (Pre-2.7 this was a hand-rolled 3-status array that
+          // silently excluded `compensated` / `compensation_failed`, so
+          // settled saga runs accumulated forever.)
+          status: { $in: [...TERMINAL_RUN_STATUSES] },
         },
       },
     );
@@ -244,7 +252,8 @@ interface SweeperConfig {
  * so a slow sweep can't pile up overlapping invocations.
  */
 export class StaleRunSweeper {
-  private timer?: NodeJS.Timeout;
+  /** `| undefined` (exactOptionalPropertyTypes): stop() clears via assignment. */
+  private timer: NodeJS.Timeout | undefined;
   private active = false;
   /** Re-entrancy guard — sweeps don't overlap even on manual `sweepOnce()`. */
   private inFlight = false;

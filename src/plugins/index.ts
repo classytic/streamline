@@ -5,7 +5,7 @@
  *
  * @example Multi-Tenant Setup
  * ```typescript
- * import { tenantFilterPlugin } from '@classytic/streamline/plugins';
+ * import { tenantFilterPlugin } from '@classytic/streamline';
  * import { Repository } from '@classytic/mongokit';
  *
  * const repo = new Repository(WorkflowRunModel, [
@@ -24,7 +24,7 @@
  *
  * @example Single-Tenant Setup
  * ```typescript
- * import { singleTenantPlugin } from '@classytic/streamline/plugins';
+ * import { singleTenantPlugin } from '@classytic/streamline';
  *
  * const repo = new Repository(WorkflowRunModel, [
  *   singleTenantPlugin('my-organization-id')

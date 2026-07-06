@@ -15,6 +15,8 @@
 
 import type { EventTransport } from '@classytic/primitives/events';
 import type { EventPayloadMap, WorkflowEventBus, WorkflowEventName } from '../core/events.js';
+import { toError } from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
 import { LEGACY_TO_CANONICAL } from './event-constants.js';
 import { createEvent, type EventContext } from './helpers.js';
 
@@ -66,9 +68,15 @@ export function bridgeBusToTransport(bus: WorkflowEventBus, transport: EventTran
             deriveContext(payload),
           ),
         )
-        .catch(() => {
+        .catch((err: unknown) => {
           // The transport is responsible for its own error handling/retry.
-          // Swallow here so one slow subscriber doesn't stall the engine.
+          // Swallow here so one slow subscriber doesn't stall the engine —
+          // but log it: a silently-dead transport bridge is undiagnosable.
+          logger.warn('[streamline] event-transport publish failed', {
+            event: legacyName,
+            canonicalEvent: canonical,
+            error: toError(err).message,
+          });
         });
     };
 

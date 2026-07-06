@@ -40,6 +40,15 @@ export default defineConfig({
           hookTimeout: 10_000,
           // Pure functions — parallel-safe. Group 0 runs first.
           sequence: { groupOrder: 0 },
+          // Type-level tests (test/*.test-d.ts) — previously dead weight
+          // (main tsconfig only includes src/, so nothing verified them).
+          // Running them under the unit project puts DX-inference contracts
+          // (createWorkflow generics, typed step outputs) in the fast gate.
+          typecheck: {
+            enabled: true,
+            include: ['test/**/*.test-d.ts'],
+            tsconfig: './tsconfig.typetest.json',
+          },
         },
       },
       {
