@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.8.0] - 2026-07-08 — Human-in-the-loop primitives, checkpoint-slot guard, generic hooks
+
+Additive, no behavior change for existing workflows. Two ergonomics/safety
+fixes and one flagship feature — a typed, durable human-in-the-loop layer that
+makes "pause the workflow, ask a human, resume" a first-class primitive instead
+of a hand-rolled hook dance.
+
+### Added — human-in-the-loop primitives (`features/approval.ts`)
+
+A cohesive, fully-typed layer over the existing hook + wait-resolution
+machinery — pure composition, so it inherits their durability (cross-restart,
+multi-worker, fail-closed token validation) with no engine or storage changes.
+
+- **Approval gate** — `requestApproval(ctx, { reason, metadata?, expiresAt?, onToken?, token? })`
+  parks the run and hands the resume token to `onToken` (persist it for the
+  approver UI). Resume side: `approve(token, data?)` / `reject(token, reason?)`.
+  The next step calls `readApprovalDecision(output)` → a discriminated
+  `ApprovalDecision` covering ALL FOUR real outcomes: `approved` (with data),
+  `rejected` (with reason), `withdrawn` (`cancelHook`), `timed_out` (`expiresAt`
+  sweep). Flow-tools like n8n collapse these into "resumed / not".
+- **Ask/answer** — the generalization for arbitrary human INPUT mid-flow (an OTP
+  typed into a background browser automation, a captcha, a chosen value):
+  `ask(ctx, { question, … })` → `answer(token, value)` → `readAnswer<T>(output)`
+  returns `{ status: 'answered', value } | 'withdrawn' | 'timed_out'`. Combine
+  with `ctx.goto()` for a **durable interactive loop** — ask an OTP each turn,
+  resume exactly where it paused across an unbounded number of turns, surviving
+  restarts. See the module docstring for the browser-login example.
+- New exports: `requestApproval`, `approve`, `reject`, `readApprovalDecision`,
+  `ask`, `answer`, `readAnswer` + types `ApprovalDecision`, `AnswerResult`,
+  `RequestApprovalOptions`, `AskOptions`, `ApprovalResumeOptions`.
+
+### Added — checkpoint-slot guard (`ctx.scatter` / `ctx.loop` / `ctx.checkpoint`)
+
+A step has ONE checkpoint slot (`output.__checkpoint`); `scatter()` and `loop()`
+claim it for durable recovery. Previously, a `ctx.checkpoint()` — or a nested
+`scatter()`/`loop()` — inside a scatter task silently clobbered that slot and
+re-ran completed work. Now it throws a clear runtime error naming the owner
+instead of corrupting recovery state. The slot is released in a `finally`, so a
+failing scatter never wedges a subsequent checkpoint. Behavior change only for
+code that was already misusing the slot (silent corruption → loud error).
+
+### Changed — `createHook` is generic over the step context
+
+`createHook<TContext, TOutputs>(ctx: StepContext<TContext, TOutputs>, …)` — it
+only ever read `ctx.runId` / `ctx.stepId`, but the bare `StepContext` param
+forced consumers with a typed context to write
+`createHook(ctx as unknown as StepContext<Record<string, unknown>>, …)`. That
+cast is gone. Backward-compatible — the default type parameters preserve every
+existing call.
+
+### Tests
+
+`test/unit/approval.test.ts` (11), `test/unit/context-slot-guard.test.ts` (8),
+`test/integration/approval-primitive.test.ts` (5, real-engine round-trip of
+approve/reject/withdraw/timeout + ask/answer). Full suite 461 green.
+
+
 ## [2.7.0] - 2026-07-06 — Tenant-scope hardening + queryable progress, task guards, durable dedupe, operator pause/resume, run metrics
 
 The next release after 2.6.0. Two bodies of work land together: an

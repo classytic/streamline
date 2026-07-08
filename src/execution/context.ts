@@ -60,6 +60,12 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
   public signal: AbortSignal;
   /** Buffered log entries — flushed to DB once after step completes */
   private readonly logBuffer: StepLogEntry[] = [];
+  /**
+   * Name of the checkpoint-slot owner currently in flight (`'scatter'` |
+   * `'loop'`), or `null`. The step's `output.__checkpoint` slot is single-use;
+   * this flag makes nesting a hard runtime error instead of silent corruption.
+   */
+  private slotInUse: 'scatter' | 'loop' | null = null;
 
   constructor(
     public runId: string,
@@ -393,6 +399,25 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     tasks: T,
     options?: { concurrency?: number },
   ): Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }> {
+    if (this.slotInUse) {
+      throw new Error(
+        `ctx.scatter() cannot be nested inside ctx.${this.slotInUse}() — each owns ` +
+          `the step's single checkpoint slot (nesting corrupts recovery). Run the ` +
+          `inner work as its own step, or flatten into a single scatter.`,
+      );
+    }
+    this.slotInUse = 'scatter';
+    try {
+      return await this.runScatter(tasks, options);
+    } finally {
+      this.slotInUse = null;
+    }
+  }
+
+  private async runScatter<T extends Record<string, () => Promise<unknown>>>(
+    tasks: T,
+    options?: { concurrency?: number },
+  ): Promise<{ [K in keyof T]: Awaited<ReturnType<T[K]>> }> {
     const taskIds = Object.keys(tasks);
     const concurrency = options?.concurrency ?? Infinity;
 
@@ -461,7 +486,9 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
           // incomplete/failed tasks (completed ones are restored above).
           checkpoint[id] = { done: true, value };
           // Persist after each SUCCESS — crash recovery resumes from here.
-          await this.checkpoint(checkpoint);
+          // Use the raw writer (not the guarded public `checkpoint()`) — scatter
+          // legitimately owns the slot it just claimed via `slotInUse`.
+          await this.writeCheckpoint(checkpoint);
           if (this.taskHooks) {
             await this.taskHooks.after(id, {
               result: value,
@@ -504,6 +531,27 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
   }
 
   async checkpoint<T = unknown>(value: T): Promise<void> {
+    // A single step has ONE checkpoint slot (`output.__checkpoint`). `scatter()`
+    // and `loop()` claim it for their durable recovery, so a user `checkpoint()`
+    // call while one is in flight would clobber their progress and silently
+    // re-run completed work. Fail loud instead of corrupting state.
+    if (this.slotInUse) {
+      throw new Error(
+        `ctx.checkpoint() cannot run inside ctx.${this.slotInUse}() — it owns this ` +
+          `step's single checkpoint slot (a nested write corrupts recovery). ` +
+          `Checkpoint from the parent step, or move the work out of ${this.slotInUse}().`,
+      );
+    }
+    await this.writeCheckpoint(value);
+  }
+
+  /**
+   * The raw checkpoint DB write, WITHOUT the slot-ownership guard. Used by the
+   * public `checkpoint()` (behind the guard) and internally by `scatter()` /
+   * `loop()` (which legitimately own the slot). Keeping the guard off the writer
+   * lets scatter persist per-task progress without tripping its own guard.
+   */
+  private async writeCheckpoint<T = unknown>(value: T): Promise<void> {
     if (this.signal.aborted) return;
 
     guardPayloadSize('checkpoint', value, {
@@ -609,7 +657,26 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     if (!Number.isInteger(maxIterations) || maxIterations < 1) {
       throw new NonRetriableError(`ctx.loop: maxIterations must be a positive integer.`);
     }
+    if (this.slotInUse) {
+      throw new Error(
+        `ctx.loop() cannot be nested inside ctx.${this.slotInUse}() — each owns the ` +
+          `step's single checkpoint slot (nesting corrupts recovery). Run the inner ` +
+          `work as its own step.`,
+      );
+    }
+    this.slotInUse = 'loop';
+    try {
+      return await this.runLoop(initial, body, maxIterations);
+    } finally {
+      this.slotInUse = null;
+    }
+  }
 
+  private async runLoop<S>(
+    initial: S,
+    body: (state: S, iteration: number) => Promise<{ state: S; done: boolean }>,
+    maxIterations: number,
+  ): Promise<S> {
     // Crash recovery: resume from the last committed iteration. The loop owns
     // the step's checkpoint slot; a foreign checkpoint shape (no marker) means
     // first execution — start from `initial`.
@@ -641,10 +708,11 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
       state = result.state;
       iteration += 1;
 
-      // Durable commit of this iteration. checkpoint() also bumps the run's
+      // Durable commit of this iteration. writeCheckpoint() also bumps the run's
       // lastHeartbeat, so each iteration doubles as an automatic heartbeat —
-      // a long loop never trips the stale detector.
-      await this.checkpoint({ __loopIteration: iteration, state });
+      // a long loop never trips the stale detector. Raw writer: the loop owns
+      // the slot it claimed via `slotInUse`.
+      await this.writeCheckpoint({ __loopIteration: iteration, state });
 
       if (result.done) return state;
     }

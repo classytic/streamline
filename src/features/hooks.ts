@@ -116,7 +116,11 @@ export interface PendingHook {
  * });
  * ```
  */
-export function createHook(ctx: StepContext, reason: string, options?: HookOptions): HookResult {
+export function createHook<TContext, TOutputs>(
+  ctx: StepContext<TContext, TOutputs>,
+  reason: string,
+  options?: HookOptions,
+): HookResult {
   const randomSuffix = randomBytes(16).toString('hex');
   const token = options?.token ?? `${ctx.runId}:${ctx.stepId}:${randomSuffix}`;
   const path = `/hooks/${token}`;

@@ -37,6 +37,30 @@ export { createWorkflow } from './workflow/define.js';
 // ============================================================================
 
 export { GotoSignal, WaitSignal } from './execution/context.js';
+/**
+ * Human-in-the-loop primitives — a typed, durable layer over hooks + wait
+ * resolution. `requestApproval`/`approve`/`reject`/`readApprovalDecision` for a
+ * yes/no gate; `ask`/`answer`/`readAnswer` for arbitrary human input (OTP,
+ * captcha, a chosen value) mid-flow. Both discriminate all real outcomes
+ * (approved/rejected/answered · withdrawn · timed_out) and loop durably with
+ * `ctx.goto()` — the interactive-agent pattern flow-tools like n8n can't express.
+ */
+export type {
+  AnswerResult,
+  ApprovalDecision,
+  ApprovalResumeOptions,
+  AskOptions,
+  RequestApprovalOptions,
+} from './features/approval.js';
+export {
+  answer,
+  approve,
+  ask,
+  readAnswer,
+  readApprovalDecision,
+  reject,
+  requestApproval,
+} from './features/approval.js';
 export type { HookOptions, HookResult, PendingHook } from './features/hooks.js';
 /**
  * Create hooks for pausing workflows and resuming them from webhooks/APIs,
