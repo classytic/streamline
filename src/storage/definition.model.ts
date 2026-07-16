@@ -57,7 +57,9 @@ export interface WorkflowDefinitionDoc {
 
 const WorkflowDefinitionSchema = new Schema<WorkflowDefinitionDoc>(
   {
-    workflowId: { type: String, required: true, index: true }, // Not _id!
+    // No field-level index — the {workflowId, version} unique compound covers
+    // the prefix (P11.1). (Not _id!)
+    workflowId: { type: String, required: true },
     name: { type: String, required: true },
     description: String,
     version: { type: String, required: true, default: '1.0.0' },

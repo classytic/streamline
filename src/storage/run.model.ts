@@ -99,7 +99,10 @@ const SchedulingInfoSchema = new Schema<SchedulingInfo>(
 const WorkflowRunSchema = new Schema<WorkflowRun>(
   {
     _id: { type: String, required: true },
-    workflowId: { type: String, required: true, index: true },
+    // No field-level index — every workflowId query rides a workflowId-leading
+    // compound ({workflowId, concurrencyKey, status}, the scheduler compound);
+    // a bare single is a redundant prefix (P11.1, fleet index audit 2026-07).
+    workflowId: { type: String, required: true },
     status: {
       type: String,
       // Durable saga (v2.4) adds 'compensating' | 'compensated' |
@@ -117,7 +120,8 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
         'compensation_failed',
       ],
       required: true,
-      index: true,
+      // No field-level index — {status, updatedAt} + {status, priority,
+      // updatedAt} compounds serve every status-prefix query (P11.1).
     },
     steps: [StepStateSchema],
     currentStepId: String,
@@ -136,7 +140,8 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
     idempotencyKey: String, // Dedup key — non-terminal runs block duplicates
     priority: { type: Number, default: 0 }, // Higher = picked up sooner by scheduler
     concurrencyKey: String, // Grouping key for concurrency limits
-    userId: { type: String, index: true },
+    // No field-level index — {userId, createdAt} compound covers the prefix (P11.1).
+    userId: { type: String },
     tags: [String],
     meta: Schema.Types.Mixed,
     // Operator cancellation reason (v2.7). Absent unless
@@ -174,8 +179,10 @@ const WorkflowRunSchema = new Schema<WorkflowRun>(
   },
 );
 
-// Core indexes for workflow execution
-WorkflowRunSchema.index({ workflowId: 1, status: 1 });
+// Core indexes for workflow execution.
+// NOTE: no bare {workflowId, status} — the scheduler compound
+// {workflowId, status, steps.status, steps.waitingFor.resumeAt} below serves
+// the same prefix (P11.1; the audit's highest-traffic redundant index rode it).
 WorkflowRunSchema.index({ status: 1, updatedAt: -1 });
 
 // Idempotency: compound index for "find active run by key" query
