@@ -378,27 +378,38 @@ WorkflowRunSchema.index({
 WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: -1, _id: -1 });
 WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: 1, _id: 1 });
 
-// Workflow-SCOPED keyset variant (v2.4.0 engine scoping). The scheduler sweeps
-// (getReadyForRetry / getReadyToResume / getChildWaitingRuns / getStaleRunning /
-// scheduledReady) are scoped to the engine's own `workflowId`, so their keyset
-// query filters `{ status, paused, workflowId }` and sorts `updatedAt: 1`. The
-// unscoped pair above can't back that (a `workflowId` equality term not in the
-// index prefix bars its use), so MongoKit warned + Mongo full-scanned on EVERY
-// poll tick. This mirrors 347-348 with `workflowId` in the prefix — the exact
-// index MongoKit's keyset detector asks for. The `notPaused()` sweeps all sort
-// ascending, so one asc variant suffices.
-WorkflowRunSchema.index({ status: 1, paused: 1, workflowId: 1, updatedAt: 1, _id: 1 });
-
-// Same prefix + the `steps` multikey position. Used by `readyForRetry` /
-// `readyToResume` (CommonQueries.readyForRetry / readyToResume in
-// `query-builder.ts`) — both add a `steps.$elemMatch` clause on top of
-// `{ status, paused }` and sort by `updatedAt`. Mongokit's keyset
-// detector emits a "no matching compound index" warning without this;
-// the multikey index lets the planner use a single bounded scan
-// instead of fetching every status='waiting' & paused=false doc and
-// filtering steps in-memory. The trailing `_id` matches the cursor
-// shape mongokit's keyset cursor encodes.
-WorkflowRunSchema.index({ status: 1, paused: 1, steps: 1, updatedAt: 1, _id: 1 });
+// Workflow-SCOPED keyset sweeps (v2.4.0 engine scoping) — ESR: Equality → Sort.
+//
+// Every scheduler pickup sweep (CommonQueries.readyForRetry / readyToResume /
+// expiredWaits / childWaiting / branchJoinWaiting / staleRunning /
+// staleCompensating / scheduledReady in `query-builder.ts`) keyset-paginates
+// sorted by `updatedAt`, scoped to the engine's own `workflowId`. Reducing each
+// to its predicate CLASSES:
+//   - EQUALITY: `status` (a single value) + `workflowId` (the scope term).
+//   - RANGE:    `paused: {$ne:true}` (`notPaused()`; `isPaused()` is never used
+//               by a sweep), plus `steps: {$elemMatch}` and/or
+//               `scheduling.executionTime: {$lte}` on the step/scheduled variants.
+//
+// So the ONLY correct prefix is `{ status, workflowId }` (both equalities, so
+// both bound the scan — `workflowId` is selective and must not be stranded
+// behind a range), then `updatedAt` so the sort is index-provided. The range
+// predicates are left as cheap residual filters over the tiny
+// per-(status, workflowId) working set — deliberately NOT in the index:
+//   - a `$ne`/`$elemMatch` wedged into the prefix stops the planner using any
+//     later key for bounds or for the sort (forcing a blocking sort);
+//   - a bare `{ steps: 1 }` multikey indexes each ENTIRE step subdocument
+//     (Mixed output/logs and all) — it cannot serve `$elemMatch` on step
+//     SUBFIELDS, so it only bloats the index and slows every step-state write.
+//
+// Requires mongokit ≥ 3.24, whose keyset detector is ESR/range-aware
+// (`classifyFilterFields`): it accepts this equality-lead index and no longer
+// demands the range fields (`paused`/`steps`) sit in the prefix. Trailing `_id`
+// matches the keyset cursor tiebreaker.
+//
+// Unscoped sweeps (legacy + existence probes, `workflowId` omitted) ride the
+// `{ status: 1, updatedAt: -1 }` index above (equality `status` + sort,
+// reverse-walked for the ascending sweeps).
+WorkflowRunSchema.index({ status: 1, workflowId: 1, updatedAt: 1, _id: 1 });
 
 /**
  * MULTI-TENANCY & SCHEDULED WORKFLOWS - COMPOSITE INDEXES

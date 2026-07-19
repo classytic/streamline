@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [2.8.2] - 2026-07-19 — ESR-correct scheduler indexes, mongokit ≥3.24.0
+
+### Changed — `WorkflowRunSchema` scheduler indexes corrected for ESR
+
+Two indexes that violated MongoDB's ESR (Equality → Sort → Range) rule have
+been replaced with one correct compound index:
+
+**Removed:**
+- `{ status: 1, paused: 1, workflowId: 1, updatedAt: 1, _id: 1 }` — `paused`
+  is a `$ne` range predicate; placing it in the equality prefix stops the
+  planner using `workflowId` or `updatedAt` for bounds, forcing a blocking
+  sort on every scheduler poll tick.
+- `{ status: 1, paused: 1, steps: 1, updatedAt: 1, _id: 1 }` — a bare
+  `{ steps: 1 }` multikey index cannot serve `$elemMatch` on step subfields;
+  it only bloated the index and slowed every step-state write.
+
+**Added:**
+- `{ status: 1, workflowId: 1, updatedAt: 1, _id: 1 }` — ESR-correct: both
+  equality predicates (`status`, `workflowId`) lead, then the sort key
+  (`updatedAt`), then the tiebreaker (`_id`). Range predicates (`paused: {$ne}`,
+  `steps: {$elemMatch}`, `scheduling.executionTime: {$lte}`) are left as cheap
+  residuals over the tiny per-(status, workflowId) working set — they must not
+  appear in the prefix per ESR.
+
+Requires `@classytic/mongokit ≥3.24.0` whose keyset warning detector is
+ESR/range-aware (`classifyFilterFields`): it accepts the equality-lead index
+and no longer demands range fields sit in the prefix.
+
+### Changed — peer floor
+
+- `@classytic/mongokit`: `>=3.14.0` → `>=3.24.0`
+
 ## [2.8.0] - 2026-07-08 — Human-in-the-loop primitives, checkpoint-slot guard, generic hooks
 
 Additive, no behavior change for existing workflows. Two ergonomics/safety
