@@ -21,7 +21,7 @@
  *   - Bounded by parallelism × MTBF; in practice negligible.
  */
 
-import mongoose, { Schema } from 'mongoose';
+import { Schema } from 'mongoose';
 
 /** Document shape. */
 export interface WorkflowConcurrencyCounter {
@@ -41,43 +41,38 @@ export interface WorkflowConcurrencyCounter {
   updatedAt: Date;
 }
 
-const WorkflowConcurrencyCounterSchema = new Schema<WorkflowConcurrencyCounter>(
-  {
-    _id: { type: String, required: true },
-    workflowId: { type: String, required: true },
-    concurrencyKey: { type: String, required: true },
-    count: { type: Number, required: true, default: 0 },
-    limit: { type: Number, required: true },
-    createdAt: { type: Date, required: true },
-    updatedAt: { type: Date, required: true },
-  },
-  {
-    collection: 'workflow_concurrency_counters',
-    timestamps: false,
-    /**
-     * Majority write concern — same correctness rationale as
-     * `WorkflowRunModel`. Counter writes that lose to a primary crash
-     * would silently drift the active-count.
-     */
-    writeConcern: { w: 'majority', j: true },
-  },
-);
-
-// Reconciliation queries scan by workflowId; one secondary index is enough.
-WorkflowConcurrencyCounterSchema.index({ workflowId: 1, concurrencyKey: 1 });
-
-let WorkflowConcurrencyCounterModel: mongoose.Model<WorkflowConcurrencyCounter>;
-if (mongoose.models.WorkflowConcurrencyCounter) {
-  WorkflowConcurrencyCounterModel = mongoose.models
-    .WorkflowConcurrencyCounter as mongoose.Model<WorkflowConcurrencyCounter>;
-} else {
-  WorkflowConcurrencyCounterModel = mongoose.model<WorkflowConcurrencyCounter>(
-    'WorkflowConcurrencyCounter',
-    WorkflowConcurrencyCounterSchema,
+/**
+ * Build the strict-concurrency counter schema. Pure factory — invoked by
+ * `defineStreamlineModels().bind(connection)`; registers nothing itself.
+ */
+export function buildWorkflowConcurrencyCounterSchema(): Schema<WorkflowConcurrencyCounter> {
+  const WorkflowConcurrencyCounterSchema = new Schema<WorkflowConcurrencyCounter>(
+    {
+      _id: { type: String, required: true },
+      workflowId: { type: String, required: true },
+      concurrencyKey: { type: String, required: true },
+      count: { type: Number, required: true, default: 0 },
+      limit: { type: Number, required: true },
+      createdAt: { type: Date, required: true },
+      updatedAt: { type: Date, required: true },
+    },
+    {
+      collection: 'workflow_concurrency_counters',
+      timestamps: false,
+      /**
+       * Majority write concern — same correctness rationale as
+       * `WorkflowRunModel`. Counter writes that lose to a primary crash
+       * would silently drift the active-count.
+       */
+      writeConcern: { w: 'majority', j: true },
+    },
   );
-}
 
-export { WorkflowConcurrencyCounterModel };
+  // Reconciliation queries scan by workflowId; one secondary index is enough.
+  WorkflowConcurrencyCounterSchema.index({ workflowId: 1, concurrencyKey: 1 });
+
+  return WorkflowConcurrencyCounterSchema;
+}
 
 /** Build the composite `_id` from workflowId + concurrencyKey. */
 export function makeCounterId(workflowId: string, concurrencyKey: string): string {

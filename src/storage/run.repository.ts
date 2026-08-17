@@ -35,10 +35,15 @@ import type {
   KeysetPaginationResult,
   OffsetPaginationResult,
 } from '@classytic/repo-core/pagination';
+import type { Model } from 'mongoose';
 import type { WaitingFor, WorkflowRun } from '../core/types.js';
-import { type TenantFilterOptions, tenantFilterPlugin } from '../plugins/tenant-filter.plugin.js';
+import {
+  resolveTenantFilterOptions,
+  type TenantFilterOptions,
+  tenantFilterPlugin,
+} from '../plugins/tenant-filter.plugin.js';
+import { WorkflowRunModel } from './models.js';
 import { CommonQueries } from './query-builder.js';
-import { WorkflowRunModel } from './run.model.js';
 import { type MongoUpdate, normalizeUpdate } from './update-builders.js';
 
 // ============================================================================
@@ -86,7 +91,20 @@ interface AtomicUpdateOptions {
 type PaginatedResult<T> = OffsetPaginationResult<T> | KeysetPaginationResult<T>;
 
 export interface WorkflowRepositoryConfig {
-  multiTenant?: TenantFilterOptions;
+  tenant?: boolean | TenantFilterOptions;
+  /**
+   * The bound `WorkflowRun` model to persist through. Defaults to the eagerly
+   * bound {@link WorkflowRunModel} (whose idempotency unique index is compound
+   * on `context.tenantId`, the default tenant field).
+   *
+   * REQUIRED when `tenant.tenantField` is anything OTHER than
+   * `context.tenantId`: build a model whose idempotency index matches your
+   * field and pass it here —
+   * `defineStreamlineModels({ tenantField }).bind(connection).WorkflowRun`.
+   * Otherwise the default model's `context.tenantId` index would let two
+   * tenants collide on the same idempotency key (or share one silently).
+   */
+  model?: Model<WorkflowRun>;
 }
 
 // Duplicate-key detection (E11000 from a partial-unique-index collision)
@@ -118,19 +136,48 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
    */
   readonly isMultiTenant: boolean;
   private readonly isStrictTenant: boolean;
+  /**
+   * The bound `WorkflowRun` model this repository persists through — the
+   * caller-supplied `config.model` or the eager default. Exposed so
+   * connection-aware helpers (retention index sync, the concurrency counter's
+   * reconciliation) operate on the SAME connection as the repository.
+   */
+  readonly runModel: Model<WorkflowRun>;
 
   constructor(config: WorkflowRepositoryConfig = {}) {
+    const tenant = resolveTenantFilterOptions(config.tenant);
     const plugins: PluginType[] = [
       methodRegistryPlugin(),
       mongoOperationsPlugin(),
-      ...(config.multiTenant ? [tenantFilterPlugin(config.multiTenant)] : []),
+      ...(tenant ? [tenantFilterPlugin(tenant)] : []),
     ];
 
-    super(WorkflowRunModel, plugins);
+    const tenantField = tenant?.tenantField || 'context.tenantId';
 
-    this.isMultiTenant = !!config.multiTenant;
-    this.isStrictTenant = config.multiTenant?.strict !== false;
-    this.tenantField = config.multiTenant?.tenantField || 'context.tenantId';
+    // A custom tenant field needs a model whose COMPOUND idempotency index is
+    // built for that field. The eagerly-bound default model indexes
+    // `context.tenantId`; using it with a different field leaves idempotency
+    // keys globally-scoped (all custom-field runs share the index's `null`
+    // bucket) — so two tenants can collide on the same key. Tenant FILTERING
+    // and STAMPING still work via the plugin, so this is a warning (idempotency
+    // may not be used), not a hard failure. Pass a matching `model` to fix it.
+    if (!config.model && tenantField !== 'context.tenantId') {
+      console.warn(
+        `[WorkflowRunRepository] tenant.tenantField '${tenantField}' is used with the DEFAULT model, ` +
+          `whose idempotency unique index is built for 'context.tenantId'. Idempotency keys will NOT be ` +
+          `tenant-isolated (cross-tenant collisions possible). If you use idempotency keys, build a matching ` +
+          `model — defineStreamlineModels({ tenantField: '${tenantField}' }).bind(connection).WorkflowRun — ` +
+          `and pass it as \`repository.model\`.`,
+      );
+    }
+
+    const runModel = config.model ?? WorkflowRunModel;
+    super(runModel, plugins);
+
+    this.runModel = runModel;
+    this.isMultiTenant = tenant !== undefined;
+    this.isStrictTenant = tenant?.required !== false;
+    this.tenantField = tenantField;
   }
 
   /**
@@ -1121,7 +1168,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
  *
  * // Multi-tenant:
  * const repo = createWorkflowRepository({
- *   multiTenant: { tenantField: 'context.tenantId', strict: true }
+ *   tenant: { tenantField: 'context.tenantId', required: true }
  * });
  */
 export function createWorkflowRepository(

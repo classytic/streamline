@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
 import mongoose from 'mongoose';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import { workflowRunRepository } from '../../src/storage/run.repository.js';
 import { SmartScheduler } from '../../src/execution/smart-scheduler.js';
 

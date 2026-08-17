@@ -115,13 +115,30 @@ export {
 } from './storage/concurrency-counter.repository.js';
 export type { WorkflowDefinitionDoc } from './storage/definition.model.js';
 /**
- * Optional: WorkflowDefinition storage for versioning and auditing.
+ * Repository for WorkflowDefinition versioning / auditing / dynamic loading.
  */
 export {
-  WorkflowDefinitionModel,
   WorkflowDefinitionRepository,
   workflowDefinitionRepository,
-} from './storage/definition.model.js';
+} from './storage/definition.repository.js';
+/**
+ * Canonical streamline model set — the single mongokit `defineModels`
+ * blueprint over all three models. Exposed so a host can inspect the model
+ * names or bind the set against an explicit connection.
+ */
+export type { DefineStreamlineModelsConfig, StreamlineModels } from './storage/models.js';
+/**
+ * Optional: WorkflowDefinition storage model for versioning and auditing.
+ */
+/**
+ * Mongoose model for workflow runs.
+ * Use this for direct MongoDB queries and custom indexes.
+ */
+export {
+  defineStreamlineModels,
+  WorkflowDefinitionModel,
+  WorkflowRunModel,
+} from './storage/models.js';
 /**
  * Query builder and common queries for workflows.
  * Type-safe MongoDB query construction.
@@ -132,11 +149,6 @@ export {
   STEP_STATUS,
   WorkflowQueryBuilder,
 } from './storage/query-builder.js';
-/**
- * Mongoose model for workflow runs.
- * Use this for direct MongoDB queries and custom indexes.
- */
-export { WorkflowRunModel } from './storage/run.model.js';
 export type { WorkflowRepositoryConfig, WorkflowRunRepository } from './storage/run.repository.js';
 /**
  * Repository for workflow run CRUD operations.

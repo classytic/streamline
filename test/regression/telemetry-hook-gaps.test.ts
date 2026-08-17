@@ -9,7 +9,7 @@ import {
 import { SchedulingService } from '../../src/scheduling/scheduling.service.js';
 import { enableTelemetry, disableTelemetry } from '../../src/telemetry/index.js';
 import type { Span, Tracer } from '@opentelemetry/api';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 
 class TestSpan {
   name: string;

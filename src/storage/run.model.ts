@@ -1,4 +1,4 @@
-import mongoose, { Schema } from 'mongoose';
+import { Schema } from 'mongoose';
 import type {
   RecurrencePattern,
   SchedulingInfo,
@@ -96,320 +96,344 @@ const SchedulingInfoSchema = new Schema<SchedulingInfo>(
   { _id: false },
 );
 
-const WorkflowRunSchema = new Schema<WorkflowRun>(
-  {
-    _id: { type: String, required: true },
-    // No field-level index — every workflowId query rides a workflowId-leading
-    // compound ({workflowId, concurrencyKey, status}, the scheduler compound);
-    // a bare single is a redundant prefix (P11.1, fleet index audit 2026-07).
-    workflowId: { type: String, required: true },
-    status: {
-      type: String,
-      // Durable saga (v2.4) adds 'compensating' | 'compensated' |
-      // 'compensation_failed'. Additive at runtime — existing runs are
-      // unaffected.
-      enum: [
-        'draft',
-        'running',
-        'waiting',
-        'done',
-        'failed',
-        'cancelled',
-        'compensating',
-        'compensated',
-        'compensation_failed',
-      ],
-      required: true,
-      // No field-level index — {status, updatedAt} + {status, priority,
-      // updatedAt} compounds serve every status-prefix query (P11.1).
-    },
-    steps: [StepStateSchema],
-    currentStepId: String,
-    context: { type: Schema.Types.Mixed, default: {} },
-    input: Schema.Types.Mixed,
-    output: Schema.Types.Mixed,
-    error: { type: Schema.Types.Mixed, required: false }, // Workflow-level error (e.g., data corruption)
-    createdAt: { type: Date, required: true },
-    updatedAt: { type: Date, required: true },
-    startedAt: Date,
-    endedAt: Date,
-    lastHeartbeat: Date, // For detecting stale running workflows
-    paused: { type: Boolean, default: false }, // User-initiated pause - scheduler skips paused workflows
-    scheduling: SchedulingInfoSchema, // Optional: timezone-aware scheduling metadata
-    stepLogs: { type: [StepLogEntrySchema], default: undefined }, // Persisted step-level logs from ctx.log()
-    idempotencyKey: String, // Dedup key — non-terminal runs block duplicates
-    priority: { type: Number, default: 0 }, // Higher = picked up sooner by scheduler
-    concurrencyKey: String, // Grouping key for concurrency limits
-    // No field-level index — {userId, createdAt} compound covers the prefix (P11.1).
-    userId: { type: String },
-    tags: [String],
-    meta: Schema.Types.Mixed,
-    // Operator cancellation reason (v2.7). Absent unless
-    // `engine.cancel(runId, { reason })` was called with a reason.
-    cancellationReason: { type: String, required: false },
-    /**
-     * Pinned definition version (semver). The engine snapshots
-     * `WorkflowDefinition.version` at create-time so a run resumed weeks
-     * later still uses the step graph it started under. The engine
-     * resolves this through a version-keyed registry (`workflowRegistry.lookupVersion`)
-     * before re-execution; missing → falls back to the active definition.
-     */
-    definitionVersion: String,
-    /**
-     * How many times the stale-recovery / sweeper paths have touched this
-     * run. Once it hits `RetentionOptions.maxStaleRecoveries`, the next
-     * sweep marks the run failed with `error.code === 'dead_lettered'`
-     * instead of recycling it forever.
-     */
-    recoveryAttempts: { type: Number, default: 0 },
-  },
-  {
-    collection: 'workflow_runs',
-    timestamps: false,
-    /**
-     * Majority write concern ensures data survives replica set failovers.
-     * Without this, acknowledged writes can vanish on primary crash.
-     *
-     * - w: 'majority' — acknowledged by a majority of replica set members
-     * - j: true — written to the on-disk journal before acknowledging
-     *
-     * For standalone dev instances, Mongoose/MongoDB gracefully degrades.
-     */
-    writeConcern: { w: 'majority', j: true },
-  },
-);
-
-// Core indexes for workflow execution.
-// NOTE: no bare {workflowId, status} — the scheduler compound
-// {workflowId, status, steps.status, steps.waitingFor.resumeAt} below serves
-// the same prefix (P11.1; the audit's highest-traffic redundant index rode it).
-WorkflowRunSchema.index({ status: 1, updatedAt: -1 });
-
-// Idempotency: compound index for "find active run by key" query
-WorkflowRunSchema.index({ idempotencyKey: 1, status: 1 }, { sparse: true });
-
 /**
- * Idempotency race-safety (PACKAGE_RULES §32).
- *
- * Partial unique index closes the TOCTOU window between the lookup in
- * `engine.start()` and the `repository.create()` call. Two concurrent
- * workers with the same key both pass the lookup (no row yet); the second
- * insert hits MongoDB's E11000 duplicate-key error. `WorkflowRunRepository`
- * catches it and returns the winning run.
- *
- * `partialFilterExpression` excludes terminal statuses, so the key is
- * reusable after `done` / `failed` / `cancelled` — same documented semantic
- * as before, now actually race-safe.
- *
- * Durable saga (v2.4): `'compensating'` is included in the active `$in` set —
- * a run mid-rollback is still ACTIVE and must keep blocking a duplicate
- * idempotency key (a second start of the same logical operation while the
- * first is still compensating would be unsafe). The terminal compensation
- * outcomes `'compensated'` / `'compensation_failed'` are deliberately EXCLUDED
- * (like `done`/`failed`/`cancelled`), so the key becomes reusable once the
- * saga fully settles.
- *
- * `idempotencyKey: { $type: 'string' }` is the standard guard against
- * `null` collisions when other docs lack the field (PACKAGE_RULES §35).
- *
- * ⚠️ Production deployment — clean active duplicates first.
- *
- * Existing deployments may carry duplicate `idempotencyKey` values across
- * non-terminal runs (the pre-fix race could produce them). MongoDB will
- * REFUSE to build this index if duplicates exist:
- *
- *     IndexBuildFailed: E11000 duplicate key error
- *
- * Pre-deploy migration — run once against the production replica set
- * BEFORE rolling out a streamline version that ships this index:
- *
- * ```js
- * // 1. Find active duplicates so you can audit them.
- * db.workflow_runs.aggregate([
- *   { $match: {
- *     idempotencyKey: { $type: 'string' },
- *     status: { $in: ['draft', 'running', 'waiting'] },
- *   }},
- *   { $group: { _id: '$idempotencyKey', ids: { $push: '$_id' }, n: { $sum: 1 } }},
- *   { $match: { n: { $gt: 1 } }},
- * ]);
- *
- * // 2. For each duplicate group, keep the oldest run, terminate the rest:
- * db.workflow_runs.updateMany(
- *   { _id: { $in: [/* duplicate ids except the keeper *\/] }, status: { $ne: 'cancelled' }},
- *   { $set: { status: 'cancelled', endTime: new Date(),
- *             error: { message: 'Cancelled during idempotency-index migration' }}},
- * );
- * ```
- *
- * Single-tenant new deployments can skip this — no pre-existing data, no
- * duplicates possible.
+ * Build the WorkflowRun schema (fields, write concern, and every execution /
+ * scheduler / retention index). Pure factory — invoked by
+ * `defineStreamlineModels().bind(connection)`; registers nothing itself.
  */
-WorkflowRunSchema.index(
-  { idempotencyKey: 1 },
-  {
-    unique: true,
-    partialFilterExpression: {
-      idempotencyKey: { $type: 'string' },
-      // 'compensating' is still active → keeps blocking duplicate keys.
-      // Terminal 'compensated'/'compensation_failed' are excluded (key reusable).
-      status: { $in: ['draft', 'running', 'waiting', 'compensating'] },
-    },
-  },
-);
-
-// Concurrency: count active runs per workflow + key
-WorkflowRunSchema.index({ workflowId: 1, concurrencyKey: 1, status: 1 });
-
-// Priority: scheduler picks highest priority first
-WorkflowRunSchema.index({ status: 1, priority: -1, updatedAt: 1 });
-
-// User-scoped history: "list this user's runs, newest first" —
-// CommonQueries.byUser (query-builder.ts) and host dashboards filtering
-// on the `userId` stamped by SchedulingService.schedule().
-WorkflowRunSchema.index({ userId: 1, createdAt: -1 });
-
-// Step-targeted lookups: host-side queries that select runs by an embedded
-// step id (multikey) — e.g. "which runs contain step X" operator views and
-// webhook/approval resolvers matching a run via its waiting step.
-WorkflowRunSchema.index({ 'steps.stepId': 1 });
-
-// Critical index for scheduler polling (prevents full collection scans)
-// REQUIRED for production: Supports getReadyToResume() query
-WorkflowRunSchema.index({
-  status: 1,
-  'steps.status': 1,
-  'steps.waitingFor.resumeAt': 1,
-});
-
-// Critical index for retry polling (prevents full collection scans)
-// REQUIRED for production: Supports getReadyForRetry() query
-WorkflowRunSchema.index({
-  status: 1,
-  'steps.status': 1,
-  'steps.retryAfter': 1,
-});
-
-// Critical index for stale workflow recovery (prevents full collection scans)
-// REQUIRED for production: Supports getStaleRunningWorkflows() query
-WorkflowRunSchema.index({
-  status: 1,
-  lastHeartbeat: 1,
-});
-
-// Critical index for crash-durable child-workflow reconciliation.
-// REQUIRED for production: Supports getChildWaitingRuns() query
-// (CommonQueries.childWaiting in query-builder.ts). Selects
-// status='waiting' runs with a step in status='waiting' whose
-// waitingFor.type='childWorkflow', gated on the reconcile cadence
-// (waitingFor.nextReconcileAt <= now). Without it the poller does a full
-// collection scan every cadence window.
-WorkflowRunSchema.index({
-  status: 1,
-  'steps.status': 1,
-  'steps.waitingFor.type': 1,
-  'steps.waitingFor.nextReconcileAt': 1,
-});
-
-// Critical index for scheduled workflow polling (timezone-aware scheduling)
-// REQUIRED for scheduled workflows: Supports efficient polling by execution time
-// Query pattern: status='draft' AND executionTime <= now AND paused != true
-WorkflowRunSchema.index({
-  status: 1,
-  'scheduling.executionTime': 1,
-  paused: 1,
-});
-
 /**
- * WORKFLOW-SCOPED SCHEDULER PICKUP INDEXES (v2.4.0 distributed-correctness fix).
- *
- * Each WorkflowEngine owns its own SmartScheduler, now scoped to the engine's
- * own `workflowId` so engine B never picks up engine A's run. That scoping adds
- * a leading `workflowId` equality predicate to every pickup query. These
- * compound indexes carry that `workflowId` prefix so the scoped sweeps stay
- * index-backed (an index whose prefix doesn't match the query's leading
- * equality term can't be used, so the unscoped indexes above are insufficient
- * once `workflowId` is the leading filter term).
- *
- * Each mirrors an unscoped pickup index above, prefixed with `workflowId`:
- *   - readyToResume  : status + steps.status + steps.waitingFor.resumeAt
- *   - readyForRetry  : status + steps.status + steps.retryAfter
- *   - staleRunning / staleCompensating : status + lastHeartbeat
- *   - childWaiting / branchJoinWaiting : status + steps.status
- *                       + steps.waitingFor.type + steps.waitingFor.nextReconcileAt
- *   - scheduledReady : status + scheduling.executionTime + paused
- * The existing `{ workflowId:1, status:1 }` and
- * `{ workflowId:1, concurrencyKey:1, status:1 }` indexes already back the
- * scoped waiting/concurrency-draft existence probes and concurrency-draft list.
+ * @param tenantField Dot-path of the tenant field on the run doc (default
+ *   `'context.tenantId'`, the repository default). The idempotency unique index
+ *   is COMPOUND on `{ [tenantField], idempotencyKey }` so an idempotency key is
+ *   unique PER TENANT, not globally — matching the tenant-scoped idempotency
+ *   lookup. A host that configures a custom `tenant.tenantField` must build
+ *   its model set with the matching `defineStreamlineModels({ tenantField })`.
  */
-WorkflowRunSchema.index({
-  workflowId: 1,
-  status: 1,
-  'steps.status': 1,
-  'steps.waitingFor.resumeAt': 1,
-});
-WorkflowRunSchema.index({
-  workflowId: 1,
-  status: 1,
-  'steps.status': 1,
-  'steps.retryAfter': 1,
-});
-WorkflowRunSchema.index({
-  workflowId: 1,
-  status: 1,
-  lastHeartbeat: 1,
-});
-WorkflowRunSchema.index({
-  workflowId: 1,
-  status: 1,
-  'steps.status': 1,
-  'steps.waitingFor.type': 1,
-  'steps.waitingFor.nextReconcileAt': 1,
-});
-WorkflowRunSchema.index({
-  workflowId: 1,
-  status: 1,
-  'scheduling.executionTime': 1,
-  paused: 1,
-});
+export function buildWorkflowRunSchema(tenantField = 'context.tenantId'): Schema<WorkflowRun> {
+  const WorkflowRunSchema = new Schema<WorkflowRun>(
+    {
+      _id: { type: String, required: true },
+      // No field-level index — every workflowId query rides a workflowId-leading
+      // compound ({workflowId, concurrencyKey, status}, the scheduler compound);
+      // a bare single is a redundant prefix (P11.1, fleet index audit 2026-07).
+      workflowId: { type: String, required: true },
+      status: {
+        type: String,
+        // Durable saga (v2.4) adds 'compensating' | 'compensated' |
+        // 'compensation_failed'. Additive at runtime — existing runs are
+        // unaffected.
+        enum: [
+          'draft',
+          'running',
+          'waiting',
+          'done',
+          'failed',
+          'cancelled',
+          'compensating',
+          'compensated',
+          'compensation_failed',
+        ],
+        required: true,
+        // No field-level index — {status, updatedAt} + {status, priority,
+        // updatedAt} compounds serve every status-prefix query (P11.1).
+      },
+      steps: [StepStateSchema],
+      currentStepId: String,
+      context: { type: Schema.Types.Mixed, default: {} },
+      input: Schema.Types.Mixed,
+      output: Schema.Types.Mixed,
+      error: { type: Schema.Types.Mixed, required: false }, // Workflow-level error (e.g., data corruption)
+      createdAt: { type: Date, required: true },
+      updatedAt: { type: Date, required: true },
+      startedAt: Date,
+      endedAt: Date,
+      lastHeartbeat: Date, // For detecting stale running workflows
+      paused: { type: Boolean, default: false }, // User-initiated pause - scheduler skips paused workflows
+      scheduling: SchedulingInfoSchema, // Optional: timezone-aware scheduling metadata
+      stepLogs: { type: [StepLogEntrySchema], default: undefined }, // Persisted step-level logs from ctx.log()
+      idempotencyKey: String, // Dedup key — non-terminal runs block duplicates
+      priority: { type: Number, default: 0 }, // Higher = picked up sooner by scheduler
+      concurrencyKey: String, // Grouping key for concurrency limits
+      // No field-level index — {userId, createdAt} compound covers the prefix (P11.1).
+      userId: { type: String },
+      tags: [String],
+      meta: Schema.Types.Mixed,
+      // Operator cancellation reason (v2.7). Absent unless
+      // `engine.cancel(runId, { reason })` was called with a reason.
+      cancellationReason: { type: String, required: false },
+      /**
+       * Pinned definition version (semver). The engine snapshots
+       * `WorkflowDefinition.version` at create-time so a run resumed weeks
+       * later still uses the step graph it started under. The engine
+       * resolves this through a version-keyed registry (`workflowRegistry.lookupVersion`)
+       * before re-execution; missing → falls back to the active definition.
+       */
+      definitionVersion: String,
+      /**
+       * How many times the stale-recovery / sweeper paths have touched this
+       * run. Once it hits `RetentionOptions.maxStaleRecoveries`, the next
+       * sweep marks the run failed with `error.code === 'dead_lettered'`
+       * instead of recycling it forever.
+       */
+      recoveryAttempts: { type: Number, default: 0 },
+    },
+    {
+      collection: 'workflow_runs',
+      timestamps: false,
+      /**
+       * Majority write concern ensures data survives replica set failovers.
+       * Without this, acknowledged writes can vanish on primary crash.
+       *
+       * - w: 'majority' — acknowledged by a majority of replica set members
+       * - j: true — written to the on-disk journal before acknowledging
+       *
+       * For standalone dev instances, Mongoose/MongoDB gracefully degrades.
+       */
+      writeConcern: { w: 'majority', j: true },
+    },
+  );
 
-// Compound indexes for keyset pagination used by repository getAll/scheduler queries.
-// Without these, MongoKit emits warnings and MongoDB does full collection scans.
-WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: -1, _id: -1 });
-WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: 1, _id: 1 });
+  // Core indexes for workflow execution.
+  // NOTE: no bare {workflowId, status} — the scheduler compound
+  // {workflowId, status, steps.status, steps.waitingFor.resumeAt} below serves
+  // the same prefix (P11.1; the audit's highest-traffic redundant index rode it).
+  WorkflowRunSchema.index({ status: 1, updatedAt: -1 });
 
-// Workflow-SCOPED keyset sweeps (v2.4.0 engine scoping) — ESR: Equality → Sort.
-//
-// Every scheduler pickup sweep (CommonQueries.readyForRetry / readyToResume /
-// expiredWaits / childWaiting / branchJoinWaiting / staleRunning /
-// staleCompensating / scheduledReady in `query-builder.ts`) keyset-paginates
-// sorted by `updatedAt`, scoped to the engine's own `workflowId`. Reducing each
-// to its predicate CLASSES:
-//   - EQUALITY: `status` (a single value) + `workflowId` (the scope term).
-//   - RANGE:    `paused: {$ne:true}` (`notPaused()`; `isPaused()` is never used
-//               by a sweep), plus `steps: {$elemMatch}` and/or
-//               `scheduling.executionTime: {$lte}` on the step/scheduled variants.
-//
-// So the ONLY correct prefix is `{ status, workflowId }` (both equalities, so
-// both bound the scan — `workflowId` is selective and must not be stranded
-// behind a range), then `updatedAt` so the sort is index-provided. The range
-// predicates are left as cheap residual filters over the tiny
-// per-(status, workflowId) working set — deliberately NOT in the index:
-//   - a `$ne`/`$elemMatch` wedged into the prefix stops the planner using any
-//     later key for bounds or for the sort (forcing a blocking sort);
-//   - a bare `{ steps: 1 }` multikey indexes each ENTIRE step subdocument
-//     (Mixed output/logs and all) — it cannot serve `$elemMatch` on step
-//     SUBFIELDS, so it only bloats the index and slows every step-state write.
-//
-// Requires mongokit ≥ 3.24, whose keyset detector is ESR/range-aware
-// (`classifyFilterFields`): it accepts this equality-lead index and no longer
-// demands the range fields (`paused`/`steps`) sit in the prefix. Trailing `_id`
-// matches the keyset cursor tiebreaker.
-//
-// Unscoped sweeps (legacy + existence probes, `workflowId` omitted) ride the
-// `{ status: 1, updatedAt: -1 }` index above (equality `status` + sort,
-// reverse-walked for the ascending sweeps).
-WorkflowRunSchema.index({ status: 1, workflowId: 1, updatedAt: 1, _id: 1 });
+  // Idempotency: compound index for "find active run by key" query
+  WorkflowRunSchema.index({ idempotencyKey: 1, status: 1 }, { sparse: true });
+
+  /**
+   * Idempotency race-safety (PACKAGE_RULES §32).
+   *
+   * Partial unique index closes the TOCTOU window between the lookup in
+   * `engine.start()` and the `repository.create()` call. Two concurrent
+   * workers with the same key both pass the lookup (no row yet); the second
+   * insert hits MongoDB's E11000 duplicate-key error. `WorkflowRunRepository`
+   * catches it and returns the winning run.
+   *
+   * `partialFilterExpression` excludes terminal statuses, so the key is
+   * reusable after `done` / `failed` / `cancelled` — same documented semantic
+   * as before, now actually race-safe.
+   *
+   * Durable saga (v2.4): `'compensating'` is included in the active `$in` set —
+   * a run mid-rollback is still ACTIVE and must keep blocking a duplicate
+   * idempotency key (a second start of the same logical operation while the
+   * first is still compensating would be unsafe). The terminal compensation
+   * outcomes `'compensated'` / `'compensation_failed'` are deliberately EXCLUDED
+   * (like `done`/`failed`/`cancelled`), so the key becomes reusable once the
+   * saga fully settles.
+   *
+   * `idempotencyKey: { $type: 'string' }` is the standard guard against
+   * `null` collisions when other docs lack the field (PACKAGE_RULES §35).
+   *
+   * ⚠️ Production deployment — clean active duplicates first.
+   *
+   * Existing deployments may carry duplicate `idempotencyKey` values across
+   * non-terminal runs (the pre-fix race could produce them). MongoDB will
+   * REFUSE to build this index if duplicates exist:
+   *
+   *     IndexBuildFailed: E11000 duplicate key error
+   *
+   * Pre-deploy migration — run once against the production replica set
+   * BEFORE rolling out a streamline version that ships this index:
+   *
+   * ```js
+   * // 1. Find active duplicates so you can audit them.
+   * db.workflow_runs.aggregate([
+   *   { $match: {
+   *     idempotencyKey: { $type: 'string' },
+   *     status: { $in: ['draft', 'running', 'waiting'] },
+   *   }},
+   *   { $group: { _id: '$idempotencyKey', ids: { $push: '$_id' }, n: { $sum: 1 } }},
+   *   { $match: { n: { $gt: 1 } }},
+   * ]);
+   *
+   * // 2. For each duplicate group, keep the oldest run, terminate the rest:
+   * db.workflow_runs.updateMany(
+   *   { _id: { $in: [/* duplicate ids except the keeper *\/] }, status: { $ne: 'cancelled' }},
+   *   { $set: { status: 'cancelled', endTime: new Date(),
+   *             error: { message: 'Cancelled during idempotency-index migration' }}},
+   * );
+   * ```
+   *
+   * Single-tenant new deployments can skip this — no pre-existing data, no
+   * duplicates possible.
+   *
+   * COMPOUND on the tenant field: uniqueness is scoped PER TENANT (matching the
+   * tenant-scoped idempotency lookup) — tenants A and B may use the same
+   * ordinary key concurrently without a cross-tenant E11000. Single-tenant runs
+   * (no tenant value) share the `null` bucket, so the key stays globally unique
+   * for them, exactly as before. A prior global `{ idempotencyKey: 1 }` index
+   * must be dropped when upgrading (it would keep rejecting cross-tenant keys).
+   */
+  WorkflowRunSchema.index(
+    { [tenantField]: 1, idempotencyKey: 1 },
+    {
+      unique: true,
+      partialFilterExpression: {
+        idempotencyKey: { $type: 'string' },
+        // 'compensating' is still active → keeps blocking duplicate keys.
+        // Terminal 'compensated'/'compensation_failed' are excluded (key reusable).
+        status: { $in: ['draft', 'running', 'waiting', 'compensating'] },
+      },
+    },
+  );
+
+  // Concurrency: count active runs per workflow + key
+  WorkflowRunSchema.index({ workflowId: 1, concurrencyKey: 1, status: 1 });
+
+  // Priority: scheduler picks highest priority first
+  WorkflowRunSchema.index({ status: 1, priority: -1, updatedAt: 1 });
+
+  // User-scoped history: "list this user's runs, newest first" —
+  // CommonQueries.byUser (query-builder.ts) and host dashboards filtering
+  // on the `userId` stamped by SchedulingService.schedule().
+  WorkflowRunSchema.index({ userId: 1, createdAt: -1 });
+
+  // Step-targeted lookups: host-side queries that select runs by an embedded
+  // step id (multikey) — e.g. "which runs contain step X" operator views and
+  // webhook/approval resolvers matching a run via its waiting step.
+  WorkflowRunSchema.index({ 'steps.stepId': 1 });
+
+  // Critical index for scheduler polling (prevents full collection scans)
+  // REQUIRED for production: Supports getReadyToResume() query
+  WorkflowRunSchema.index({
+    status: 1,
+    'steps.status': 1,
+    'steps.waitingFor.resumeAt': 1,
+  });
+
+  // Critical index for retry polling (prevents full collection scans)
+  // REQUIRED for production: Supports getReadyForRetry() query
+  WorkflowRunSchema.index({
+    status: 1,
+    'steps.status': 1,
+    'steps.retryAfter': 1,
+  });
+
+  // Critical index for stale workflow recovery (prevents full collection scans)
+  // REQUIRED for production: Supports getStaleRunningWorkflows() query
+  WorkflowRunSchema.index({
+    status: 1,
+    lastHeartbeat: 1,
+  });
+
+  // Critical index for crash-durable child-workflow reconciliation.
+  // REQUIRED for production: Supports getChildWaitingRuns() query
+  // (CommonQueries.childWaiting in query-builder.ts). Selects
+  // status='waiting' runs with a step in status='waiting' whose
+  // waitingFor.type='childWorkflow', gated on the reconcile cadence
+  // (waitingFor.nextReconcileAt <= now). Without it the poller does a full
+  // collection scan every cadence window.
+  WorkflowRunSchema.index({
+    status: 1,
+    'steps.status': 1,
+    'steps.waitingFor.type': 1,
+    'steps.waitingFor.nextReconcileAt': 1,
+  });
+
+  // Critical index for scheduled workflow polling (timezone-aware scheduling)
+  // REQUIRED for scheduled workflows: Supports efficient polling by execution time
+  // Query pattern: status='draft' AND executionTime <= now AND paused != true
+  WorkflowRunSchema.index({
+    status: 1,
+    'scheduling.executionTime': 1,
+    paused: 1,
+  });
+
+  /**
+   * WORKFLOW-SCOPED SCHEDULER PICKUP INDEXES (v2.4.0 distributed-correctness fix).
+   *
+   * Each WorkflowEngine owns its own SmartScheduler, now scoped to the engine's
+   * own `workflowId` so engine B never picks up engine A's run. That scoping adds
+   * a leading `workflowId` equality predicate to every pickup query. These
+   * compound indexes carry that `workflowId` prefix so the scoped sweeps stay
+   * index-backed (an index whose prefix doesn't match the query's leading
+   * equality term can't be used, so the unscoped indexes above are insufficient
+   * once `workflowId` is the leading filter term).
+   *
+   * Each mirrors an unscoped pickup index above, prefixed with `workflowId`:
+   *   - readyToResume  : status + steps.status + steps.waitingFor.resumeAt
+   *   - readyForRetry  : status + steps.status + steps.retryAfter
+   *   - staleRunning / staleCompensating : status + lastHeartbeat
+   *   - childWaiting / branchJoinWaiting : status + steps.status
+   *                       + steps.waitingFor.type + steps.waitingFor.nextReconcileAt
+   *   - scheduledReady : status + scheduling.executionTime + paused
+   * The existing `{ workflowId:1, status:1 }` and
+   * `{ workflowId:1, concurrencyKey:1, status:1 }` indexes already back the
+   * scoped waiting/concurrency-draft existence probes and concurrency-draft list.
+   */
+  WorkflowRunSchema.index({
+    workflowId: 1,
+    status: 1,
+    'steps.status': 1,
+    'steps.waitingFor.resumeAt': 1,
+  });
+  WorkflowRunSchema.index({
+    workflowId: 1,
+    status: 1,
+    'steps.status': 1,
+    'steps.retryAfter': 1,
+  });
+  WorkflowRunSchema.index({
+    workflowId: 1,
+    status: 1,
+    lastHeartbeat: 1,
+  });
+  WorkflowRunSchema.index({
+    workflowId: 1,
+    status: 1,
+    'steps.status': 1,
+    'steps.waitingFor.type': 1,
+    'steps.waitingFor.nextReconcileAt': 1,
+  });
+  WorkflowRunSchema.index({
+    workflowId: 1,
+    status: 1,
+    'scheduling.executionTime': 1,
+    paused: 1,
+  });
+
+  // Compound indexes for keyset pagination used by repository getAll/scheduler queries.
+  // Without these, MongoKit emits warnings and MongoDB does full collection scans.
+  WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: -1, _id: -1 });
+  WorkflowRunSchema.index({ status: 1, paused: 1, updatedAt: 1, _id: 1 });
+
+  // Workflow-SCOPED keyset sweeps (v2.4.0 engine scoping) — ESR: Equality → Sort.
+  //
+  // Every scheduler pickup sweep (CommonQueries.readyForRetry / readyToResume /
+  // expiredWaits / childWaiting / branchJoinWaiting / staleRunning /
+  // staleCompensating / scheduledReady in `query-builder.ts`) keyset-paginates
+  // sorted by `updatedAt`, scoped to the engine's own `workflowId`. Reducing each
+  // to its predicate CLASSES:
+  //   - EQUALITY: `status` (a single value) + `workflowId` (the scope term).
+  //   - RANGE:    `paused: {$ne:true}` (`notPaused()`; `isPaused()` is never used
+  //               by a sweep), plus `steps: {$elemMatch}` and/or
+  //               `scheduling.executionTime: {$lte}` on the step/scheduled variants.
+  //
+  // So the ONLY correct prefix is `{ status, workflowId }` (both equalities, so
+  // both bound the scan — `workflowId` is selective and must not be stranded
+  // behind a range), then `updatedAt` so the sort is index-provided. The range
+  // predicates are left as cheap residual filters over the tiny
+  // per-(status, workflowId) working set — deliberately NOT in the index:
+  //   - a `$ne`/`$elemMatch` wedged into the prefix stops the planner using any
+  //     later key for bounds or for the sort (forcing a blocking sort);
+  //   - a bare `{ steps: 1 }` multikey indexes each ENTIRE step subdocument
+  //     (Mixed output/logs and all) — it cannot serve `$elemMatch` on step
+  //     SUBFIELDS, so it only bloats the index and slows every step-state write.
+  //
+  // Requires mongokit ≥ 3.24, whose keyset detector is ESR/range-aware
+  // (`classifyFilterFields`): it accepts this equality-lead index and no longer
+  // demands the range fields (`paused`/`steps`) sit in the prefix. Trailing `_id`
+  // matches the keyset cursor tiebreaker.
+  //
+  // Unscoped sweeps (legacy + existence probes, `workflowId` omitted) ride the
+  // `{ status: 1, updatedAt: -1 }` index above (equality `status` + sort,
+  // reverse-walked for the ascending sweeps).
+  WorkflowRunSchema.index({ status: 1, workflowId: 1, updatedAt: 1, _id: 1 });
+
+  return WorkflowRunSchema;
+}
 
 /**
  * MULTI-TENANCY & SCHEDULED WORKFLOWS - COMPOSITE INDEXES
@@ -476,21 +500,3 @@ WorkflowRunSchema.index({ status: 1, workflowId: 1, updatedAt: 1, _id: 1 });
  *
  * Then query: engine.get(runId) and filter by tenantId in your app layer
  */
-
-/**
- * Export WorkflowRunModel with hot-reload safety
- *
- * The pattern checks if the model already exists before creating a new one.
- * This prevents "OverwriteModelError" in development with hot module replacement.
- */
-let WorkflowRunModel: mongoose.Model<WorkflowRun>;
-
-if (mongoose.models.WorkflowRun) {
-  // Model already exists - reuse it (for hot reload scenarios)
-  WorkflowRunModel = mongoose.models.WorkflowRun as mongoose.Model<WorkflowRun>;
-} else {
-  // Create new model
-  WorkflowRunModel = mongoose.model<WorkflowRun>('WorkflowRun', WorkflowRunSchema);
-}
-
-export { WorkflowRunModel };

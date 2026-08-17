@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import mongoose from 'mongoose';
 import { createWorkflowRepository } from '../../src/storage/run.repository.js';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import type { WorkflowRun } from '../../src/core/types.js';
 
 describe('Multi-Tenant UpdateOne Safety', () => {
@@ -29,9 +29,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
   describe('Strict Multi-Tenant Mode', () => {
     it('should throw error if tenantId is missing in updateOne', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -59,9 +59,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
 
     it('should update workflow with correct tenantId', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -94,9 +94,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
 
     it('should NOT update workflow with wrong tenantId', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -129,9 +129,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
 
     it('should prevent cross-tenant updates in atomic claims', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -188,9 +188,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
 
     it('should allow bypass for admin operations', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -254,9 +254,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
   describe('Operator Handling', () => {
     it('should handle MongoDB operators correctly', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -292,9 +292,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
 
     it('should wrap plain objects in $set', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -328,9 +328,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
   describe('Edge Cases', () => {
     it('should handle non-existent workflow gracefully', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -345,9 +345,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
 
     it('should handle empty update object', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -380,9 +380,9 @@ describe('Multi-Tenant UpdateOne Safety', () => {
 
     it('should handle complex filters with tenant injection', async () => {
       const repo = createWorkflowRepository({
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 

@@ -157,17 +157,27 @@ export async function executeParallel<T>(
 ): Promise<T[] | Array<{ success: boolean; value?: T; reason?: unknown }>> {
   const { mode = 'all', concurrency = Infinity, timeout } = options;
 
-  // Wrap tasks with timeout if specified
+  // Wrap tasks with timeout if specified. The timer MUST be cleared once the
+  // task settles — otherwise a batch of fast tasks with long timeouts leaves
+  // one live handle per task until each deadline, keeping the event loop busy
+  // and delaying process shutdown.
   const wrappedTasks = timeout
-    ? tasks.map(
-        (task) => () =>
-          Promise.race([
+    ? tasks.map((task) => async (): Promise<T> => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          return await Promise.race([
             task(),
-            new Promise<T>((_, reject) =>
-              setTimeout(() => reject(new Error(`Task timeout after ${timeout}ms`)), timeout),
-            ),
-          ]),
-      )
+            new Promise<T>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`Task timeout after ${timeout}ms`)),
+                timeout,
+              );
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      })
     : tasks;
 
   // Validate mode + concurrency combination

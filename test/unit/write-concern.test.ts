@@ -16,8 +16,8 @@
 
 import type mongoose from 'mongoose';
 import { describe, expect, it } from 'vitest';
-import { WorkflowConcurrencyCounterModel } from '../../src/storage/concurrency-counter.model.js';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowConcurrencyCounterModel } from '../../src/storage/models.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 
 /**
  * Assert a model's schema carries the majority/journaled write concern.

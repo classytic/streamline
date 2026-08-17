@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import mongoose from 'mongoose';
 import { createWorkflow } from '../../src/index.js';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 
 // Track workflows for cleanup
 const createdWorkflows: { shutdown: () => void }[] = [];

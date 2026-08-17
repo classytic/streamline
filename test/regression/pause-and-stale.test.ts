@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { createWorkflow } from '../../src/index.js';
 import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import { setupTestDB, cleanupTestDB, teardownTestDB, waitFor, waitUntil } from '../utils/setup.js';
 
 describe('Pause and Stale Recovery Regression', () => {

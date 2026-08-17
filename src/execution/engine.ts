@@ -192,6 +192,31 @@ export interface WorkflowEngineOptions {
  * const run = await engine.start({ orderId: '123' });
  * ```
  */
+
+/**
+ * Tenant scoping for the control API (`get` / `execute` / `resume` / `cancel` /
+ * `pause` / `rewindTo` / progress / metrics). In multi-tenant strict mode the
+ * caller MUST pass `tenantId` (or `bypassTenant: true` for admin/cross-tenant
+ * access); the run's initial lookup is then scoped to that tenant so possession
+ * of a foreign `runId` cannot read or control another tenant's run.
+ */
+export interface ControlOptions {
+  /** The tenant permitted to act on the run. Required in multi-tenant strict mode. */
+  tenantId?: string | undefined;
+  /** Skip tenant scoping — admin / cross-tenant callers only. */
+  bypassTenant?: boolean | undefined;
+}
+
+/** Read a (possibly nested, dot-pathed) tenant field off a run doc. */
+function readTenantPath(obj: unknown, path: string): unknown {
+  return path
+    .split('.')
+    .reduce<unknown>(
+      (o, k) => (o && typeof o === 'object' ? (o as Record<string, unknown>)[k] : undefined),
+      obj,
+    );
+}
+
 export class WorkflowEngine<TContext = Record<string, unknown>> {
   private readonly executor: StepExecutor<TContext>;
   private scheduler: SmartScheduler; // Mutable: reconfigured in updateSchedulerConfig()
@@ -439,7 +464,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       /**
        * Tenant context forwarded to `repository.create` (and the idempotency
        * lookup). Required when the repository was constructed with
-       * `multiTenant.strict: true`; the tenant-filter plugin throws on
+       * `tenant.required: true`; the tenant-filter plugin throws on
        * `before:create` / `before:getOne` if missing. Single-tenant or
        * `staticTenantId` deployments can omit.
        */
@@ -558,12 +583,55 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    * @param runId - Workflow run ID
    * @returns The workflow run or null if not found
    */
-  async get(runId: string): Promise<WorkflowRun<TContext> | null> {
+  async get(runId: string, options?: ControlOptions): Promise<WorkflowRun<TContext> | null> {
     const cached = this.container.cache.get<TContext>(runId);
-    if (cached) return cached;
+    if (cached) {
+      // The run cache is keyed by runId GLOBALLY. Without validating tenant
+      // ownership, a caller holding another tenant's runId would get their run
+      // straight from cache (bypassing the tenant-filter plugin entirely). Only
+      // return a cached hit the caller is entitled to; otherwise fall through
+      // to a tenant-scoped DB read (which returns null / throws in strict mode).
+      if (this.cacheOwnershipHolds(cached, options)) return cached;
+    } else {
+      // Nothing cached — a tenant-scoped read establishes ownership.
+    }
 
-    const run = await this.container.repository.getById(runId);
-    return run as WorkflowRun<TContext> | null;
+    // `options` provided → tenant-scoped read (the public control path). No
+    // options → unscoped read (internal re-reads during execution, which have
+    // already passed the ownership gate on the public method).
+    const run = options
+      ? await this.readRun(runId, options)
+      : ((await this.container.repository.getById(runId)) as WorkflowRun<TContext> | null);
+    return run;
+  }
+
+  /**
+   * Establish that `options`' tenant is entitled to act on `runId` BEFORE any
+   * `bypassTenant` mutation runs. A run outside the caller's tenant is reported
+   * as not-found (no cross-tenant existence oracle). No-op for single-tenant
+   * repositories or explicit `bypassTenant` (admin/cross-tenant callers).
+   *
+   * Called at the PUBLIC control boundary (the `Workflow` interface) — internal
+   * engine-to-engine calls (start→execute, resumeOperator→resume, scheduler)
+   * are already system-initiated and do not re-gate.
+   */
+  async assertOwnership(runId: string, options?: ControlOptions): Promise<void> {
+    const repo = this.container.repository;
+    if (!repo.isMultiTenant || options?.bypassTenant) return;
+    const owned = await repo.getById(runId, {
+      ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+    });
+    if (!owned) throw new WorkflowNotFoundError(runId);
+  }
+
+  /** Whether a cached run may be returned to a caller under `options`' tenant scope. */
+  private cacheOwnershipHolds(run: WorkflowRun<TContext>, options?: ControlOptions): boolean {
+    if (!options) return true; // unscoped internal read
+    const repo = this.container.repository;
+    if (!repo.isMultiTenant || options.bypassTenant) return true;
+    if (options.tenantId === undefined) return false; // can't validate → force scoped DB read
+    const runTenant = readTenantPath(run, repo.tenantField);
+    return runTenant !== undefined && String(runTenant) === String(options.tenantId);
   }
 
   /**
@@ -1834,7 +1902,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   async getStepProgress(
     runId: string,
     stepId: string,
-    options?: { tenantId?: string; bypassTenant?: boolean },
+    options?: ControlOptions,
   ): Promise<StepProgress | undefined> {
     const run = await this.readRun(runId, options);
     return run?.steps.find((s) => s.stepId === stepId)?.lastProgress;
@@ -1845,10 +1913,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    * plus each step's status and latest reported progress. Plain read off the
    * run doc; tenant-scoped like other reads.
    */
-  async getRunProgress(
-    runId: string,
-    options?: { tenantId?: string; bypassTenant?: boolean },
-  ): Promise<RunProgress | null> {
+  async getRunProgress(runId: string, options?: ControlOptions): Promise<RunProgress | null> {
     const run = await this.readRun(runId, options);
     if (!run) return null;
     return {
@@ -1867,10 +1932,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    * for both terminal and in-flight runs. `totalCost` is the sum only when at
    * least one step carries a `cost`; otherwise `undefined`.
    */
-  async getRunMetrics(
-    runId: string,
-    options?: { tenantId?: string; bypassTenant?: boolean },
-  ): Promise<RunMetrics | null> {
+  async getRunMetrics(runId: string, options?: ControlOptions): Promise<RunMetrics | null> {
     const run = await this.readRun(runId, options);
     if (!run) return null;
 
@@ -1908,7 +1970,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    */
   private async readRun(
     runId: string,
-    options?: { tenantId?: string; bypassTenant?: boolean },
+    options?: ControlOptions,
   ): Promise<WorkflowRun<TContext> | null> {
     const run = await this.container.repository.getById(runId, {
       ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),

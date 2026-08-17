@@ -494,7 +494,7 @@ export async function cancelBranchChildren<TContext>(run: WorkflowRun<TContext>)
  * exact bus. Re-drives are deduped by the resume claim; after a crash the
  * scheduler's branch-join sweep reclaims the wait regardless of listeners.
  */
-export function registerBranchCompletionListeners<TContext>(
+function registerBranchCompletionListeners<TContext>(
   engine: BranchJoinEngine<TContext>,
   runId: string,
   childRunId: string,

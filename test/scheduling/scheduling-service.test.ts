@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import mongoose from 'mongoose';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import { SchedulingService } from '../../src/scheduling/scheduling.service.js';
 import { createWorkflow } from '../../src/index.js';
 import type { WorkflowHandlers } from '../../src/core/types.js';
@@ -327,9 +327,9 @@ describe('SchedulingService', () => {
   describe('Multi-Tenant Scheduling', () => {
     it('should schedule with tenantId', async () => {
       const multiTenantService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: false, // Non-strict for testing
+          required: false, // Non-strict for testing
         },
       });
 
@@ -346,9 +346,9 @@ describe('SchedulingService', () => {
 
     it('should schedule under a strict-tenant repo: run is tenant-stamped and tenant-scoped-queryable', async () => {
       const strictService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -379,9 +379,9 @@ describe('SchedulingService', () => {
 
     it('should throw under a strict-tenant repo when tenantId is missing', async () => {
       const strictService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        multiTenant: {
+        tenant: {
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         },
       });
 
@@ -396,9 +396,9 @@ describe('SchedulingService', () => {
 
     it('should stamp the CONFIGURED tenant field, not a hardcoded context.tenantId literal', async () => {
       const metaService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        multiTenant: {
+        tenant: {
           tenantField: 'meta.orgId',
-          strict: true,
+          required: true,
         },
       });
 

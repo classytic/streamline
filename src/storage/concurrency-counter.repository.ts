@@ -25,12 +25,10 @@
  */
 
 import { Repository } from '@classytic/mongokit';
-import {
-  makeCounterId,
-  type WorkflowConcurrencyCounter,
-  WorkflowConcurrencyCounterModel,
-} from './concurrency-counter.model.js';
-import { WorkflowRunModel } from './run.model.js';
+import type { Model } from 'mongoose';
+import type { WorkflowRun } from '../core/types.js';
+import { makeCounterId, type WorkflowConcurrencyCounter } from './concurrency-counter.model.js';
+import { WorkflowConcurrencyCounterModel, WorkflowRunModel } from './models.js';
 
 /**
  * Run statuses that hold a strict-concurrency slot. The slot is claimed at
@@ -43,13 +41,25 @@ import { WorkflowRunModel } from './run.model.js';
  */
 const SLOT_HOLDING_STATUSES = ['running', 'waiting', 'compensating'] as const;
 
+/** Connection-aware models for the concurrency counter (default: the eager singletons). */
+export interface ConcurrencyCounterConfig {
+  /** Counter model to persist through. Default {@link WorkflowConcurrencyCounterModel}. */
+  counterModel?: Model<WorkflowConcurrencyCounter>;
+  /** Run model used by slot RECONCILIATION — MUST be on the same connection as the run repo. */
+  runModel?: Model<WorkflowRun>;
+}
+
 export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowConcurrencyCounter> {
-  constructor() {
+  /** Run model consulted by {@link reconcileBucket} — same connection as the run repo. */
+  private readonly runModel: Model<WorkflowRun>;
+
+  constructor(config: ConcurrencyCounterConfig = {}) {
     // Counter docs are global per (workflowId, key) — the same scheduler
     // serves every tenant. No tenant-filter plugin wired here by design;
     // tenant scoping for strict concurrency would require a per-tenant
     // counter (= per-tenant rate limit), a different feature.
-    super(WorkflowConcurrencyCounterModel);
+    super(config.counterModel ?? WorkflowConcurrencyCounterModel);
+    this.runModel = config.runModel ?? WorkflowRunModel;
   }
 
   /**
@@ -178,7 +188,7 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
     // Count the runs that actually still hold a slot. Query the run model
     // directly (cross-tenant — the strict counter is a global gate, same
     // rationale as the repository's no-tenant-plugin design above).
-    const trueCount = await WorkflowRunModel.countDocuments({
+    const trueCount = await this.runModel.countDocuments({
       workflowId,
       concurrencyKey,
       status: { $in: SLOT_HOLDING_STATUSES },

@@ -6,13 +6,15 @@
  */
 
 import type { EventTransport } from '@classytic/primitives/events';
+import type { Connection } from 'mongoose';
 import { bridgeBusToTransport } from '../events/bridge.js';
 import { InProcessStreamlineBus } from '../events/in-process-bus.js';
 import { WorkflowCache } from '../storage/cache.js';
 import {
-  type WorkflowConcurrencyCounterRepository,
+  WorkflowConcurrencyCounterRepository,
   workflowConcurrencyCounterRepository,
 } from '../storage/concurrency-counter.repository.js';
+import { defineStreamlineModels } from '../storage/models.js';
 import {
   type RetentionOptions,
   resolveSweeperConfig,
@@ -131,13 +133,22 @@ export interface StreamlineContainer {
    */
   readonly staleRunSweeper?: StaleRunSweeper | undefined;
   /**
-   * Build retention indexes (TTL on terminal runs + tenant-prefixed
-   * compound) idempotently against the live mongoose connection.
+   * Build ALL of streamline's indexes idempotently against the live mongoose
+   * connection — the deploy-time index-sync helper (kernel `syncIndexes()`
+   * convention). Three idempotent steps:
    *
-   * No-op when `retention` was not configured on this container — safe
-   * to call unconditionally from a deploy script. Must be called AFTER
-   * `mongoose.connect(...)`. Honours PACKAGE_RULES §32 — explicit,
-   * deploy-time, never auto-run on every boot.
+   *   1. drops the legacy `idempotencyKey_1` unique index on upgrade (pre-2.9
+   *      global idempotency → 2.9 tenant-scoped compound);
+   *   2. builds the schema-defined indexes (tenant-scoped idempotency compound,
+   *      …) non-destructively;
+   *   3. builds retention extras — terminal-runs TTL and tenant-prefixed
+   *      compound — when `retention` was configured on this container.
+   *
+   * Runs steps 1–2 even when `retention` is unset (the upgrade migration
+   * matters regardless), so it's safe to call unconditionally from a deploy
+   * script. Must be called AFTER `mongoose.connect(...)` / the connection is
+   * open. Honours PACKAGE_RULES §32 — explicit, deploy-time, never auto-run on
+   * every boot.
    *
    * @example
    * ```ts
@@ -150,10 +161,12 @@ export interface StreamlineContainer {
    */
   syncRetentionIndexes(): Promise<void>;
   /**
-   * Stop background sweepers and release timers. Idempotent.
-   * Hosts that gracefully shut down (test teardown, SIGTERM) should
-   * call this — the underlying timers are `unref()`'d so omitting it
-   * won't block process exit.
+   * Stop background sweepers, release timers, and detach this container's
+   * bus→transport bridge listeners. Idempotent. Hosts that gracefully shut
+   * down (test teardown, SIGTERM) should call this — the underlying timers
+   * are `unref()`'d so omitting it won't block process exit, but hosts
+   * using `eventBus: 'global'` MUST call it or the bridge listeners leak
+   * on the process-wide bus across container lifetimes (2.8.3).
    */
   dispose(): void;
 }
@@ -163,10 +176,23 @@ export interface StreamlineContainer {
  */
 export interface ContainerOptions {
   /**
+   * Mongoose connection to bind streamline's models on. When provided (and
+   * `repository` is a config, not an instance), the container binds the FULL
+   * model set — run + concurrency-counter — on this connection with the
+   * configured `tenant.tenantField`, so the idempotency index, retention
+   * indexes, and concurrency reconciliation are all correct and connection-
+   * consistent WITHOUT the host hand-building a model. Omit to use the default
+   * eager models bound on `mongoose.connection`.
+   *
+   * (This is the clean way to run a custom `tenantField`: pass your connection
+   * here — no separate `defineStreamlineModels().bind()` + `repository.model`.)
+   */
+  connection?: Connection | undefined;
+  /**
    * Custom repository instance or configuration
-   * - If WorkflowRunRepository: uses the provided instance
+   * - If WorkflowRunRepository: uses the provided instance (as-is; `connection` ignored)
    * - If WorkflowRepositoryConfig: creates a new repository with the config
-   * - If undefined: uses the default singleton repository
+   * - If undefined: uses the default singleton repository (or a connection-bound one)
    */
   repository?: WorkflowRunRepository | WorkflowRepositoryConfig | undefined;
 
@@ -243,7 +269,7 @@ export interface ContainerOptions {
  * @example Multi-tenant container
  * ```typescript
  * const container = createContainer({
- *   repository: { multiTenant: { tenantField: 'meta.tenantId', strict: true } }
+ *   repository: { tenant: { tenantField: 'meta.tenantId', required: true } }
  * });
  * ```
  *
@@ -262,18 +288,39 @@ export interface ContainerOptions {
  * ```
  */
 export function createContainer(options: ContainerOptions = {}): StreamlineContainer {
-  // Resolve repository: instance (has 'create' method) vs config object
-  let repository: WorkflowRunRepository;
-  if (!options.repository) {
-    repository = workflowRunRepository;
-  } else if (
+  // Resolve repository: instance (has 'create' method) vs config object.
+  // When a `connection` is supplied with a config, bind the FULL model set on
+  // it (with the configured tenantField) and thread those models into BOTH the
+  // run repo and the concurrency counter — so idempotency, retention, and
+  // reconciliation all share one connection + one tenant field.
+  const isRepoInstance =
     typeof options.repository === 'object' &&
+    options.repository !== null &&
     'create' in options.repository &&
-    'getById' in options.repository
-  ) {
-    repository = options.repository;
+    'getById' in options.repository;
+
+  let repository: WorkflowRunRepository;
+  let boundModels: ReturnType<ReturnType<typeof defineStreamlineModels>['bind']> | undefined;
+
+  if (isRepoInstance) {
+    repository = options.repository as WorkflowRunRepository; // host-owned; `connection` ignored
   } else {
-    repository = createWorkflowRepository(options.repository);
+    const repoConfig = (options.repository ?? {}) as WorkflowRepositoryConfig;
+    if (options.connection) {
+      const tenantField =
+        typeof repoConfig.tenant === 'object' ? repoConfig.tenant.tenantField : undefined;
+      boundModels = defineStreamlineModels(tenantField ? { tenantField } : {}).bind(
+        options.connection,
+      );
+      repository = createWorkflowRepository({
+        ...repoConfig,
+        model: repoConfig.model ?? boundModels.WorkflowRun,
+      });
+    } else if (!options.repository) {
+      repository = workflowRunRepository;
+    } else {
+      repository = createWorkflowRepository(repoConfig);
+    }
   }
 
   // Resolve event bus
@@ -297,15 +344,26 @@ export function createContainer(options: ContainerOptions = {}): StreamlineConta
 
   // Bridge every legacy event bus emission onto the transport using
   // canonical streamline:<resource>.<verb> names. The bridge lives for the
-  // lifetime of the container — no explicit teardown needed in normal use.
-  bridgeBusToTransport(eventBus, eventTransport);
+  // lifetime of the container and is torn down by `dispose()`. That teardown
+  // is LOAD-BEARING for `eventBus: 'global'` hosts: the global bus is a
+  // process-wide singleton, so a bridge left attached after the container is
+  // discarded accumulates one listener per event name per container — repeated
+  // create/dispose cycles (test suites booting an app per scenario) grow the
+  // bus until MaxListenersExceededWarning fires.
+  const unbridge = bridgeBusToTransport(eventBus, eventTransport);
 
   // Strict-concurrency counter — singleton; the counter collection is
   // global per `(workflowId, key)` and the same scheduler / engine
   // serves every container. Override via `options.concurrencyCounterRepository`
   // for tests or custom collections.
   const concurrencyCounterRepository =
-    options.concurrencyCounterRepository ?? workflowConcurrencyCounterRepository;
+    options.concurrencyCounterRepository ??
+    (boundModels
+      ? new WorkflowConcurrencyCounterRepository({
+          counterModel: boundModels.WorkflowConcurrencyCounter,
+          runModel: boundModels.WorkflowRun,
+        })
+      : workflowConcurrencyCounterRepository);
 
   // Retention — TTL/index sync stays explicit (PACKAGE_RULES §32) but the
   // stale-run sweeper auto-starts when the host configured a threshold.
@@ -328,11 +386,19 @@ export function createContainer(options: ContainerOptions = {}): StreamlineConta
     signalStore,
     staleRunSweeper: sweeper,
     syncRetentionIndexes: async () => {
-      if (!retention) return;
-      await syncRetentionIndexesImpl(repository, retention);
+      // Always run: builds the base schema indexes (tenant-scoped idempotency
+      // compound) and drops the legacy `idempotencyKey_1` on upgrade — the
+      // migration matters even for hosts that never configured `retention`.
+      // TTL / tenant-compound extras kick in only when `retention` is set.
+      await syncRetentionIndexesImpl(repository, retention ?? {});
     },
     dispose: () => {
       sweeper?.stop();
+      // Detach the bus→transport bridge. Without this, containers created
+      // against the shared `globalEventBus` leak their bridge listeners for
+      // the life of the process (idempotent — `off` on removed listeners is
+      // a no-op, so double-dispose is safe).
+      unbridge();
     },
   };
 

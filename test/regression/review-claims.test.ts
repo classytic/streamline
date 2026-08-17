@@ -77,4 +77,19 @@ describe('Review Claims Fixes', () => {
       infoSpy.mockRestore();
     }
   });
+
+  it('executeParallel clears each task timeout timer on settle (no timer leak)', async () => {
+    vi.useFakeTimers();
+    try {
+      // Fast tasks with a LONG timeout: before the fix, each task left a live
+      // 60s timer after settling; now the timer is cleared in `finally`.
+      const tasks = [() => Promise.resolve('a'), () => Promise.resolve('b'), () => Promise.resolve('c')];
+      const result = await executeParallel(tasks, { timeout: 60_000 });
+      expect(result).toEqual(['a', 'b', 'c']);
+      // No timers left ticking toward their deadline.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

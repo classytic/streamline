@@ -192,7 +192,7 @@ export async function handleChildWorkflowWait<TContext>(
  * wait. The `resume()` atomic claim makes listener + poll mutually
  * exclusive.
  */
-export function registerChildCompletionListeners<TContext>(
+function registerChildCompletionListeners<TContext>(
   engine: ChildWorkflowEngine<TContext>,
   runId: string,
   childRunId: string,

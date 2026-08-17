@@ -402,7 +402,7 @@ describe('Trigger event — tenant context propagation', () => {
 
   it('extracts tenantId from event payload via `trigger.tenantId(payload)` extractor', async () => {
     const container = createContainer({
-      repository: { multiTenant: { tenantField: 'context.tenantId', strict: true } },
+      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
     });
     const wf = createWorkflow<{ orgId: string }, { orgId: string }>('trigger-tenant-extract', {
       steps: { run: async () => 'ok' },
@@ -434,7 +434,7 @@ describe('Trigger event — tenant context propagation', () => {
 
   it('uses `trigger.staticTenantId` for single-tenant deployments', async () => {
     const container = createContainer({
-      repository: { multiTenant: { tenantField: 'context.tenantId', strict: true } },
+      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
     });
     const wf = createWorkflow<{}, {}>('trigger-tenant-static', {
       steps: { run: async () => 'ok' },

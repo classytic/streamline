@@ -17,7 +17,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import {
   createWorkflowRepository,
   type WorkflowRunRepository,
@@ -124,7 +124,7 @@ describe('Bulk primitives + tenantFilterPlugin', () => {
   it('updateMany with tenantId only touches that tenant\'s runs', async () => {
     // Tenant-scoped repository — streamline's own plugin, not mongokit's.
     const repo = createWorkflowRepository({
-      multiTenant: { tenantField: 'context.tenantId', strict: true },
+      tenant: { tenantField: 'context.tenantId', required: true },
     });
 
     // Seed using raw model so we bypass create hooks — the goal here is to
@@ -153,7 +153,7 @@ describe('Bulk primitives + tenantFilterPlugin', () => {
 
   it('deleteMany with tenantId only removes that tenant\'s runs', async () => {
     const repo = createWorkflowRepository({
-      multiTenant: { tenantField: 'context.tenantId', strict: true },
+      tenant: { tenantField: 'context.tenantId', required: true },
     });
 
     await seed([
@@ -171,7 +171,7 @@ describe('Bulk primitives + tenantFilterPlugin', () => {
 
   it('rejects bulk operations without tenantId in strict mode', async () => {
     const repo = createWorkflowRepository({
-      multiTenant: { tenantField: 'context.tenantId', strict: true },
+      tenant: { tenantField: 'context.tenantId', required: true },
     });
 
     await seed([makeRun({ _id: 'a1', status: 'running', context: { tenantId: 'a' } })]);
@@ -251,7 +251,7 @@ describe('hasConcurrencyDrafts', () => {
 describe('tenantFilterPlugin hook priority', () => {
   it('injects tenant scope before lower-priority listeners observe the context', async () => {
     const repo = createWorkflowRepository({
-      multiTenant: { tenantField: 'context.tenantId', strict: true },
+      tenant: { tenantField: 'context.tenantId', required: true },
     });
 
     await seed([

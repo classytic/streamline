@@ -1,21 +1,75 @@
-MIT License
+Classytic Source-Available License (Community & Commercial), Version 1.0
 
-Copyright (c) 2025 Classytic
+Copyright (c) 2026 Classytic LLC. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software is source-available, not open source. Please read this License
+before using it.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. DEFINITIONS
+   "Software" means the contents of this package and any accompanying source
+   code, object code, or documentation, in any form.
+   "Licensor" means Classytic LLC, a limited liability company organized in the
+   United States.
+   "You" means the individual or legal entity exercising rights under this
+   License.
+   "Evaluation Use" means use for evaluation, development, testing,
+   experimentation, or internal non-commercial purposes only.
+   "Production Use" means any use of the Software that is live, commercial,
+   revenue-generating, or customer-facing, or any use other than Evaluation Use.
+   "Commercial License" means a separate written agreement executed with
+   Licensor that grants Production Use rights.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. OWNERSHIP
+   The Software is licensed, not sold. Licensor retains all right, title, and
+   interest in and to the Software, including all intellectual property rights.
+   All rights not expressly granted in this License are reserved by Licensor.
+
+3. EVALUATION GRANT
+   Subject to Your compliance with this License, Licensor grants You a
+   worldwide, royalty-free, non-exclusive, non-transferable, revocable license
+   to download, install, run, and modify the Software solely for Evaluation Use.
+
+4. PRODUCTION USE REQUIRES A COMMERCIAL LICENSE
+   Production Use of the Software is NOT permitted under this License and
+   requires a Commercial License from Licensor. A Commercial License may be
+   granted at Licensor's discretion, with or without a fee, and may confer
+   perpetual, irrevocable, and transferable Production Use rights as set out in
+   that agreement. Contact licensing@classytic.com to obtain one.
+
+5. RESTRICTIONS
+   You may not:
+   (a) make any Production Use of the Software without a Commercial License;
+   (b) redistribute, resell, rent, sublicense, or otherwise make the Software
+       (in whole or in part, original or modified) available to third parties as
+       a stand-alone product, framework, library, or hosted/managed service that
+       competes with the Software or with Licensor;
+   (c) remove, obscure, or alter any copyright, license, or attribution notice.
+
+6. FEEDBACK AND CONTRIBUTIONS
+   Any feedback, suggestions, or contributions You provide relating to the
+   Software may be used by Licensor for any purpose without obligation to You.
+
+7. TERMINATION
+   This License and the Evaluation Grant terminate automatically if You breach
+   any term. Upon termination You must cease all use of the Software and destroy
+   all copies in Your possession. Rights under a Commercial License are governed
+   by that agreement's own terms and survive termination of this License to the
+   extent stated there.
+
+8. DISCLAIMER OF WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+9. LIMITATION OF LIABILITY
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL LICENSOR BE LIABLE
+   FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+   TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE
+   OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+10. GOVERNING LAW
+   This License is governed by the laws of the State of Delaware, United States,
+   without regard to its conflict-of-laws principles. (Adjust to Your LLC's state
+   of formation.)
+
+For commercial licensing, contact: licensing@classytic.com

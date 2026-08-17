@@ -232,7 +232,7 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
 
   it('throttle path forwards tenantId through count, nextSlot, and create probes', async () => {
     const container = createContainer({
-      repository: { multiTenant: { tenantField: 'context.tenantId', strict: true } },
+      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
     });
     const wf = makeThrottleWorkflow('throttle-tenant-prop', {
       limit: 1,
@@ -256,7 +256,7 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
 
   it('debounce bump path forwards tenantId to the atomic findOneAndUpdate', async () => {
     const container = createContainer({
-      repository: { multiTenant: { tenantField: 'context.tenantId', strict: true } },
+      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
     });
     const wf = makeDebounceWorkflow('debounce-tenant-prop', {
       windowMs: 30_000,
@@ -277,7 +277,7 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
 
   it('concurrency.limit path forwards tenantId to countActiveByConcurrencyKey', async () => {
     const container = createContainer({
-      repository: { multiTenant: { tenantField: 'context.tenantId', strict: true } },
+      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
     });
     const wf = createWorkflow<{ userId: string }, { userId: string }>(
       'concurrency-tenant-prop',
@@ -305,7 +305,7 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
     // tenantId" inside the engine's promoteConcurrencyDrafts and the
     // scheduler's poll loop, freezing queued drafts in strict-tenant mode.
     const container = createContainer({
-      repository: { multiTenant: { tenantField: 'context.tenantId', strict: true } },
+      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
     });
     const wf = createWorkflow<{ userId: string }, { userId: string }>(
       'concurrency-promote-strict',
@@ -337,7 +337,7 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
 
   it('throws cleanly when strict mode is missing tenantId (no silent cross-tenant write)', async () => {
     const container = createContainer({
-      repository: { multiTenant: { tenantField: 'context.tenantId', strict: true } },
+      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
     });
     const wf = makeThrottleWorkflow('throttle-strict-fail', {
       limit: 1,

@@ -33,7 +33,7 @@ import {
   ErrorCodeHierarchical,
   type Workflow,
 } from '../../src/index.js';
-import { WorkflowConcurrencyCounterModel } from '../../src/storage/concurrency-counter.model.js';
+import { WorkflowConcurrencyCounterModel } from '../../src/storage/models.js';
 import { workflowConcurrencyCounterRepository } from '../../src/storage/concurrency-counter.repository.js';
 import { useTestDb } from '../helpers/lifecycle.js';
 

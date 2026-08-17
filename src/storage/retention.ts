@@ -13,7 +13,7 @@
  *    `{ <tenantField>: 1, workflowId: 1, createdAt: -1 }` so org-scoped
  *    list queries hit a covering index instead of fanning out across
  *    every tenant. Built automatically when the repository was
- *    constructed with `multiTenant.tenantField`. PACKAGE_RULES §33
+ *    constructed with `tenant.tenantField`. PACKAGE_RULES §33
  *    (scope-field prefix on compound indexes) made literal.
  *
  * 3. **Stale-run sweep** — the scheduler ships stale-recovery (re-exec
@@ -38,7 +38,6 @@ import type { WorkflowEventBus } from '../core/events.js';
 import { TERMINAL_RUN_STATUSES } from '../core/status.js';
 import { toError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
-import { WorkflowRunModel } from './run.model.js';
 import type { WorkflowRunRepository } from './run.repository.js';
 
 // ============================================================================
@@ -69,7 +68,7 @@ export interface RetentionOptions {
 
   /**
    * Build the tenant-prefixed compound index when the repository was
-   * constructed with `multiTenant.tenantField`. Index shape:
+   * constructed with `tenant.tenantField`. Index shape:
    * `{ <tenantField>: 1, workflowId: 1, createdAt: -1 }` — covers the
    * canonical "list this org's recent runs of workflow X" query without
    * a cross-tenant scan.
@@ -146,23 +145,64 @@ const TERMINAL_RUNS_TTL_INDEX_NAME = 'streamline_terminal_runs_ttl';
 const TENANT_WORKFLOW_RECENT_INDEX_NAME = 'streamline_tenant_workflow_recent';
 
 /**
- * Idempotently build the retention indexes on `workflow_runs`.
+ * Legacy single-field idempotency index name (pre-2.9). Streamline ≤2.8 built
+ * `WorkflowRunSchema.index({ idempotencyKey: 1 }, { unique: true, … })`, which
+ * Mongoose auto-named `idempotencyKey_1`. 2.9 replaced it with a TENANT-SCOPED
+ * compound partial-unique index (`{ <tenantField>: 1, idempotencyKey: 1 }`),
+ * so the legacy index must be dropped or it keeps enforcing GLOBAL uniqueness
+ * and rejects the same key across two tenants.
+ */
+const LEGACY_IDEMPOTENCY_INDEX_NAME = 'idempotencyKey_1';
+
+/**
+ * Idempotently build ALL of streamline's indexes on `workflow_runs` — the
+ * deploy-time index-sync helper (mirrors the kernel `syncIndexes()` convention).
  *
- * Safe to call repeatedly — already-built indexes are no-ops, and a
- * `terminalRunsTtlSeconds` change between calls drops + recreates the
- * TTL index (Mongo refuses to mutate `expireAfterSeconds` in place via
- * `createIndex`).
+ * Does three things, each idempotent:
+ *   1. **Migration** — drops the legacy `idempotencyKey_1` unique index if
+ *      present (pre-2.9 global idempotency), so it can't shadow the new
+ *      tenant-scoped compound. No-op on a fresh DB or once dropped.
+ *   2. **Schema indexes** — builds the schema-defined indexes (compound
+ *      partial-unique idempotency, status/heartbeat, …) via the model's
+ *      NON-destructive `createIndexes()` — never drops host-added indexes
+ *      (same discipline as the order kernel's `syncIndexes()`).
+ *   3. **Retention extras** — the terminal-runs TTL (when
+ *      `terminalRunsTtlSeconds` is set) and the tenant-prefixed compound
+ *      (when the repository is multi-tenant).
  *
- * Must be called AFTER `mongoose.connect(...)`. The container method of
- * the same name resolves the underlying `WorkflowRunModel` for the
- * caller; this lower-level export is for hosts that want to call it
- * directly from a deploy script (PACKAGE_RULES §32).
+ * A `terminalRunsTtlSeconds` change between calls drops + recreates the TTL
+ * index (Mongo refuses to mutate `expireAfterSeconds` in place).
+ *
+ * Must be called AFTER `mongoose.connect(...)` / the connection is open. The
+ * container method resolves the underlying model for the caller; this
+ * lower-level export is for hosts that want to call it directly from a deploy
+ * script (PACKAGE_RULES §32).
  */
 export async function syncRetentionIndexes(
   repository: WorkflowRunRepository,
   options: RetentionOptions,
 ): Promise<void> {
-  const collection = WorkflowRunModel.collection;
+  // Use the repository's OWN bound model — indexes must land on the same
+  // connection/collection the repo writes to (matters when the container binds
+  // a per-tenant-field model on a custom connection).
+  const collection = repository.runModel.collection;
+
+  // (1) Migration: drop the pre-2.9 global-unique idempotency index so the
+  // tenant-scoped compound can take over. Best-effort — `IndexNotFound` (27)
+  // is the fresh-DB / already-migrated case.
+  try {
+    await collection.dropIndex(LEGACY_IDEMPOTENCY_INDEX_NAME);
+    logger.info(
+      `[streamline] dropped legacy '${LEGACY_IDEMPOTENCY_INDEX_NAME}' index — idempotency is now tenant-scoped`,
+    );
+  } catch (err) {
+    const code = (err as { code?: number }).code;
+    if (code !== 27) throw err;
+  }
+
+  // (2) Build the schema-defined indexes (incl. the tenant-scoped compound
+  // idempotency index) non-destructively.
+  await repository.runModel.createIndexes();
 
   if (options.terminalRunsTtlSeconds && options.terminalRunsTtlSeconds > 0) {
     await ensureIndex(

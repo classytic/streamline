@@ -13,7 +13,7 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import { WorkflowEngine } from '../../src/execution/engine.js';
 import { SmartScheduler } from '../../src/execution/smart-scheduler.js';
 import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import { createContainer } from '../../src/core/container.js';
 import type { WorkflowDefinition, WorkflowHandlers } from '../../src/core/types.js';
 

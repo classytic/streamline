@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import mongoose from 'mongoose';
 import { createWorkflow } from '../../src/index.js';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import { workflowCache } from '../../src/storage/cache.js';
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test';

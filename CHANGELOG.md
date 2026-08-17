@@ -6,6 +6,96 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 2.9.0 - 2026-07-29
+
+### Security — multi-tenant isolation on the workflow control API
+
+- **The control API now enforces tenant ownership, not just `start()`.** `get`,
+  `execute`, `resume`, `cancel`, `pause`, `resumeOperator`, `rewindTo`,
+  `waitFor`, and the progress/metrics readers accept `{ tenantId }` /
+  `{ bypassTenant }` and scope the INITIAL lookup to the caller's tenant — so
+  possession of another tenant's `runId` can no longer read or control that run
+  (a foreign runId reads as not-found). Ownership is established with a
+  tenant-scoped read BEFORE the engine's `_id`-scoped `bypassTenant` machinery
+  runs. The run cache (keyed globally by `runId`) is now tenant-validated, so a
+  cached cross-tenant hit is never returned. Internal engine-to-engine calls
+  (start→execute, scheduler) are unaffected. Regression:
+  `test/integration/tenant-isolation.test.ts`.
+- **Idempotency keys are now unique PER TENANT.** The partial unique index was
+  `{ idempotencyKey }` (global) while the lookup was tenant-scoped — so two
+  tenants using the same ordinary key collided with `E11000`, and the
+  tenant-scoped recovery lookup couldn't see the other tenant's run and
+  rethrew. The index is now COMPOUND `{ [tenantField], idempotencyKey }`
+  (tenant-field-aware via `defineStreamlineModels({ tenantField })`, default
+  `context.tenantId`); single-tenant runs share the `null` bucket so their keys
+  stay globally unique. **Upgrade note:** `container.syncRetentionIndexes()` now
+  DROPS the legacy `idempotencyKey_1` and builds the compound one for you — call
+  it once after deploying 2.9.0 (it runs even without `retention` configured). If
+  you sync indexes by hand, drop `idempotencyKey_1` explicitly first (Mongoose's
+  non-destructive `createIndexes()` won't remove it; destructive `syncIndexes()`
+  does).
+
+### Fixed
+
+- **`executeParallel({ timeout })` no longer leaks a timer per task.** Each task
+  raced a `setTimeout` that was never cleared on success/failure — a batch of
+  fast tasks with long timeouts left many live handles, keeping the event loop
+  busy and delaying process shutdown. The timer is now cleared in `finally`.
+
+### Added
+- **`createContainer({ connection })` — auto-binds the correctly-indexed model set.**
+  Pass a mongoose `Connection` and the container binds streamline's FULL model
+  set (run + concurrency-counter) on it with the configured
+  `multiTenant.tenantField` — so the idempotency compound index, retention
+  indexes, and strict-concurrency reconciliation are all connection-consistent
+  WITHOUT the host hand-building a model. This is the clean way to run a custom
+  `tenantField`: `createContainer({ connection, repository: { multiTenant: { tenantField } } })`
+  — no separate `defineStreamlineModels().bind()` + `repository.model`. Passing a
+  `repository` INSTANCE (not a config) ignores `connection` (the instance owns its
+  model). Regression: `test/integration/tenant-custom-field.test.ts`.
+- **`syncRetentionIndexes()` is now the full deploy-time index helper.** Beyond the
+  TTL + tenant compound, it drops the legacy `idempotencyKey_1` (pre-2.9 migration)
+  and builds the schema-defined indexes non-destructively (kernel `syncIndexes()`
+  convention). Runs even when `retention` is unset, so it's safe to call
+  unconditionally from a deploy script after connecting.
+
+### Changed
+- **License:** relicensed from MIT to the **Classytic Source-Available License**. Evaluation/development remains free; production use now requires a commercial license from Classytic LLC. See `LICENSE`. (Shipped as a MINOR — the license is not an API break; `3.0.0` is reserved for the Mongoose 10 migration.)
+- **Custom `multiTenant.tenantField` now requires (and accepts) a matching model.**
+  `WorkflowRepositoryConfig` gains `model?` — a `WorkflowRun` model you bound
+  with your tenant field (`defineStreamlineModels({ tenantField }).bind(connection).WorkflowRun`).
+  The repository uses it instead of the eagerly-bound default (whose idempotency
+  index is built for `context.tenantId`). A custom `tenantField` supplied WITHOUT
+  a matching `model` now emits a one-time WARNING (idempotency keys won't be
+  tenant-isolated) instead of silently doing so — tenant filtering/stamping still
+  work, so it's a warning, not a hard failure. The default field
+  (`context.tenantId`) is unchanged — no model needed.
+- **Peer floors raised — `@classytic/mongokit >=3.30.0` and `@classytic/repo-core >=0.20.0`.**
+  Streamline's model layer now uses mongokit's `defineModels` / `ModelBlueprint`
+  kernel-construction API (`defineStreamlineModels().bind(connection)`,
+  STANDARDIZATION-PLAN §5), which ships in mongokit ≥3.30; mongokit 3.30 in turn
+  requires repo-core ≥0.20. The previous permissive floors (`mongokit >=3.24.0`,
+  `repo-core >=0.5.0`) were internally inconsistent (mongokit 3.24 already needs
+  repo-core ≥0.14) and predated the `defineModels` capability. Validated green
+  against mongokit 3.30.0 / repo-core 0.20.0.
+
+## [2.8.3] - 2026-07-23 — dispose() detaches the bus→transport bridge
+
+### Fixed — container bridge listeners leaked on the global event bus
+
+`createContainer()` wires `bridgeBusToTransport(eventBus, eventTransport)`
+but discarded the unsubscribe function it returns, and `dispose()` only
+stopped the stale-run sweeper. For containers created with
+`eventBus: 'global'` the bridge attaches one listener per legacy event name
+(~23) to the process-wide `globalEventBus` singleton — so every
+create/dispose cycle (e.g. a test suite booting a fresh app per scenario)
+permanently grew the bus until Node emitted `MaxListenersExceededWarning`.
+
+`container.dispose()` now also detaches the bridge. Still idempotent —
+`EventEmitter.off` on an already-removed listener is a no-op. Hosts that
+already call `dispose()` on shutdown (arc's `streamlinePlugin` onClose does)
+get the fix with no code change.
+
 ## [2.8.2] - 2026-07-19 — ESR-correct scheduler indexes, mongokit ≥3.24.0
 
 ### Changed — `WorkflowRunSchema` scheduler indexes corrected for ESR

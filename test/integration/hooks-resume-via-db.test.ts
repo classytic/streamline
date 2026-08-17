@@ -22,7 +22,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { hookRegistry } from '../../src/execution/engine.js';
-import { WorkflowConcurrencyCounterModel } from '../../src/storage/concurrency-counter.model.js';
+import { WorkflowConcurrencyCounterModel } from '../../src/storage/models.js';
 import { createWorkflowRepository } from '../../src/storage/run.repository.js';
 import { createContainer, createHook, createWorkflow, resumeHook } from '../../src/index.js';
 import { useTestDb } from '../helpers/lifecycle.js';

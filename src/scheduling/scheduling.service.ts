@@ -33,7 +33,7 @@
  * @example Multi-Tenant Scheduling
  * ```typescript
  * const service = new SchedulingService(workflow, handlers, {
- *   multiTenant: {
+ *   tenant: {
  *     tenantField: 'context.tenantId',
  *     strict: true
  *   }
@@ -179,14 +179,14 @@ export interface GetScheduledWorkflowsOptions {
  */
 export interface SchedulingServiceConfig {
   /** Multi-tenant configuration (optional) - shorthand for container.repository config */
-  multiTenant?: TenantFilterOptions;
+  tenant?: boolean | TenantFilterOptions;
 
   /** Auto-execute workflows when ready (default: true) */
   autoExecute?: boolean;
 
   /**
    * Custom container or container options
-   * If provided, multiTenant option is ignored (use container.repository instead)
+   * If provided, tenant option is ignored (use container.repository instead)
    */
   container?: StreamlineContainer | ContainerOptions;
 }
@@ -218,7 +218,7 @@ export class SchedulingService<TContext = Record<string, unknown>> {
     this.timezoneHandler = new TimezoneHandler();
 
     // Create unified container - same repository for scheduling and execution
-    // Priority: explicit container > multiTenant config > default
+    // Priority: explicit container > tenant config > default
     if (config.container) {
       // Check if it's already a StreamlineContainer or ContainerOptions
       if (
@@ -230,10 +230,10 @@ export class SchedulingService<TContext = Record<string, unknown>> {
       } else {
         this.container = createContainer(config.container as ContainerOptions);
       }
-    } else if (config.multiTenant) {
+    } else if (config.tenant) {
       // Create container with multi-tenant repository
       this.container = createContainer({
-        repository: { multiTenant: config.multiTenant },
+        repository: { tenant: config.tenant },
       });
     } else {
       this.container = createContainer();

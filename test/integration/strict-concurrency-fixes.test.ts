@@ -29,7 +29,7 @@ import {
   createWorkflow,
   WorkflowRunModel,
 } from '../../src/index.js';
-import { WorkflowConcurrencyCounterModel } from '../../src/storage/concurrency-counter.model.js';
+import { WorkflowConcurrencyCounterModel } from '../../src/storage/models.js';
 import { workflowRunRepository } from '../../src/storage/run.repository.js';
 import { useTestDb } from '../helpers/lifecycle.js';
 

@@ -1,5 +1,7 @@
 # @classytic/streamline
 
+[![Sponsor](https://img.shields.io/github/sponsors/classytic?style=flat-square&label=Sponsor&logo=GitHub&color=EA4AAA)](https://github.com/sponsors/classytic)
+
 > MongoDB-native durable workflow engine. Sleep / wait / retry / parallel / human-in-the-loop / event triggers / idempotency / concurrency / crash recovery — zero infrastructure beyond MongoDB.
 
 ```
@@ -425,10 +427,22 @@ tenant-prefixed compound multi-tenant deployments need, and a sweep that
 terminates runs whose worker crashed.
 
 ```typescript
-import { createContainer } from '@classytic/streamline';
+import { createContainer, defineStreamlineModels } from '@classytic/streamline';
+
+// A CUSTOM tenant field must be baked into the model too — the idempotency
+// unique index is COMPOUND on the tenant field, so keys are unique per-tenant.
+// Build the model with the field and pass it as `repository.model`; the default
+// field (`context.tenantId`) needs no model. A custom field WITHOUT a matching
+// model still works for filtering/stamping but WARNS that idempotency keys
+// won't be tenant-isolated — pass the model if you use idempotency keys.
+const tenantField = 'context.organizationId';
+const models = defineStreamlineModels({ tenantField }).bind(mongoose.connection);
 
 const container = createContainer({
-  repository: { multiTenant: { tenantField: 'context.organizationId', strict: true } },
+  repository: {
+    multiTenant: { tenantField, strict: true },
+    model: models.WorkflowRun,
+  },
   retention: {
     terminalRunsTtlSeconds: 30 * 24 * 60 * 60,   // GC done/failed/cancelled after 30d
     staleHeartbeatThresholdMs: 30 * 60 * 1000,   // mark as failed after 30 min no heartbeat
@@ -444,6 +458,41 @@ await container.syncRetentionIndexes();          // idempotent, drop+rebuild on 
 // Graceful shutdown — sweeper timer is unref()'d, so this is optional:
 container.dispose();
 ```
+
+> **Simpler: let the container bind the model.** Instead of building the model
+> yourself and passing `repository.model`, hand `createContainer` your
+> `connection` — it binds streamline's whole model set (run + concurrency
+> counter) on that connection with your `tenantField`, so every index and the
+> strict-concurrency reconciler are connection-consistent automatically:
+>
+> ```ts
+> const container = createContainer({
+>   connection: mongoose.connection,                       // or a createConnection() handle
+>   repository: { multiTenant: { tenantField: 'context.organizationId', strict: true } },
+> });
+> await container.syncRetentionIndexes();  // builds the org-scoped compound on that connection
+> ```
+
+> **Upgrading from ≤2.8.x — `syncRetentionIndexes()` handles the migration.**
+> Earlier versions shipped a GLOBAL unique index `idempotencyKey_1`. 2.9.0
+> replaces it with a per-tenant COMPOUND index. `container.syncRetentionIndexes()`
+> now **drops the legacy `idempotencyKey_1` and builds the compound one for you**
+> — call it once after deploying 2.9.0 (it runs even without `retention`
+> configured). No manual step needed:
+>
+> ```ts
+> await mongoose.connect(uri);
+> await container.syncRetentionIndexes();   // drops idempotencyKey_1 + builds the compound
+> ```
+>
+> If you sync indexes yourself instead, drop the legacy index explicitly before
+> building the schema indexes (Mongoose's non-destructive `createIndexes()` won't
+> remove it):
+>
+> ```js
+> db.workflow_runs.dropIndex('idempotencyKey_1');   // ignore "index not found"
+> // WorkflowRunModel.syncIndexes() (destructive) also drops it automatically.
+> ```
 
 | Knob                          | Default | Effect                                                                                         |
 | ----------------------------- | ------- | ---------------------------------------------------------------------------------------------- |
@@ -741,3 +790,10 @@ See [CHANGELOG.md](./CHANGELOG.md) for the full list.
 ## License
 
 MIT · Issues + PRs welcome at [github.com/classytic/streamline](https://github.com/classytic/streamline)
+
+
+## Trademark
+
+The code is under the Classytic Source-Available License. **"Classytic", "arc", and the logos are trademarks of
+Classytic LLC** and are **not** licensed under it — see [TRADEMARK.md](TRADEMARK.md).
+Forks must be renamed; the license covers the code, not the brand.

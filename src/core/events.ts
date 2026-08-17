@@ -36,7 +36,7 @@ export interface StepRetryPayload extends StepEventPayload {
  * anything a later step depends on — durable data belongs in the step
  * output / checkpoint.
  */
-export interface StepStreamPayload extends StepEventPayload {
+interface StepStreamPayload extends StepEventPayload {
   /** Monotonic per-step-execution frame counter (0-based; resets on retry). */
   seq: number;
   /** The host-supplied frame value. */

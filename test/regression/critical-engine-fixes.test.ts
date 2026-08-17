@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import mongoose from 'mongoose';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import { workflowRunRepository } from '../../src/storage/run.repository.js';
 import { SchedulingService } from '../../src/scheduling/scheduling.service.js';
 import { createWorkflow, WorkflowEngine, createContainer } from '../../src/index.js';

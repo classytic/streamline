@@ -19,25 +19,25 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { createContainer } from '../../src/core/container.js';
 import { WorkflowEventBus, type WorkflowFailedPayload } from '../../src/core/events.js';
 import {
   isTerminalState,
   RUN_STATUS_VALUES,
   TERMINAL_RUN_STATUSES,
 } from '../../src/core/status.js';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import type { WorkflowRun } from '../../src/core/types.js';
 import {
   RETENTION_DEFAULTS,
-  StaleRunSweeper,
   resolveSweeperConfig,
+  StaleRunSweeper,
   syncRetentionIndexes,
 } from '../../src/storage/retention.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import {
   createWorkflowRepository,
   type WorkflowRunRepository,
 } from '../../src/storage/run.repository.js';
-import { createContainer } from '../../src/core/container.js';
-import type { WorkflowRun } from '../../src/core/types.js';
 import { cleanupTestDB, setupTestDB, teardownTestDB } from '../utils/setup.js';
 
 beforeAll(setupTestDB);
@@ -104,9 +104,8 @@ describe('syncRetentionIndexes — TTL on terminal runs', () => {
 
     const indexes = await WorkflowRunModel.collection.indexes();
     const ttl = indexes.find((ix) => ix.name === 'streamline_terminal_runs_ttl');
-    const filterStatuses = (
-      ttl?.partialFilterExpression as { status: { $in: string[] } }
-    ).status.$in;
+    const filterStatuses = (ttl?.partialFilterExpression as { status: { $in: string[] } }).status
+      .$in;
 
     // Exactly the statuses `isTerminalState` classifies terminal — derived
     // from the same `TERMINAL_RUN_STATUSES` source, so a new terminal
@@ -156,7 +155,7 @@ describe('syncRetentionIndexes — tenant-prefixed compound', () => {
 
   it('builds tenant-prefixed compound when repo is multi-tenant', async () => {
     const repo = createWorkflowRepository({
-      multiTenant: { tenantField: 'context.organizationId', strict: false },
+      tenant: { tenantField: 'context.organizationId', required: false },
     });
 
     await syncRetentionIndexes(repo, {});
@@ -182,7 +181,7 @@ describe('syncRetentionIndexes — tenant-prefixed compound', () => {
 
   it('honours `multiTenantIndexes: false` opt-out', async () => {
     const repo = createWorkflowRepository({
-      multiTenant: { tenantField: 'context.tenantId', strict: false },
+      tenant: { tenantField: 'context.tenantId', required: false },
     });
     await syncRetentionIndexes(repo, { multiTenantIndexes: false });
 
@@ -392,11 +391,28 @@ describe('StaleRunSweeper — dead-letter cap', () => {
 // ---------------------------------------------------------------------------
 
 describe('createContainer — retention block wiring', () => {
-  it('exposes syncRetentionIndexes as a no-op when retention is unset', async () => {
-    const container = createContainer();
+  it('syncRetentionIndexes still builds base indexes + migrates when retention is unset', async () => {
+    // Simulate a pre-2.9 deployment: the legacy global-unique idempotency index.
+    await WorkflowRunModel.collection.createIndex(
+      { idempotencyKey: 1 },
+      { name: 'idempotencyKey_1', unique: true, sparse: true },
+    );
+
+    const container = createContainer(); // no retention configured
     await expect(container.syncRetentionIndexes()).resolves.toBeUndefined();
+
+    const indexes = await WorkflowRunModel.collection.indexes();
+    // Legacy single-field unique index is dropped…
+    expect(indexes.find((ix) => ix.name === 'idempotencyKey_1')).toBeUndefined();
+    // …and replaced by the tenant-scoped compound partial-unique index.
+    const compound = indexes.find(
+      (ix) => ix.key?.['context.tenantId'] === 1 && ix.key?.idempotencyKey === 1,
+    );
+    expect(compound?.unique).toBe(true);
+
     expect(container.staleRunSweeper).toBeUndefined();
     container.dispose();
+    await WorkflowRunModel.syncIndexes(); // restore clean schema state for later tests
   });
 
   it('auto-starts the sweeper when staleHeartbeatThresholdMs is set', () => {

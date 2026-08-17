@@ -7,15 +7,24 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import mongoose from 'mongoose';
 import { Repository } from '@classytic/mongokit';
-import { WorkflowRunModel } from '../../src/storage/run.model.js';
+import { WorkflowRunModel } from '../../src/storage/models.js';
 import { createWorkflowRepository } from '../../src/storage/run.repository.js';
 import {
   tenantFilterPlugin,
   singleTenantPlugin,
+  resolveTenantFilterOptions,
   type TenantFilterOptions,
 } from '../../src/plugins/tenant-filter.plugin.js';
 
 describe('TenantFilterPlugin', () => {
+  it('normalizes canonical boolean tenant configuration', () => {
+    expect(resolveTenantFilterOptions(false)).toBeUndefined();
+    expect(resolveTenantFilterOptions(true)).toEqual({});
+    expect(resolveTenantFilterOptions({ tenantField: 'context.organizationId' })).toEqual({
+      tenantField: 'context.organizationId',
+    });
+  });
+
   beforeAll(async () => {
     if (mongoose.connection.readyState === 0) {
       await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test');
@@ -35,7 +44,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -49,7 +58,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -103,7 +112,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -149,7 +158,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: false,
+          required: false,
         }),
       ]);
 
@@ -174,7 +183,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: false,
+          required: false,
         }),
       ]);
 
@@ -218,7 +227,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
           allowBypass: true, // Default
         }),
       ]);
@@ -248,7 +257,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
           allowBypass: false,
         }),
       ]);
@@ -268,7 +277,7 @@ describe('TenantFilterPlugin', () => {
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           staticTenantId: 'static-org-123',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -345,7 +354,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -373,7 +382,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'meta.orgId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -404,7 +413,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -430,7 +439,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -454,7 +463,7 @@ describe('TenantFilterPlugin', () => {
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           staticTenantId: 'auto-inject-org',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -479,7 +488,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -513,7 +522,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -543,7 +552,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -559,7 +568,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -604,7 +613,7 @@ describe('TenantFilterPlugin', () => {
       const repo = new Repository(WorkflowRunModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
-          strict: true,
+          required: true,
         }),
       ]);
 
@@ -651,7 +660,7 @@ describe('TenantFilterPlugin', () => {
   describe('Derived Hook Coverage (2.7): cursor / claimVersion / getOrCreate', () => {
     const strictOptions: TenantFilterOptions = {
       tenantField: 'context.tenantId',
-      strict: true,
+      required: true,
     };
 
     const seedRun = (id: string, tenantId: string, extra: Record<string, unknown> = {}) =>
@@ -700,7 +709,7 @@ describe('TenantFilterPlugin', () => {
       });
 
       it('cursorStaleRunning should be tenant-scoped and strict-throwing', async () => {
-        const repo = createWorkflowRepository({ multiTenant: strictOptions });
+        const repo = createWorkflowRepository({ tenant: strictOptions });
         const staleHeartbeat = new Date(Date.now() - 60 * 60 * 1000);
         await seedRun('run-stale-a', 'stale-tenant-a', { lastHeartbeat: staleHeartbeat });
         await seedRun('run-stale-b', 'stale-tenant-b', { lastHeartbeat: staleHeartbeat });

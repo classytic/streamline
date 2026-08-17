@@ -1,6 +1,6 @@
 {
   "name": "@classytic/streamline",
-  "version": "2.8.2",
+  "version": "2.9.0",
   "description": "MongoDB-native durable workflow orchestration engine. Like Temporal but simpler - supports sleep, wait, retry, parallel execution, human-in-the-loop, and crash recovery. Perfect for payment gateways, approval flows, and scheduled tasks.",
   "type": "module",
   "sideEffects": false,
@@ -81,19 +81,19 @@
   "contributors": [
     "Sadman Chowdhury (https://github.com/siam923)"
   ],
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
-    "url": "https://github.com/classytic/streamline.git"
+    "url": "git+https://github.com/classytic/streamline.git"
   },
   "homepage": "https://github.com/classytic/streamline#readme",
   "bugs": {
     "url": "https://github.com/classytic/streamline/issues"
   },
   "peerDependencies": {
-    "@classytic/mongokit": ">=3.24.0",
-    "@classytic/primitives": ">=0.6.0",
-    "@classytic/repo-core": ">=0.5.0",
+    "@classytic/mongokit": ">=3.33.0",
+    "@classytic/primitives": ">=0.23.0",
+    "@classytic/repo-core": ">=0.24.0",
     "@opentelemetry/api": ">=1.0.0",
     "mongoose": ">=9.4.1"
   },
@@ -103,11 +103,12 @@
     }
   },
   "devDependencies": {
+    "@arethetypeswrong/core": "^0.18.5",
     "@biomejs/biome": "^2.4.10",
     "@classytic/dev-tools": "^0.2.0",
-    "@classytic/mongokit": "^3.24.0",
-    "@classytic/primitives": "^0.9.1",
-    "@classytic/repo-core": "^0.7.0",
+    "@classytic/mongokit": "^3.33.0",
+    "@classytic/primitives": "^0.23.0",
+    "@classytic/repo-core": "^0.24.0",
     "@opentelemetry/api": "^1.9.0",
     "@types/luxon": "^3.7.1",
     "@types/node": "^25.0.0",
@@ -116,8 +117,9 @@
     "luxon": "^3.7.2",
     "mongodb-memory-server": "^11.0.1",
     "mongoose": "^9.4.1",
+    "publint": "^0.3.23",
     "semver": "^7.7.3",
-    "tsdown": "^0.21.7",
+    "tsdown": "^0.22.14",
     "typescript": "^5.0.0",
     "vitest": "^4.0.0"
   },

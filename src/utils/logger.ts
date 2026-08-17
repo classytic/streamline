@@ -7,7 +7,7 @@
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
 
-export interface LogContext {
+interface LogContext {
   runId?: string;
   stepId?: string;
   workflowId?: string;

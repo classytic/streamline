@@ -63,7 +63,7 @@
  *
  * // Create multi-tenant repository
  * const repo = new Repository(WorkflowRunModel, [
- *   tenantFilterPlugin({ tenantField: 'context.tenantId', strict: true })
+ *   tenantFilterPlugin({ tenantField: 'context.tenantId', required: true })
  * ]);
  *
  * // All queries automatically filtered by tenantId
@@ -163,7 +163,7 @@ export interface TenantFilterOptions {
    *
    * @default true
    */
-  strict?: boolean | undefined;
+  required?: boolean | undefined;
 
   /**
    * Enable bypass capability - allows queries to bypass tenant filter
@@ -172,6 +172,14 @@ export interface TenantFilterOptions {
    * @default true (allows bypassTenant: true for admin operations)
    */
   allowBypass?: boolean | undefined;
+}
+
+/** Normalize the public boolean-or-config tenant input once. */
+export function resolveTenantFilterOptions(
+  input: boolean | TenantFilterOptions | undefined,
+): TenantFilterOptions | undefined {
+  if (input === false || input === undefined) return undefined;
+  return input === true ? {} : input;
 }
 
 /**
@@ -256,7 +264,7 @@ const BULK_FILTER_KEYS = [
 export function tenantFilterPlugin(options: TenantFilterOptions = {}): Plugin {
   const tenantField = options.tenantField || 'context.tenantId';
   const staticTenantId = options.staticTenantId;
-  const strict = options.strict !== false; // Default: true
+  const strict = options.required !== false; // Default: true
   const allowBypass = options.allowBypass !== false; // Default: true
 
   return {
@@ -486,7 +494,7 @@ export function singleTenantPlugin(
   return tenantFilterPlugin({
     tenantField,
     staticTenantId: tenantId,
-    strict: true,
+    required: true,
     allowBypass: false, // Single-tenant mode should not allow bypasses
   });
 }

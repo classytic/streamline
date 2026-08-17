@@ -41,7 +41,7 @@ import type {
   WorkflowDefinition,
   WorkflowRun,
 } from '../core/types.js';
-import { WorkflowEngine } from '../execution/engine.js';
+import { type ControlOptions, WorkflowEngine } from '../execution/engine.js';
 import type { SmartSchedulerConfig } from '../execution/smart-scheduler.js';
 import { makeCounterId } from '../storage/concurrency-counter.model.js';
 import { ConcurrencyLimitReachedError, WorkflowNotFoundError } from '../utils/errors.js';
@@ -473,7 +473,7 @@ export interface WorkflowConfig<TContext, TInput = unknown, TOutputs = Record<st
    *
    * **Multi-tenant note.** Auto-started runs flow through the same
    * `start()` path as direct invocations, so the same tenant-context
-   * rules apply: in `multiTenant.strict: true` mode the start throws
+   * rules apply: in `tenant.required: true` mode the start throws
    * `Missing tenantId` unless context is provided. Three ways to wire
    * tenant context for triggered workflows:
    *
@@ -539,7 +539,7 @@ export interface StartOptions {
   priority?: number;
   /**
    * Tenant identifier — required when the container's repository is
-   * configured with `multiTenant.strict: true`. Forwarded to:
+   * configured with `tenant.required: true`. Forwarded to:
    *   - the `create` operation that persists the new run (auto-injected
    *     into the document at the configured `tenantField`)
    *   - the atomic `findOneAndUpdate` for `debounce` bumps
@@ -580,26 +580,59 @@ export interface WaitForOptions {
  */
 export interface Workflow<TContext, TInput = unknown> {
   start: (input: TInput, options?: StartOptions) => Promise<WorkflowRun<TContext>>;
-  get: (runId: string) => Promise<WorkflowRun<TContext> | null>;
-  execute: (runId: string) => Promise<WorkflowRun<TContext>>;
-  resume: (runId: string, payload?: unknown) => Promise<WorkflowRun<TContext>>;
-  /** Cancel a run. `{ reason }` (v2.7) persists on the run + `workflow:cancelled` payload. */
-  cancel: (runId: string, options?: { reason?: string }) => Promise<WorkflowRun<TContext>>;
-  /** Operator-pause a run at the next step boundary. `{ reason }` (v2.7) echoed in `workflow:paused`. */
-  pause: (runId: string, options?: { reason?: string }) => Promise<WorkflowRun<TContext>>;
-  /** Operator-resume a paused run from the same step (v2.7). Symmetric with `pause`. */
-  resumeOperator: (runId: string, options?: { data?: unknown }) => Promise<WorkflowRun<TContext>>;
-  rewindTo: (runId: string, stepId: string) => Promise<WorkflowRun<TContext>>;
-  waitFor: (runId: string, options?: WaitForOptions) => Promise<WorkflowRun<TContext>>;
-  /** Latest queryable progress for one step (v2.7). */
+  /**
+   * Read a run. In multi-tenant strict mode pass `{ tenantId }` (or
+   * `{ bypassTenant: true }`) — a run outside the caller's tenant reads as
+   * `null`, and the cache is tenant-validated so a foreign `runId` can't leak
+   * another tenant's run.
+   */
+  get: (runId: string, control?: ControlOptions) => Promise<WorkflowRun<TContext> | null>;
+  execute: (runId: string, control?: ControlOptions) => Promise<WorkflowRun<TContext>>;
+  resume: (
+    runId: string,
+    payload?: unknown,
+    control?: ControlOptions,
+  ) => Promise<WorkflowRun<TContext>>;
+  /** Cancel a run. `{ reason }` (v2.7) persists on the run + `workflow:cancelled` payload. Tenant-scoped. */
+  cancel: (
+    runId: string,
+    options?: { reason?: string } & ControlOptions,
+  ) => Promise<WorkflowRun<TContext>>;
+  /** Operator-pause a run at the next step boundary. `{ reason }` (v2.7) echoed in `workflow:paused`. Tenant-scoped. */
+  pause: (
+    runId: string,
+    options?: { reason?: string } & ControlOptions,
+  ) => Promise<WorkflowRun<TContext>>;
+  /** Operator-resume a paused run from the same step (v2.7). Symmetric with `pause`. Tenant-scoped. */
+  resumeOperator: (
+    runId: string,
+    options?: { data?: unknown } & ControlOptions,
+  ) => Promise<WorkflowRun<TContext>>;
+  rewindTo: (
+    runId: string,
+    stepId: string,
+    control?: ControlOptions,
+  ) => Promise<WorkflowRun<TContext>>;
+  waitFor: (
+    runId: string,
+    options?: WaitForOptions & ControlOptions,
+  ) => Promise<WorkflowRun<TContext>>;
+  /** Latest queryable progress for one step (v2.7). Tenant-scoped. */
   getStepProgress: (
     runId: string,
     stepId: string,
+    control?: ControlOptions,
   ) => Promise<import('../core/types.js').StepProgress | undefined>;
-  /** Current status + latest progress of every step (v2.7). */
-  getRunProgress: (runId: string) => Promise<import('../core/types.js').RunProgress | null>;
-  /** Aggregated run metrics — durations, attempts, cost (v2.7). */
-  getRunMetrics: (runId: string) => Promise<import('../core/types.js').RunMetrics | null>;
+  /** Current status + latest progress of every step (v2.7). Tenant-scoped. */
+  getRunProgress: (
+    runId: string,
+    control?: ControlOptions,
+  ) => Promise<import('../core/types.js').RunProgress | null>;
+  /** Aggregated run metrics — durations, attempts, cost (v2.7). Tenant-scoped. */
+  getRunMetrics: (
+    runId: string,
+    control?: ControlOptions,
+  ) => Promise<import('../core/types.js').RunMetrics | null>;
   shutdown: () => void;
   definition: WorkflowDefinition<TContext>;
   engine: WorkflowEngine<TContext>;
@@ -889,13 +922,17 @@ export function createWorkflow<
 
   const waitFor = async (
     runId: string,
-    options: WaitForOptions = {},
+    options: WaitForOptions & ControlOptions = {},
   ): Promise<WorkflowRun<TContext>> => {
-    const { pollInterval = 1000, timeout } = options;
+    const { pollInterval = 1000, timeout, tenantId, bypassTenant } = options;
+    const control: ControlOptions = {
+      ...(tenantId !== undefined ? { tenantId } : {}),
+      ...(bypassTenant ? { bypassTenant } : {}),
+    };
     const startTime = Date.now();
 
     while (true) {
-      const run = await engine.get(runId);
+      const run = await engine.get(runId, control);
 
       if (!run) {
         throw new WorkflowNotFoundError(runId);
@@ -1201,17 +1238,39 @@ export function createWorkflow<
 
   return {
     start,
-    get: (runId) => engine.get(runId),
-    execute: (runId) => engine.execute(runId),
-    resume: (runId, payload) => engine.resume(runId, payload),
-    cancel: (runId, options) => engine.cancel(runId, options),
-    pause: (runId, options) => engine.pause(runId, options),
-    resumeOperator: (runId, options) => engine.resumeOperator(runId, options),
-    rewindTo: (runId, stepId) => engine.rewindTo(runId, stepId),
+    // Reads are tenant-scoped directly (cache is tenant-validated inside
+    // `engine.get`; progress/metrics read through the scoped `readRun`).
+    get: (runId, control) => engine.get(runId, control),
+    getStepProgress: (runId, stepId, control) => engine.getStepProgress(runId, stepId, control),
+    getRunProgress: (runId, control) => engine.getRunProgress(runId, control),
+    getRunMetrics: (runId, control) => engine.getRunMetrics(runId, control),
+    // Mutations gate on tenant OWNERSHIP first (a foreign runId reads as
+    // not-found), THEN run the engine's `_id`-scoped bypassTenant machinery.
+    execute: async (runId, control) => {
+      await engine.assertOwnership(runId, control);
+      return engine.execute(runId);
+    },
+    resume: async (runId, payload, control) => {
+      await engine.assertOwnership(runId, control);
+      return engine.resume(runId, payload);
+    },
+    cancel: async (runId, options) => {
+      await engine.assertOwnership(runId, options);
+      return engine.cancel(runId, options);
+    },
+    pause: async (runId, options) => {
+      await engine.assertOwnership(runId, options);
+      return engine.pause(runId, options);
+    },
+    resumeOperator: async (runId, options) => {
+      await engine.assertOwnership(runId, options);
+      return engine.resumeOperator(runId, options);
+    },
+    rewindTo: async (runId, stepId, control) => {
+      await engine.assertOwnership(runId, control);
+      return engine.rewindTo(runId, stepId);
+    },
     waitFor,
-    getStepProgress: (runId, stepId) => engine.getStepProgress(runId, stepId),
-    getRunProgress: (runId) => engine.getRunProgress(runId),
-    getRunMetrics: (runId) => engine.getRunMetrics(runId),
     shutdown: () => {
       // Remove only THIS workflow's trigger listener (safe for shared buses)
       if (config.trigger?.event && triggerListener) {
