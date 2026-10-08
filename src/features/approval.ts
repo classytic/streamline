@@ -49,7 +49,6 @@
  */
 
 import type { StepContext } from '../core/types.js';
-import type { WorkflowRunRepository } from '../storage/run.repository.js';
 import { createHook, resumeHook } from './hooks.js';
 import { getWaitResolution } from './wait-resolution.js';
 
@@ -139,11 +138,12 @@ async function parkOnHook<TContext, TOutputs>(
   });
 }
 
-/** Resume-side option bag shared by {@link approve} / {@link reject}. */
-export interface ApprovalResumeOptions {
-  /** Repository for the DB-fallback resume (multi-tenant / custom container). See {@link resumeHook}. */
-  repository?: WorkflowRunRepository;
-}
+/**
+ * Resume-side options shared by {@link approve} / {@link reject} / {@link answer}
+ * — exactly {@link resumeHook}'s, so `{ container }` (repository + strict-slot
+ * counter on the run's own connection) reaches the DB-fallback path too.
+ */
+export type ApprovalResumeOptions = NonNullable<Parameters<typeof resumeHook>[2]>;
 
 /**
  * Approve a pending request (resume side). Durable across workers/restarts and

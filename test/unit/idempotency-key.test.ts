@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { StepContextImpl } from '../../src/execution/context.js';
 import type { WorkflowEventBus } from '../../src/core/events.js';
 import type { WorkflowRun } from '../../src/core/types.js';
+import { StepContextImpl } from '../../src/execution/context.js';
 import type { WorkflowRunRepository } from '../../src/storage/run.repository.js';
 
 /**

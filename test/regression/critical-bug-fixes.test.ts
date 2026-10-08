@@ -9,34 +9,19 @@
  * 5. Write concern durability
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createContainer,
-  WorkflowRunModel,
-  type SignalStore,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import type { SignalStore } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // Bug #1: Double-claim in scheduler for scheduled workflows
 // ============================================================================
 
 describe('Scheduled workflow execution (double-claim fix)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should execute a scheduled workflow via executeRetry without double-claim', async () => {
-    const workflow = createWorkflow<{ executed: boolean }>('scheduled-exec', {
+    const workflow = env.workflow<{ executed: boolean }>('scheduled-exec', {
       steps: {
         run: async (ctx) => {
           await ctx.set('executed', true);
@@ -44,7 +29,6 @@ describe('Scheduled workflow execution (double-claim fix)', () => {
         },
       },
       context: () => ({ executed: false }),
-      autoExecute: false,
     });
 
     // Create a "draft" workflow with scheduling metadata to simulate a scheduled run
@@ -52,7 +36,7 @@ describe('Scheduled workflow execution (double-claim fix)', () => {
 
     // Manually set it back to draft with scheduling (simulating SchedulingService behavior)
     const pastTime = new Date(Date.now() - 60_000);
-    await WorkflowRunModel.updateOne(
+    await env.runModel.updateOne(
       { _id: run._id },
       {
         $set: {
@@ -65,58 +49,48 @@ describe('Scheduled workflow execution (double-claim fix)', () => {
             isDSTTransition: false,
           },
         },
-      }
+      },
     );
 
     // executeRetry should claim draft→running and execute
     const result = await workflow.engine.executeRetry(run._id);
     expect(result).not.toBeNull();
-    expect(result!.status).toBe('done');
-    expect(result!.context.executed).toBe(true);
-
-    workflow.shutdown();
+    expect(result?.status).toBe('done');
+    expect(result?.context.executed).toBe(true);
   });
 
   it('should not execute a scheduled workflow that is not yet due', async () => {
-    const workflow = createWorkflow('scheduled-not-due', {
+    const workflow = env.workflow('scheduled-not-due', {
       steps: {
         run: async () => 'done',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
 
     // Set to draft with FUTURE scheduling
     const futureTime = new Date(Date.now() + 60 * 60 * 1000);
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      {
-        $set: {
-          status: 'draft',
-          scheduling: {
-            scheduledFor: futureTime.toISOString(),
-            timezone: 'UTC',
-            localTimeDisplay: futureTime.toISOString(),
-            executionTime: futureTime,
-            isDSTTransition: false,
-          },
+    // (runs.update also clears the cache, so the engine reads from DB)
+    await env.runs.update(run._id, {
+      $set: {
+        status: 'draft',
+        scheduling: {
+          scheduledFor: futureTime.toISOString(),
+          timezone: 'UTC',
+          localTimeDisplay: futureTime.toISOString(),
+          executionTime: futureTime,
+          isDSTTransition: false,
         },
-      }
-    );
-
-    // Clear cache so we read from DB
-    workflow.container.cache.delete(run._id);
+      },
+    });
 
     // executeRetry should NOT claim it (not yet due)
     const result = await workflow.engine.executeRetry(run._id);
     expect(result).toBeNull();
 
     // Verify still in draft (read directly from DB)
-    const current = await WorkflowRunModel.findById(run._id).lean();
+    const current = await env.runs.get(run._id);
     expect(current?.status).toBe('draft');
-
-    workflow.shutdown();
   });
 });
 
@@ -125,14 +99,10 @@ describe('Scheduled workflow execution (double-claim fix)', () => {
 // ============================================================================
 
 describe('Stale recovery (mid-step crash fix)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should recover a workflow where step crashed mid-execution', async () => {
     let attempts = 0;
 
-    const workflow = createWorkflow<{ recovered: boolean }>('stale-mid-step', {
+    const workflow = env.workflow<{ recovered: boolean }>('stale-mid-step', {
       steps: {
         crashable: async (ctx) => {
           attempts++;
@@ -141,65 +111,36 @@ describe('Stale recovery (mid-step crash fix)', () => {
         },
       },
       context: () => ({ recovered: false }),
-      autoExecute: false,
     });
 
-    const run = await workflow.start({});
-
-    // Simulate a mid-step crash: set workflow to running with step also running
-    // and a stale heartbeat
-    const staleTime = new Date(Date.now() - 10 * 60 * 1000);
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      {
-        $set: {
-          status: 'running',
-          lastHeartbeat: staleTime,
-          'steps.0.status': 'running',
-          'steps.0.startedAt': staleTime,
-          'steps.0.attempts': 1,
-        },
-      }
-    );
+    // A mid-step crash: run `running`, step `running` (attempt 1), heartbeat stale.
+    const run = await env.runs.staleRunning(workflow, {
+      step: 'crashable',
+      heartbeatAgeMs: 10 * 60 * 1000,
+    });
 
     // recoverStale should reset step to pending and re-execute
     const recovered = await workflow.engine.recoverStale(run._id, 5 * 60 * 1000);
     expect(recovered).not.toBeNull();
-    expect(recovered!.status).toBe('done');
-    expect(recovered!.context.recovered).toBe(true);
+    expect(recovered?.status).toBe('done');
+    expect(recovered?.context.recovered).toBe(true);
 
     // Step should have been re-executed (attempt 2 after reset)
     expect(attempts).toBe(1); // Only 1 successful attempt after recovery
-
-    workflow.shutdown();
   });
 
   it('should NOT recover workflow with fresh heartbeat even if step is running', async () => {
-    const workflow = createWorkflow('stale-fresh-heartbeat', {
+    const workflow = env.workflow('stale-fresh-heartbeat', {
       steps: {
         step1: async () => 'done',
       },
-      autoExecute: false,
     });
 
-    const run = await workflow.start({});
-
-    // Simulate running with FRESH heartbeat (another worker is active)
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      {
-        $set: {
-          status: 'running',
-          lastHeartbeat: new Date(), // Fresh!
-          'steps.0.status': 'running',
-        },
-      }
-    );
+    // Running with a FRESH heartbeat (another worker is active)
+    const run = await env.runs.staleRunning(workflow, { step: 'step1', heartbeatAgeMs: 0 });
 
     const result = await workflow.engine.recoverStale(run._id, 5 * 60 * 1000);
     expect(result).toBeNull(); // Should not recover
-
-    workflow.shutdown();
   });
 });
 
@@ -208,14 +149,10 @@ describe('Stale recovery (mid-step crash fix)', () => {
 // ============================================================================
 
 describe('Concurrent resume() atomic claim', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should atomically unpause — second resume gets current state, not double-execution', async () => {
     let executionCount = 0;
 
-    const workflow = createWorkflow('atomic-resume', {
+    const workflow = env.workflow('atomic-resume', {
       steps: {
         waitStep: async (ctx) => ctx.wait('approval'),
         after: async () => {
@@ -223,7 +160,6 @@ describe('Concurrent resume() atomic claim', () => {
           return 'done';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -242,17 +178,12 @@ describe('Concurrent resume() atomic claim', () => {
     expect(r1).toBeDefined();
     expect(r2).toBeDefined();
 
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
+    await env.until(run._id, 'done');
 
     const final = await workflow.get(run._id);
     expect(final?.status).toBe('done');
     // The "after" step should only run once
     expect(executionCount).toBe(1);
-
-    workflow.shutdown();
   });
 });
 
@@ -262,7 +193,7 @@ describe('Concurrent resume() atomic claim', () => {
 
 describe('Pluggable signal store', () => {
   it('should use default in-memory signal store', () => {
-    const container = createContainer();
+    const container = env.createContainer();
     expect(container.signalStore).toBeDefined();
     expect(typeof container.signalStore.publish).toBe('function');
     expect(typeof container.signalStore.subscribe).toBe('function');
@@ -279,13 +210,19 @@ describe('Pluggable signal store', () => {
         if (handlers) for (const h of handlers) h(data);
       },
       subscribe(channel, handler) {
-        if (!listeners.has(channel)) listeners.set(channel, new Set());
-        listeners.get(channel)!.add(handler);
-        return () => { listeners.get(channel)?.delete(handler); };
+        let handlers = listeners.get(channel);
+        if (!handlers) {
+          handlers = new Set();
+          listeners.set(channel, handlers);
+        }
+        handlers.add(handler);
+        return () => {
+          listeners.get(channel)?.delete(handler);
+        };
       },
     };
 
-    const container = createContainer({ signalStore: mockRedisStore });
+    const container = env.createContainer({ signalStore: mockRedisStore });
     expect(container.signalStore).toBe(mockRedisStore);
 
     // Test pub/sub works
@@ -298,7 +235,7 @@ describe('Pluggable signal store', () => {
   });
 
   it('should support unsubscribe via returned function', () => {
-    const container = createContainer();
+    const container = env.createContainer();
     const received: unknown[] = [];
 
     const unsub = container.signalStore.subscribe('ch', (data) => received.push(data));
@@ -318,7 +255,7 @@ describe('Pluggable signal store', () => {
 
 describe('Write concern on schema', () => {
   it('should configure majority write concern with journaling', () => {
-    const wc = WorkflowRunModel.schema.options.writeConcern;
+    const wc = env.runModel.schema.options.writeConcern;
     expect(wc).toBeDefined();
     expect(wc?.w).toBe('majority');
     expect(wc?.j).toBe(true);
@@ -332,7 +269,7 @@ describe('Write concern on schema', () => {
 describe('Compound indexes for scheduler/pagination', () => {
   it('should define keyset pagination compound indexes on the schema', () => {
     // Check schema-level index definitions (these get auto-created by Mongoose on ensureIndexes)
-    const schemaIndexes = WorkflowRunModel.schema.indexes();
+    const schemaIndexes = env.runModel.schema.indexes();
     const indexFields = schemaIndexes.map(([fields]) => Object.keys(fields));
 
     // Check for the compound indexes we added for keyset pagination
@@ -341,7 +278,7 @@ describe('Compound indexes for scheduler/pagination', () => {
         keys.includes('status') &&
         keys.includes('paused') &&
         keys.includes('updatedAt') &&
-        keys.includes('_id')
+        keys.includes('_id'),
     );
 
     expect(hasStatusPausedUpdated).toBe(true);

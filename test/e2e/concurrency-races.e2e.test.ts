@@ -5,42 +5,25 @@
  * concurrent workflow isolation, and parallel execution safety.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitFor } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createHook,
-  resumeHook,
-  executeParallel,
-  WorkflowRunModel,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { executeParallel } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // Double-Resume Prevention
 // ============================================================================
 
 describe('Double-resume prevention (atomic claim)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should prevent two concurrent resume() calls from both succeeding', async () => {
-    const wf = createWorkflow('double-resume', {
+    const wf = env.workflow('double-resume', {
       steps: {
         wait_step: async (ctx) => {
           return ctx.wait('Waiting for input');
         },
         after: async () => 'completed',
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -66,17 +49,14 @@ describe('Double-resume prevention (atomic claim)', () => {
     // The workflow should reach a terminal state (done or cancelled, not stuck)
     const final = await wf.get(run._id);
     expect(final).toBeTruthy();
-    expect(['done', 'running']).toContain(final!.status);
-
-    wf.shutdown();
+    expect(['done', 'running']).toContain(final?.status);
   });
 
   it('should prevent resume after cancel', async () => {
-    const wf = createWorkflow('resume-after-cancel', {
+    const wf = env.workflow('resume-after-cancel', {
       steps: {
         wait_step: async (ctx) => ctx.wait('Waiting'),
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -87,8 +67,6 @@ describe('Double-resume prevention (atomic claim)', () => {
 
     // Resume should fail
     await expect(wf.resume(run._id, {})).rejects.toThrow();
-
-    wf.shutdown();
   });
 });
 
@@ -97,12 +75,8 @@ describe('Double-resume prevention (atomic claim)', () => {
 // ============================================================================
 
 describe('Concurrent workflow isolation', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should execute 10 concurrent workflows without interference', async () => {
-    const wf = createWorkflow<{ index: number }>('concurrent-iso', {
+    const wf = env.workflow<{ index: number }, { index: number }>('concurrent-iso', {
       steps: {
         compute: async (ctx) => {
           // Each workflow computes its own value
@@ -114,25 +88,20 @@ describe('Concurrent workflow isolation', () => {
           return { finalIndex: ctx.context.index };
         },
       },
-      context: (input: { index: number }) => ({ index: input.index }),
-      autoExecute: false,
+      context: (input) => ({ index: input.index }),
     });
 
     // Start 10 workflows concurrently
-    const runs = await Promise.all(
-      Array.from({ length: 10 }, (_, i) => wf.start({ index: i })),
-    );
+    const runs = await Promise.all(Array.from({ length: 10 }, (_, i) => wf.start({ index: i })));
 
     // Execute all concurrently
     const results = await Promise.all(runs.map((r) => wf.execute(r._id)));
 
     // Each should have computed independently
     for (let i = 0; i < 10; i++) {
-      expect(results[i].status).toBe('done');
-      expect(results[i].context.index).toBe(i * 10);
+      expect(results[i]?.status).toBe('done');
+      expect(results[i]?.context.index).toBe(i * 10);
     }
-
-    wf.shutdown();
   });
 
   it('should isolate context between concurrent runs of same workflow', async () => {
@@ -141,7 +110,7 @@ describe('Concurrent workflow isolation', () => {
       secret: string;
     }
 
-    const wf = createWorkflow<SharedCtx>('context-isolation', {
+    const wf = env.workflow<SharedCtx, SharedCtx>('context-isolation', {
       steps: {
         process: async (ctx) => {
           // Small delay to increase chance of interleaving
@@ -149,11 +118,10 @@ describe('Concurrent workflow isolation', () => {
           return { name: ctx.context.name, secret: ctx.context.secret };
         },
       },
-      context: (input: { name: string; secret: string }) => ({
+      context: (input) => ({
         name: input.name,
         secret: input.secret,
       }),
-      autoExecute: false,
     });
 
     const [runA, runB] = await Promise.all([
@@ -161,18 +129,13 @@ describe('Concurrent workflow isolation', () => {
       wf.start({ name: 'Bob', secret: 'bob-secret' }),
     ]);
 
-    const [resultA, resultB] = await Promise.all([
-      wf.execute(runA._id),
-      wf.execute(runB._id),
-    ]);
+    const [resultA, resultB] = await Promise.all([wf.execute(runA._id), wf.execute(runB._id)]);
 
     // Contexts must NOT leak between runs
     expect(resultA.context.secret).toBe('alice-secret');
     expect(resultB.context.secret).toBe('bob-secret');
     expect(resultA.context.name).not.toBe('Bob');
     expect(resultB.context.name).not.toBe('Alice');
-
-    wf.shutdown();
   });
 });
 
@@ -222,7 +185,7 @@ describe('executeParallel safety', () => {
   });
 
   it('should handle allSettled with mixed success/failure', async () => {
-    const results = await executeParallel(
+    const results = (await executeParallel(
       [
         async () => 'ok',
         async () => {
@@ -231,10 +194,10 @@ describe('executeParallel safety', () => {
         async () => 'also-ok',
       ],
       { mode: 'allSettled' },
-    ) as Array<{ success: boolean; value?: string; reason?: unknown }>;
+    )) as Array<{ success: boolean; value?: string; reason?: unknown }>;
 
     expect(results[0]).toEqual({ success: true, value: 'ok' });
-    expect(results[1].success).toBe(false);
+    expect(results[1]?.success).toBe(false);
     expect(results[2]).toEqual({ success: true, value: 'also-ok' });
   });
 
@@ -258,41 +221,44 @@ describe('executeParallel safety', () => {
 // ============================================================================
 
 describe('Cancel during active execution', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should abort in-flight step via signal on cancel', async () => {
     let signalAborted = false;
+    let markStarted: () => void = () => undefined;
+    const started = new Promise<void>((r) => {
+      markStarted = r;
+    });
 
-    const wf = createWorkflow('cancel-inflight', {
+    const wf = env.workflow('cancel-inflight', {
       steps: {
         long_step: async (ctx) => {
-          // Listen for abort signal
-          ctx.signal.addEventListener('abort', () => {
-            signalAborted = true;
+          // A 5s step that ends early once aborted (the run must stay cancelled).
+          await new Promise<void>((r) => {
+            const timer = setTimeout(r, 5000);
+            // Listen for abort signal
+            ctx.signal.addEventListener('abort', () => {
+              signalAborted = true;
+              clearTimeout(timer);
+              r();
+            });
+            markStarted();
           });
-          await new Promise((r) => setTimeout(r, 5000));
           return 'should-not-reach';
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     const execPromise = wf.execute(run._id).catch(() => {});
 
-    // Give the step time to start
-    await waitFor(50);
+    // Cancel only once the step is in flight (listener attached).
+    await started;
 
     await wf.cancel(run._id);
     await execPromise;
 
     expect(signalAborted).toBe(true);
 
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.status).toBe('cancelled');
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(doc?.status).toBe('cancelled');
   });
 });

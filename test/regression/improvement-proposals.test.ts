@@ -5,9 +5,10 @@
  * Written RED first, then made GREEN by implementation.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 // ============================================================================
 // Proposal #1 & #4: Export Workflow and WorkflowConfig types
@@ -43,7 +44,7 @@ describe('Proposal #1 & #4: Export Workflow and WorkflowConfig types', () => {
     const fs = await import('node:fs');
     const indexSource = fs.readFileSync(
       new URL('../../src/index.ts', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'),
-      'utf-8'
+      'utf-8',
     );
 
     expect(indexSource).toContain('Workflow');
@@ -56,31 +57,19 @@ describe('Proposal #1 & #4: Export Workflow and WorkflowConfig types', () => {
 // ============================================================================
 
 describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', () => {
-  beforeAll(async () => {
-    await setupTestDB();
-  });
-
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
-  afterAll(async () => {
-    await teardownTestDB();
-  });
-
   it('should accept StepConfig objects alongside plain handlers', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
-
-    interface Ctx { value: number }
+    interface Ctx {
+      value: number;
+    }
 
     // Should not throw when mixing plain handlers and StepConfig objects
-    const workflow = createWorkflow<Ctx>('step-config-mixed', {
+    const workflow = env.workflow<Ctx>('step-config-mixed', {
       steps: {
-        fast: async (ctx) => {
+        fast: async () => {
           return { done: true };
         },
         slow: {
-          handler: async (ctx) => {
+          handler: async () => {
             return { done: true };
           },
           timeout: 120_000,
@@ -88,31 +77,28 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
         },
       },
       context: () => ({ value: 1 }),
-      autoExecute: false,
     });
 
     expect(workflow.definition.steps).toHaveLength(2);
-    expect(workflow.definition.steps[0].id).toBe('fast');
-    expect(workflow.definition.steps[1].id).toBe('slow');
-
-    workflow.shutdown();
+    expect(workflow.definition.steps[0]?.id).toBe('fast');
+    expect(workflow.definition.steps[1]?.id).toBe('slow');
   });
 
   it('should apply per-step timeout from StepConfig', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
+    interface Ctx {
+      result?: string;
+    }
 
-    interface Ctx { result?: string }
-
-    const workflow = createWorkflow<Ctx>('step-timeout-override', {
+    const workflow = env.workflow<Ctx>('step-timeout-override', {
       steps: {
         quickStep: {
-          handler: async (ctx) => {
+          handler: async () => {
             return 'quick';
           },
           timeout: 500, // Very short timeout
         },
         slowStep: {
-          handler: async (ctx) => {
+          handler: async () => {
             // This should have the default/workflow timeout, not the quick one
             return 'slow';
           },
@@ -120,56 +106,48 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     // Verify step definitions carry timeout
-    const quickStep = workflow.definition.steps.find(s => s.id === 'quickStep');
-    const slowStep = workflow.definition.steps.find(s => s.id === 'slowStep');
+    const quickStep = workflow.definition.steps.find((s) => s.id === 'quickStep');
+    const slowStep = workflow.definition.steps.find((s) => s.id === 'slowStep');
 
     expect(quickStep?.timeout).toBe(500);
     expect(slowStep?.timeout).toBe(60_000);
-
-    workflow.shutdown();
   });
 
   it('should apply per-step retries from StepConfig', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
+    interface Ctx {
+      attempts: number;
+    }
 
-    interface Ctx { attempts: number }
-
-    const workflow = createWorkflow<Ctx>('step-retries-override', {
+    const workflow = env.workflow<Ctx>('step-retries-override', {
       steps: {
         fragile: {
-          handler: async (ctx) => {
+          handler: async () => {
             return 'ok';
           },
           retries: 1, // Only 1 attempt, no retries
         },
         resilient: {
-          handler: async (ctx) => {
+          handler: async () => {
             return 'ok';
           },
           retries: 10, // Very resilient
         },
       },
       context: () => ({ attempts: 0 }),
-      autoExecute: false,
     });
 
-    const fragile = workflow.definition.steps.find(s => s.id === 'fragile');
-    const resilient = workflow.definition.steps.find(s => s.id === 'resilient');
+    const fragile = workflow.definition.steps.find((s) => s.id === 'fragile');
+    const resilient = workflow.definition.steps.find((s) => s.id === 'resilient');
 
     expect(fragile?.retries).toBe(1);
     expect(resilient?.retries).toBe(10);
-
-    workflow.shutdown();
   });
 
   it('should use workflow defaults when StepConfig omits timeout/retries', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
-
-    const workflow = createWorkflow('step-config-defaults', {
+    const workflow = env.workflow('step-config-defaults', {
       steps: {
         withConfig: {
           handler: async () => 'ok',
@@ -178,29 +156,26 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
         plainHandler: async () => 'ok',
       },
       defaults: { retries: 7, timeout: 30_000 },
-      autoExecute: false,
     });
 
     // StepConfig without timeout/retries should NOT set them on the step
     // (they should fall through to workflow defaults at runtime)
-    const withConfig = workflow.definition.steps.find(s => s.id === 'withConfig');
+    const withConfig = workflow.definition.steps.find((s) => s.id === 'withConfig');
     expect(withConfig?.timeout).toBeUndefined();
     expect(withConfig?.retries).toBeUndefined();
 
     // Plain handler also shouldn't have step-level overrides
-    const plain = workflow.definition.steps.find(s => s.id === 'plainHandler');
+    const plain = workflow.definition.steps.find((s) => s.id === 'plainHandler');
     expect(plain?.timeout).toBeUndefined();
     expect(plain?.retries).toBeUndefined();
-
-    workflow.shutdown();
   });
 
   it('should execute workflow with mixed StepConfig and plain handlers', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
+    interface Ctx {
+      results: string[];
+    }
 
-    interface Ctx { results: string[] }
-
-    const workflow = createWorkflow<Ctx>('step-config-execution', {
+    const workflow = env.workflow<Ctx>('step-config-execution', {
       steps: {
         step1: async (ctx) => {
           ctx.context.results.push('step1');
@@ -220,29 +195,26 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
         },
       },
       context: () => ({ results: [] as string[] }),
-      autoExecute: false,
     });
 
-    const run = await workflow.start({ });
+    const run = await workflow.start({});
     const result = await workflow.execute(run._id);
 
     expect(result.status).toBe('done');
     expect(result.context.results).toEqual(['step1', 'step2', 'step3']);
-
-    workflow.shutdown();
   });
 
   it('should respect per-step timeout during actual execution', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
+    interface Ctx {
+      done: boolean;
+    }
 
-    interface Ctx { done: boolean }
-
-    const workflow = createWorkflow<Ctx>('step-timeout-execution', {
+    const workflow = env.workflow<Ctx>('step-timeout-execution', {
       steps: {
         willTimeout: {
-          handler: async (ctx) => {
+          handler: async () => {
             // Wait longer than the timeout
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            await new Promise((resolve) => setTimeout(resolve, 2000));
             return 'should not reach';
           },
           timeout: 200, // 200ms timeout — handler takes 2000ms
@@ -250,25 +222,23 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
         },
       },
       context: () => ({ done: false }),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
 
     expect(result.status).toBe('failed');
-    const step = result.steps.find(s => s.stepId === 'willTimeout');
+    const step = result.steps.find((s) => s.stepId === 'willTimeout');
     expect(step?.error?.message).toContain('timeout');
-
-    workflow.shutdown();
   });
 
   it('should support conditional execution via StepConfig', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
+    interface Ctx {
+      skipOptional: boolean;
+      results: string[];
+    }
 
-    interface Ctx { skipOptional: boolean; results: string[] }
-
-    const workflow = createWorkflow<Ctx>('step-config-conditional', {
+    const workflow = env.workflow<Ctx, { skip: boolean }>('step-config-conditional', {
       steps: {
         always: async (ctx) => {
           ctx.context.results.push('always');
@@ -286,8 +256,7 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
           return 'ok';
         },
       },
-      context: (input: any) => ({ skipOptional: input.skip, results: [] as string[] }),
-      autoExecute: false,
+      context: (input) => ({ skipOptional: input.skip, results: [] as string[] }),
     });
 
     // Run with skip=true
@@ -301,8 +270,6 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
     const result2 = await workflow.execute(run2._id);
     expect(result2.status).toBe('done');
     expect(result2.context.results).toEqual(['always', 'optional', 'final']);
-
-    workflow.shutdown();
   });
 });
 
@@ -311,58 +278,35 @@ describe('Proposal #2: Per-step timeout/retries override in createWorkflow()', (
 // ============================================================================
 
 describe('Proposal #3: Scheduler concurrency limit', () => {
-  beforeAll(async () => {
-    await setupTestDB();
-  });
-
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
-  afterAll(async () => {
-    await teardownTestDB();
-  });
-
   it('should accept maxConcurrentExecutions in SmartSchedulerConfig', async () => {
-    const { SmartScheduler, DEFAULT_SCHEDULER_CONFIG } = await import(
-      '../../src/execution/smart-scheduler.js'
-    );
+    const { DEFAULT_SCHEDULER_CONFIG } = await import('../../src/execution/smart-scheduler.js');
 
     // Default should be Infinity (backwards compatible)
     expect(DEFAULT_SCHEDULER_CONFIG.maxConcurrentExecutions).toBe(Infinity);
   });
 
   it('should expose maxConcurrentExecutions through engine configure', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
-
-    const workflow = createWorkflow('concurrency-config', {
+    const workflow = env.workflow('concurrency-config', {
       steps: {
         step1: async () => 'ok',
       },
-      autoExecute: false,
     });
 
     // Should not throw when configuring maxConcurrentExecutions
     workflow.engine.configure({
       scheduler: { maxConcurrentExecutions: 5 },
     });
-
-    workflow.shutdown();
   });
 
   it('should track running count via repository', async () => {
-    const { createWorkflow } = await import('../../src/index.js');
-    const { workflowRunRepository } = await import('../../src/storage/run.repository.js');
-
     // Create a slow workflow
-    const workflow = createWorkflow('concurrency-test', {
+    const workflow = env.workflow('concurrency-test', {
       steps: {
-        slow: async (ctx) => {
-          await new Promise(resolve => setTimeout(resolve, 100));
+        slow: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 100));
           return 'done';
         },
       },
-      autoExecute: false,
     });
 
     // Start 3 workflow runs
@@ -371,7 +315,7 @@ describe('Proposal #3: Scheduler concurrency limit', () => {
     const run3 = await workflow.start({});
 
     // All should be in running state (since autoExecute is false, they're actually running status from start)
-    const runningCount = await workflowRunRepository.countRunning();
+    const runningCount = await env.container.repository.countRunning();
     expect(runningCount).toBeGreaterThanOrEqual(3);
 
     // Execute them
@@ -380,7 +324,5 @@ describe('Proposal #3: Scheduler concurrency limit', () => {
       workflow.execute(run2._id),
       workflow.execute(run3._id),
     ]);
-
-    workflow.shutdown();
   });
 });

@@ -5,7 +5,7 @@
  * If any export is missing, this test fails — catches TS4023 and barrel gaps.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 describe('Package exports: main entry point', () => {
   it('should export createWorkflow and core workflow API', async () => {
@@ -143,5 +143,25 @@ describe('Package exports: subpath entry points', () => {
   it('should export from ./telemetry subpath', async () => {
     const mod = await import('../../src/telemetry/index.js');
     expect(mod).toBeDefined();
+  });
+
+  it('./testkit exports the harness — importing it starts nothing', async () => {
+    // mongodb-memory-server loads lazily (inside createStreamlineTestEnv), so a
+    // bare import must not require a server or a connection.
+    const mod = await import('../../src/testkit/index.js');
+    expect(mod.createStreamlineTestEnv).toBeTypeOf('function');
+  });
+
+  it('every package.json export resolves to a built entry in tsdown.config', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const pkg = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
+    const tsdown = await readFile(new URL('../../tsdown.config.ts', import.meta.url), 'utf8');
+    for (const [subpath, target] of Object.entries(pkg.exports as Record<string, unknown>)) {
+      if (subpath === './package.json') continue;
+      // ./dist/<path>.mjs is built from src/<path>.ts
+      const out = (target as { default: string }).default;
+      const entry = out.replace('./dist/', 'src/').replace(/\.mjs$/, '.ts');
+      expect(tsdown, `${subpath} → ${entry} must be a tsdown entry`).toContain(`'${entry}'`);
+    }
   });
 });

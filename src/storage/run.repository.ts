@@ -36,14 +36,14 @@ import type {
   OffsetPaginationResult,
 } from '@classytic/repo-core/pagination';
 import type { Model } from 'mongoose';
-import type { WaitingFor, WorkflowRun } from '../core/types.js';
+import type { SignalEntry, WaitingFor, WorkflowRun } from '../core/types.js';
 import {
   resolveTenantFilterOptions,
   type TenantFilterOptions,
   tenantFilterPlugin,
 } from '../plugins/tenant-filter.plugin.js';
 import { WorkflowRunModel } from './models.js';
-import { CommonQueries } from './query-builder.js';
+import { CommonQueries, staleHeartbeatOr } from './query-builder.js';
 import { type MongoUpdate, normalizeUpdate } from './update-builders.js';
 
 // ============================================================================
@@ -272,6 +272,10 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     // plugin (which is what the manual path expects).
     const result = await super.findOneAndUpdate(finalFilter, finalUpdate, {
       returnDocument: 'after',
+      // Callers only need matched-or-not. Without a projection every heartbeat,
+      // claim and step write shipped the WHOLE run back (steps, outputs,
+      // history, logs) just to read a 0/1. After-hooks see `{ _id }`.
+      select: '_id',
       ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
       ...(options?.bypassTenant ? { bypassTenant: true } : {}),
     });
@@ -511,8 +515,16 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     limit = 100,
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
+    // Two stuck shapes, one sweep: a rollback that died mid-walk (stale
+    // `compensating`) and a failure that died before the saga was entered
+    // (`failed` + `compensationDue`). The recovery callback handles both.
     return this.queryLean(
-      CommonQueries.staleCompensating(staleThresholdMs, options?.workflowId),
+      {
+        $or: [
+          CommonQueries.staleCompensating(staleThresholdMs, options?.workflowId),
+          CommonQueries.failedAwaitingCompensation(staleThresholdMs, options?.workflowId),
+        ],
+      },
       { updatedAt: 1 },
       limit,
       options,
@@ -590,7 +602,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
         from: 'running',
         to: targetStatus,
         where: {
-          $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
+          $or: staleHeartbeatOr(staleTime),
         },
       },
       {
@@ -604,6 +616,9 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
           },
         },
         $inc: { recoveryAttempts: 1 },
+        // Revoke every attempt: a stalled-but-alive worker must not write the
+        // terminated run back to running/done (its writes require the token).
+        $unset: { 'steps.$[].attemptId': '' },
       },
       { bypassTenant: true } as Parameters<Repository<WorkflowRun>['claim']>[3],
     );
@@ -646,6 +661,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
             terminatedAt: now,
           },
         },
+        $unset: { 'steps.$[].attemptId': '' },
       },
       { bypassTenant: true } as Parameters<Repository<WorkflowRun>['claim']>[3],
     );
@@ -683,6 +699,45 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     );
 
     return result as PaginatedResult<LeanWorkflowRun>;
+  }
+
+  /** Due scheduled drafts, oldest deadline first — a bounded pickup with no total. */
+  async getScheduledReady(
+    now: Date,
+    limit = 100,
+    options?: AtomicUpdateOptions,
+  ): Promise<LeanWorkflowRun[]> {
+    return this.queryLean(
+      CommonQueries.scheduledReady(now, options?.workflowId),
+      { 'scheduling.executionTime': 1 },
+      limit,
+      options,
+    );
+  }
+
+  /**
+   * The earliest scheduled draft's `executionTime` (due or not), or `null`.
+   * Lets an idle scheduler arm ONE timer for the next known deadline instead
+   * of missing work that becomes due while it is not polling.
+   */
+  async getNextScheduledTime(options?: AtomicUpdateOptions): Promise<Date | null> {
+    const [next] = (await this.findAll(
+      {
+        status: 'draft',
+        paused: { $ne: true },
+        'scheduling.executionTime': { $exists: true },
+        ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
+      },
+      {
+        sort: { 'scheduling.executionTime': 1 },
+        limit: 1,
+        lean: true,
+        select: 'scheduling.executionTime',
+        ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+        ...(options?.bypassTenant ? { bypassTenant: true } : {}),
+      } as Parameters<Repository<WorkflowRun>['findAll']>[1],
+    )) as Array<{ scheduling?: { executionTime?: Date } }>;
+    return next?.scheduling?.executionTime ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -810,6 +865,112 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     )) as LeanWorkflowRun | null;
   }
 
+  /**
+   * Claim the right to release a run's strict-concurrency slot — at most once
+   * per run, across processes and engine versions. A CAS on the run document:
+   * it stamps `meta.concurrencySlotReleasedAt` only if the run carries a
+   * counter, is in one of `releasable` statuses, and was not released before.
+   *
+   * Returns the counter id the caller must decrement, or `null` when another
+   * releaser won (or the run does not qualify). Marking BEFORE the decrement
+   * means a crash between the two leaks +1 (repaired by `reconcile()`), never
+   * a double release — a leak under-admits, a double release breaks the cap.
+   */
+  async claimSlotRelease(
+    runId: string,
+    releasable: readonly WorkflowRun['status'][],
+  ): Promise<string | null> {
+    const claimed = (await super.findOneAndUpdate(
+      {
+        _id: runId,
+        status: { $in: releasable },
+        'meta.concurrencyCounterId': { $exists: true },
+        'meta.concurrencySlotReleasedAt': { $exists: false },
+      },
+      { $set: { 'meta.concurrencySlotReleasedAt': new Date() } },
+      { returnDocument: 'after', select: 'meta.concurrencyCounterId', bypassTenant: true },
+    )) as LeanWorkflowRun | null;
+    const counterId = (claimed?.meta as Record<string, unknown> | undefined)?.concurrencyCounterId;
+    return typeof counterId === 'string' ? counterId : null;
+  }
+
+  /**
+   * Append to a run's durable signal inbox — atomic, and only while the run is
+   * active, below `cap` pending entries, and (with a caller id) not already
+   * holding that id. Returns the run's routing fields AFTER the push (status,
+   * current step, inbox), or `null` when the push was refused; the caller
+   * reads the run to say why.
+   *
+   * The push and a step's wait-write are both single-document atomic updates,
+   * so whichever lands second sees the other: this result shows the run
+   * waiting (→ deliver now), or the step's post-wait inbox check sees the entry.
+   */
+  async pushSignal(
+    runId: string,
+    entry: SignalEntry,
+    cap: number,
+    options: { dedupe: boolean },
+  ): Promise<LeanWorkflowRun | null> {
+    return (await super.findOneAndUpdate(
+      {
+        _id: runId,
+        status: { $in: ['draft', 'running', 'waiting'] },
+        [`signals.${cap - 1}`]: { $exists: false },
+        ...(options.dedupe ? { 'signals.id': { $ne: entry.id } } : {}),
+      },
+      { $push: { signals: entry }, $set: { updatedAt: new Date() } },
+      {
+        returnDocument: 'after',
+        select: '_id workflowId status paused currentStepId steps signals definitionVersion',
+        bypassTenant: true,
+      },
+    )) as LeanWorkflowRun | null;
+  }
+
+  /**
+   * Waiting runs whose CURRENT event wait has a matching pending signal — the
+   * crash window between `pushSignal` and delivery. The `$expr` keeps signals
+   * queued for a LATER `waitFor` out of the sweep (they would otherwise be
+   * re-picked every poll and eat the shared budget).
+   */
+  async getSignalReadyRuns(
+    limit: number,
+    options?: AtomicUpdateOptions,
+  ): Promise<LeanWorkflowRun[]> {
+    return this.queryLean(
+      {
+        status: 'waiting',
+        paused: { $ne: true },
+        'signals.0': { $exists: true },
+        $expr: {
+          $let: {
+            vars: {
+              current: {
+                $arrayElemAt: [
+                  {
+                    $filter: {
+                      input: '$steps',
+                      as: 'st',
+                      cond: { $eq: ['$$st.stepId', '$currentStepId'] },
+                    },
+                  },
+                  0,
+                ],
+              },
+            },
+            // `$ifNull`: Mongo may evaluate `$expr` before the `signals.0`
+            // pre-filter, and `$in` THROWS on a missing array — failing the poll.
+            in: { $in: ['$$current.waitingFor.eventName', { $ifNull: ['$signals.name', []] }] },
+          },
+        },
+        ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
+      },
+      { updatedAt: 1 },
+      limit,
+      options,
+    );
+  }
+
   async countActiveByConcurrencyKey(
     workflowId: string,
     concurrencyKey: string,
@@ -841,6 +1002,7 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
     limit = 100,
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
+    if (limit <= 0) return []; // see queryLean — 0 would mean "no limit"
     return (await this.findAll(
       {
         status: 'draft',
@@ -1109,26 +1271,27 @@ export class WorkflowRunRepository extends Repository<WorkflowRun> {
   // Private helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Bounded pickup read — one query. `findAll`, not the paginated `getAll`:
+   * a scheduler sweep never reads a total, so `getAll`'s count round-trip was
+   * paid on every pickup of every poll for nothing. Hooks still fire.
+   */
   private async queryLean(
     filters: Record<string, unknown>,
     sort: string | Record<string, 1 | -1>,
     limit: number,
     options?: AtomicUpdateOptions,
   ): Promise<LeanWorkflowRun[]> {
-    const result = await this.getAll(
-      {
-        filters,
-        sort,
-        limit,
-        ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
-      },
-      {
-        lean: true,
-        ...(options?.bypassTenant ? { bypassTenant: true } : {}),
-      },
-    );
-    const data = Array.isArray(result) ? result : (result as { data: LeanWorkflowRun[] }).data;
-    return data as LeanWorkflowRun[];
+    // `findAll` treats a non-positive limit as NO limit — an exhausted budget
+    // must read nothing, not everything.
+    if (limit <= 0) return [];
+    return (await this.findAll(filters, {
+      sort,
+      limit,
+      lean: true,
+      ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+      ...(options?.bypassTenant ? { bypassTenant: true } : {}),
+    } as Parameters<Repository<WorkflowRun>['findAll']>[1])) as LeanWorkflowRun[];
   }
 
   private applyTenantFilter(

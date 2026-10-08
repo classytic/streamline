@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { RETRY, TIMING } from '../config/constants.js';
 import type { WorkflowEventBus } from '../core/events.js';
 import { deriveRunStatus } from '../core/status.js';
@@ -12,6 +13,7 @@ import {
   toPlainRun,
 } from '../storage/update-builders.js';
 import {
+  AttemptSupersededError,
   InvalidStateError,
   NonRetriableError,
   StepNotFoundError,
@@ -34,7 +36,17 @@ import { GotoSignal, StepContextImpl, WaitSignal } from './context.js';
  * a cancelled workflow gets updated by an in-flight handler.
  */
 const CANCELLED_GUARD = { status: { $ne: 'cancelled' } };
+/** Step-boundary writes (claim, skip) refuse an operator-paused run. */
+const NOT_PAUSED = { paused: { $ne: true } };
 
+/**
+ * Filter fragment matching only while `attemptId` still owns step `stepIndex`.
+ * Empty when the step carries no token (a skip, or a run from before tokens),
+ * so those writes behave exactly as they always did.
+ */
+function ownedBy(stepIndex: number, attemptId: string | undefined): Record<string, unknown> {
+  return attemptId ? { [`steps.${stepIndex}.attemptId`]: attemptId } : {};
+}
 /**
  * Structural equality for two persisted step-output values. Used only by the
  * output-history idempotency guard to detect a replay of the same success
@@ -110,6 +122,12 @@ export class StepExecutor<TContext = Record<string, unknown>> {
      * `before` can reject non-retriably; `after` records outcome + durationMs.
      */
     private readonly taskMiddleware?: ReadonlyArray<import('../core/types.js').TaskMiddleware>,
+    /**
+     * The engine has compensation handlers: a step failure then writes
+     * `compensationDue` in the SAME update as `failed`, so a crash before the
+     * saga is entered leaves a marker the scheduler sweeps.
+     */
+    private readonly compensates = false,
   ) {}
 
   /**
@@ -222,10 +240,9 @@ export class StepExecutor<TContext = Record<string, unknown>> {
    * Abort any in-flight step execution for a workflow.
    * Called by engine.cancel() to stop long-running handlers.
    *
-   * **Multi-worker limitation**: This only aborts handlers running in this process.
-   * If another worker is executing the step, the abort signal won't reach it.
-   * However, DB-level guards prevent cancelled workflows from being updated,
-   * so the other worker's updates will be rejected and the workflow stays cancelled.
+   * Immediate for handlers in THIS process. A handler on another worker learns
+   * from its cancel-guarded heartbeat (within one heartbeat interval), and DB
+   * guards refuse its writes meanwhile, so the run stays cancelled.
    */
   abortWorkflow(runId: string): void {
     const controller = this.activeControllers.get(runId);
@@ -233,6 +250,17 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       controller.abort(new Error('Workflow cancelled'));
       this.activeControllers.delete(runId);
     }
+  }
+
+  /**
+   * Register a non-step controller (the saga's compensation walk) so
+   * `abortWorkflow` / `abortAll` reach it too. Returns the untrack function.
+   */
+  trackAbort(runId: string, controller: AbortController): () => void {
+    this.activeControllers.set(runId, controller);
+    return () => {
+      if (this.activeControllers.get(runId) === controller) this.activeControllers.delete(runId);
+    };
   }
 
   /** Abort all in-flight step executions. Called by engine.shutdown(). */
@@ -297,12 +325,15 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     options: { emitSkipped?: boolean; advance?: boolean } = {},
   ): Promise<WorkflowRun<TContext>> {
     const skippedAt = new Date();
-    const skipped = await this.updateStepState(run, stepId, {
-      status: 'skipped',
-      completedAt: skippedAt,
-      endedAt: skippedAt,
-      durationMs: 0,
-    });
+    const skipped = await this.updateStepState(
+      run,
+      stepId,
+      { status: 'skipped', completedAt: skippedAt, endedAt: skippedAt, durationMs: 0 },
+      undefined,
+      // A skip crosses a step boundary like a claim does: a paused run stops here.
+      NOT_PAUSED,
+    );
+    if (skipped.paused) return skipped;
     if (options.emitSkipped) {
       this.eventBus.emit('step:skipped', { runId: skipped._id, stepId });
     }
@@ -422,12 +453,20 @@ export class StepExecutor<TContext = Record<string, unknown>> {
 
     const newAttempts = currentStepState.attempts + 1;
     const now = new Date();
+    // This attempt's ownership token — every later write it makes requires it.
+    const attemptId = randomUUID();
 
-    // Atomic claim with conditional filter (includes cancellation guard)
+    // Atomic claim with conditional filter (includes cancellation guard). It
+    // writes everything the claimed state needs (run status included), so the
+    // in-memory mirror below needs no second round-trip.
     const claimResult = await this.repository.updateOne(
       {
         _id: run._id,
         ...CANCELLED_GUARD,
+        // Operator pause takes effect at the step boundary — this claim. A
+        // refusal falls back to the read below, which carries `paused`, and the
+        // engine stops on "no progress". (This replaced a full-run read per step.)
+        ...NOT_PAUSED,
         [`steps.${stepIndex}.status`]: { $in: ['pending', 'failed'] },
         $or: [
           { [`steps.${stepIndex}.retryAfter`]: { $exists: false } },
@@ -439,7 +478,10 @@ export class StepExecutor<TContext = Record<string, unknown>> {
           [`steps.${stepIndex}.status`]: 'running',
           [`steps.${stepIndex}.startedAt`]: now,
           [`steps.${stepIndex}.attempts`]: newAttempts,
+          [`steps.${stepIndex}.attemptId`]: attemptId,
+          status: 'running',
           lastHeartbeat: now,
+          updatedAt: now,
         },
         $unset: {
           [`steps.${stepIndex}.error`]: '',
@@ -454,15 +496,18 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       return null; // Another worker claimed it
     }
 
-    // Update in-memory state to match DB
-    run = await this.updateStepState(run, stepId, {
+    run = toPlainRun(run);
+    run.steps = applyStepUpdates(stepId, run.steps, {
       status: 'running',
       startedAt: now,
       attempts: newAttempts,
+      attemptId,
       error: undefined,
       waitingFor: undefined,
       retryAfter: undefined,
     });
+    run.status = 'running';
+    run.updatedAt = now;
     run.lastHeartbeat = now;
 
     this.eventBus.emit('step:started', { runId: run._id, stepId });
@@ -484,7 +529,8 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     // Register controller for cancellation support
     this.activeControllers.set(run._id, abortController);
 
-    const { step: stepState } = this.findStepOrThrow(run, stepId);
+    const { index: stepIndex, step: stepState } = this.findStepOrThrow(run, stepId);
+    const owner = { stepId, filter: ownedBy(stepIndex, stepState.attemptId) };
 
     // Facts for the generalized task-middleware (v2.7). `taskKey` is absent at
     // the STEP level (set only for scatter sub-tasks). `tenantId` is read from
@@ -533,6 +579,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       this.maxStepLogs,
       this.maxPayloadBytes,
       taskHooks,
+      owner.filter,
     );
 
     // Read-only facts every middleware hook receives. Computed once.
@@ -561,6 +608,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         step.timeout || this.registry.definition.defaults?.timeout,
         run._id,
         abortController,
+        owner,
       );
 
       // Inline-payload guard: warn over 1MB, throw NON-retriable past the
@@ -578,16 +626,24 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       const durationMs = stepStartedAt
         ? completedAt.getTime() - new Date(stepStartedAt).getTime()
         : undefined;
-      run = await this.updateStepState(run, stepId, {
-        status: 'done',
-        completedAt,
-        endedAt: completedAt,
-        durationMs,
-        output,
-        error: undefined,
-        waitingFor: undefined,
-        retryAfter: undefined,
-      });
+      // ONE write: the step's result AND the run's advance (or completion).
+      // Two writes cost a round-trip per step and left a crash window where
+      // the run sat `running` at a step that was already done.
+      run = await this.updateStepState(
+        run,
+        stepId,
+        {
+          status: 'done',
+          completedAt,
+          endedAt: completedAt,
+          durationMs,
+          output,
+          error: undefined,
+          waitingFor: undefined,
+          retryAfter: undefined,
+        },
+        this.advanceFields(stepId, output),
+      );
 
       // After the durable success write — output + timing are final.
       await this.runMiddlewareHook('afterStep', { ...middlewareInfo, output, durationMs });
@@ -600,7 +656,11 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       });
 
       this.eventBus.emit('step:completed', { runId: run._id, stepId, data: output });
-      return await this.moveToNextStep(run);
+      // Durable-state-before-emit: the write above already persisted `done`.
+      if (run.status === 'done') {
+        this.eventBus.emit('workflow:completed', { runId: run._id, data: run.output });
+      }
+      return run;
     } catch (error) {
       // Generalized `after` recording hook (v2.7) — error outcome. WaitSignal /
       // GotoSignal are control flow, not failures, so skip them.
@@ -663,6 +723,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     timeout?: number,
     runId?: string,
     abortController?: AbortController,
+    owner?: { stepId: string; filter: Record<string, unknown> },
   ): Promise<T> {
     // Start periodic heartbeat to prevent long-running steps from being marked stale
     let heartbeatTimer: NodeJS.Timeout | undefined;
@@ -671,12 +732,30 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     if (runId) {
       let consecutiveHeartbeatFailures = 0;
       let heartbeatInFlight = false;
-      const writeHeartbeat = () =>
-        this.repository.updateOne(
-          { _id: runId },
+      const ownerFilter = owner?.filter ?? {};
+      const writeHeartbeat = async () => {
+        // Owned, cancel-guarded heartbeat: once recovery re-claims the step or
+        // the run is cancelled (from ANY process), it matches nothing — it must
+        // not keep the run looking alive, and the handler should stop.
+        const result = await this.repository.updateOne(
+          { _id: runId, ...CANCELLED_GUARD, ...ownerFilter },
           { lastHeartbeat: new Date() },
           { bypassTenant: true }, // Internal operation - already scoped by _id
         );
+        if (result.modifiedCount > 0 || abortController?.signal.aborted) return;
+        // Not a heartbeat FAILURE (no retry/count) — say which it was.
+        const current = await this.repository.getById(runId);
+        if (current?.status === 'cancelled') {
+          abortController?.abort(
+            new InvalidStateError('execute step', 'cancelled', ['running'], {
+              runId,
+              ...(owner ? { stepId: owner.stepId } : {}),
+            }),
+          );
+        } else if (owner && Object.keys(ownerFilter).length > 0) {
+          abortController?.abort(new AttemptSupersededError(runId, owner.stepId));
+        }
+      };
       heartbeatTimer = setInterval(async () => {
         // A slow/hung previous write must not pile up overlapping ticks —
         // each stalled write would otherwise inflate the failure count and
@@ -861,7 +940,7 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       // Note: Retries use retryAfter field, NOT waitingFor (which is for sleep/wait)
       const stepIndex = run.steps.findIndex((s) => s.stepId === stepId);
       const retryResult = await this.repository.updateOne(
-        { _id: run._id, ...CANCELLED_GUARD },
+        { _id: run._id, ...CANCELLED_GUARD, ...ownedBy(stepIndex, stepState.attemptId) },
         {
           $set: {
             status: 'waiting', // Workflow waits for retry timer
@@ -901,8 +980,13 @@ export class StepExecutor<TContext = Record<string, unknown>> {
           retryAfter,
         });
       } else {
-        // DB rejected update (workflow cancelled) - invalidate cache for consistency
+        // DB rejected the retry: cancelled (return as before) or superseded
+        // (throw — a recovered attempt owns the step now).
         this.cache.delete(run._id);
+        const current = await this.repository.getById(run._id);
+        if (current?.status !== 'cancelled' && stepState.attemptId) {
+          throw new AttemptSupersededError(run._id, stepId);
+        }
       }
 
       return run;
@@ -914,18 +998,23 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     const failDurationMs = failStartedAt
       ? failedAt.getTime() - new Date(failStartedAt).getTime()
       : undefined;
-    const failedRun = await this.updateStepState(run, stepId, {
-      status: 'failed',
-      completedAt: failedAt,
-      endedAt: failedAt,
-      durationMs: failDurationMs,
-      error: {
-        message: safeError.message,
-        code: (safeError as Error & { code?: string }).code,
-        retriable: false,
-        stack: safeError.stack,
+    const failedRun = await this.updateStepState(
+      run,
+      stepId,
+      {
+        status: 'failed',
+        completedAt: failedAt,
+        endedAt: failedAt,
+        durationMs: failDurationMs,
+        error: {
+          message: safeError.message,
+          code: (safeError as Error & { code?: string }).code,
+          retriable: false,
+          stack: safeError.stack,
+        },
       },
-    });
+      this.compensates ? { compensationDue: true } : undefined,
+    );
 
     this.eventBus.emit('step:failed', { runId: run._id, stepId, error: safeError });
     this.eventBus.emit('workflow:failed', { runId: run._id, error: safeError });
@@ -1022,6 +1111,13 @@ export class StepExecutor<TContext = Record<string, unknown>> {
     run: WorkflowRun<TContext>,
     stepId: string,
     updates: Partial<StepState>,
+    /** Run-level fields written in the same atomic update. */
+    runFields?: Partial<WorkflowRun<TContext>>,
+    /**
+     * Extra filter for this write. With {@link NOT_PAUSED}, a refusal because
+     * the run was paused returns the fresh paused run instead of throwing.
+     */
+    guard?: Record<string, unknown>,
   ): Promise<WorkflowRun<TContext>> {
     // Convert Mongoose document to plain object if needed
     run = toPlainRun(run);
@@ -1040,79 +1136,101 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       includeStatus: newStatus,
       ...(historyPush ? { historyPush } : {}),
     });
+    if (runFields) Object.assign(updateOps.$set, runFields);
 
     run.steps = updatedSteps;
     run.updatedAt = new Date();
     run.status = newStatus;
+    if (runFields) Object.assign(run, runFields);
 
-    // Execute atomic update via repository (rejects if workflow was cancelled)
+    // Execute atomic update via repository. Rejected when the run was cancelled
+    // or — for an executing attempt — when that attempt no longer owns the step.
     const result = await this.repository.updateOne(
-      { _id: run._id, ...CANCELLED_GUARD },
+      { _id: run._id, ...CANCELLED_GUARD, ...ownedBy(stepIndex, priorStep.attemptId), ...guard },
       updateOps,
       { bypassTenant: true },
     );
 
-    // If update was rejected and workflow is cancelled, invalidate cache and throw error
     if (result.modifiedCount === 0) {
       this.cache.delete(run._id); // Force re-fetch on next access
-      const current = await this.repository.getById(run._id);
-      if (current?.status === 'cancelled') {
-        throw new InvalidStateError('update step', 'cancelled', ['running', 'waiting', 'draft'], {
-          runId: run._id,
-          stepId,
-        });
+      if (guard === NOT_PAUSED) {
+        const fresh = await this.repository.getById(run._id);
+        if (fresh?.paused) return fresh as WorkflowRun<TContext>;
       }
+      await this.throwIfRefused(run._id, stepId, priorStep.attemptId, 'update step');
     }
 
     return run;
   }
 
   /**
+   * A guarded write matched nothing — say why. Cancelled keeps its historic
+   * error; an attempt that lost ownership gets `AttemptSupersededError`. Both
+   * are `InvalidStateError`s, so the engine stops and re-reads instead of
+   * counting a failure. An unowned write that matched nothing stays silent,
+   * as it always has.
+   */
+  private async throwIfRefused(
+    runId: string,
+    stepId: string,
+    attemptId: string | undefined,
+    action: string,
+  ): Promise<void> {
+    const current = await this.repository.getById(runId);
+    if (current?.status === 'cancelled') {
+      throw new InvalidStateError(action, 'cancelled', ['running', 'waiting', 'draft'], {
+        runId,
+        stepId,
+      });
+    }
+    if (attemptId) {
+      throw new AttemptSupersededError(runId, stepId);
+    }
+  }
+
+  /**
    * Move workflow to the next step or mark as complete.
    * If no more steps, marks workflow as done and sets final output.
    */
+  /**
+   * Run-level fields that move past `stepId`: the next step, or completion
+   * carrying `output` (the finishing step's output becomes the run's).
+   */
+  private advanceFields(stepId: string, output: unknown): Partial<WorkflowRun<TContext>> {
+    const nextStep = this.registry.getNextStep(stepId);
+    return nextStep
+      ? { currentStepId: nextStep.id, status: 'running' }
+      : { currentStepId: null, status: 'done', output, endedAt: new Date() };
+  }
+
   private async moveToNextStep(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
     const currentStepId = run.currentStepId;
     if (!currentStepId) {
       throw new Error(`moveToNextStep called without a currentStepId (run ${run._id})`);
     }
-    const nextStep = this.registry.getNextStep(currentStepId);
-
+    const lastOutput = run.steps.find((s) => s.stepId === currentStepId)?.output;
     const updates: Record<string, unknown> = {
+      ...this.advanceFields(currentStepId, lastOutput),
       updatedAt: new Date(),
     };
+    Object.assign(run, updates);
 
-    if (nextStep) {
-      run.currentStepId = nextStep.id;
-      run.status = 'running';
-      updates.currentStepId = nextStep.id;
-      updates.status = 'running';
-    } else {
-      // Workflow completed - set final output from last step
-      const lastStep = run.steps.find((s) => s.stepId === run.currentStepId);
-      run.output = lastStep?.output;
+    // The transition belongs to the attempt that finished the step — a
+    // superseded attempt must not advance (or complete) the run.
+    const currentIndex = run.steps.findIndex((s) => s.stepId === currentStepId);
+    const finishingAttempt = run.steps[currentIndex]?.attemptId;
+    const result = await this.repository.updateOne(
+      { _id: run._id, ...CANCELLED_GUARD, ...ownedBy(currentIndex, finishingAttempt) },
+      updates,
+      { bypassTenant: true },
+    );
 
-      run.currentStepId = null;
-      run.status = 'done';
-      run.endedAt = new Date();
-
-      updates.output = run.output;
-      updates.currentStepId = null;
-      updates.status = 'done';
-      updates.endedAt = run.endedAt;
-    }
-
-    run.updatedAt = updates.updatedAt as Date;
-
-    // Atomic update via repository (rejects if workflow was cancelled)
-    const result = await this.repository.updateOne({ _id: run._id, ...CANCELLED_GUARD }, updates, {
-      bypassTenant: true,
-    });
-
-    // If update was rejected and workflow is cancelled, invalidate cache and throw error
     if (result.modifiedCount === 0) {
       this.cache.delete(run._id); // Force re-fetch on next access
       const current = await this.repository.getById(run._id);
+      if (current?.status !== 'cancelled' && finishingAttempt) {
+        throw new AttemptSupersededError(run._id, currentStepId);
+      }
       if (current?.status === 'cancelled') {
         throw new InvalidStateError('move to next step', 'cancelled', ['running', 'waiting'], {
           runId: run._id,
@@ -1205,11 +1323,22 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       }
     }
 
-    await this.repository.updateOne(
-      { _id: run._id, status: { $ne: 'cancelled' } },
+    // Owned by the attempt that issued the goto (its `skipped` write above
+    // already proved ownership; this keeps the jump itself from racing recovery).
+    const fromIndex = run.steps.findIndex((s) => s.stepId === fromStepId);
+    const gotoResult = await this.repository.updateOne(
+      {
+        _id: run._id,
+        status: { $ne: 'cancelled' },
+        ...ownedBy(fromIndex, run.steps[fromIndex]?.attemptId),
+      },
       { $set: updates },
       { bypassTenant: true },
     );
+    if (gotoResult.modifiedCount === 0) {
+      this.cache.delete(run._id);
+      await this.throwIfRefused(run._id, fromStepId, run.steps[fromIndex]?.attemptId, 'goto');
+    }
 
     run.currentStepId = targetStepId;
     run.status = 'running';
@@ -1233,6 +1362,12 @@ export class StepExecutor<TContext = Record<string, unknown>> {
   async resumeStep(
     run: WorkflowRun<TContext>,
     payload: unknown,
+    /**
+     * Deliver from the durable inbox: the entry must still be pending, and it
+     * is pulled in the SAME write that completes the wait — a crash can
+     * neither lose the signal nor deliver it twice.
+     */
+    consume?: { signalId: string },
   ): Promise<{ run: WorkflowRun<TContext>; won: boolean }> {
     run = toPlainRun(run);
     const stepId = run.currentStepId;
@@ -1275,10 +1410,14 @@ export class StepExecutor<TContext = Record<string, unknown>> {
         _id: run._id,
         ...CANCELLED_GUARD,
         [`steps.${stepIndex}.status`]: 'waiting',
+        ...(consume ? { 'signals.id': consume.signalId } : {}),
       },
-      updateOps,
+      consume ? { ...updateOps, $pull: { signals: { id: consume.signalId } } } : updateOps,
       { bypassTenant: true },
     );
+    if (consume && result.modifiedCount > 0) {
+      run.signals = run.signals?.filter((s) => s.id !== consume.signalId);
+    }
 
     if (result.modifiedCount === 0) {
       // Lost the resume race (or run cancelled). Return the freshest persisted

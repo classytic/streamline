@@ -7,39 +7,52 @@
  * 3. Index warnings are suppressed with proper test setup
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createContainer,
-  createHook,
-  resumeHook,
-  hookRegistry,
-  workflowRegistry,
-  type SignalStore,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { createHook, hookRegistry, resumeHook, type SignalStore } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
+const env = useStreamlineEnv();
 
-afterAll(async () => {
-  await teardownTestDB();
-});
+/** The token captured from a step, or a test failure if the step never created one. */
+function tokenOf(token: string | undefined): string {
+  if (!token) throw new Error('hook token was never captured');
+  return token;
+}
+
+/** An in-process SignalStore that records every publish. */
+function recordingSignalStore() {
+  const published: Array<{ channel: string; data: unknown }> = [];
+  const listeners = new Map<string, Set<(data: unknown) => void>>();
+  const store: SignalStore = {
+    publish(channel, data) {
+      published.push({ channel, data });
+      const handlers = listeners.get(channel);
+      if (handlers) for (const h of handlers) h(data);
+    },
+    subscribe(channel, handler) {
+      let set = listeners.get(channel);
+      if (!set) {
+        set = new Set();
+        listeners.set(channel, set);
+      }
+      set.add(handler);
+      return () => {
+        listeners.get(channel)?.delete(handler);
+      };
+    },
+  };
+  return { store, published };
+}
 
 // ============================================================================
 // 1. resumeHook DB fallback completes workflow end-to-end
 // ============================================================================
 
 describe('resumeHook DB fallback — full workflow completion', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should complete the ENTIRE workflow when resumed via DB fallback (not just set running)', async () => {
     let hookToken: string | undefined;
 
-    const workflow = createWorkflow<{ result?: string }>('durable-hook-e2e', {
+    const workflow = env.workflow<{ result?: string }>('durable-hook-e2e', {
       steps: {
         waitStep: async (ctx) => {
           const hook = createHook(ctx, 'approval');
@@ -53,7 +66,6 @@ describe('resumeHook DB fallback — full workflow completion', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     // Execute until waiting
@@ -69,27 +81,23 @@ describe('resumeHook DB fallback — full workflow completion', () => {
     expect(hookRegistry.getEngine(run._id)).toBeUndefined();
 
     // Resume via DB fallback
-    const resumeResult = await resumeHook(hookToken!, { approved: true });
+    const resumeResult = await resumeHook(
+      tokenOf(hookToken),
+      { approved: true },
+      { container: env.container },
+    );
     expect(resumeResult.runId).toBe(run._id);
 
     // The DB fallback should advance currentStepId AND trigger execution.
     // Since workflowRegistry still has the engine, it should auto-execute.
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
-
-    const final = await workflow.get(run._id);
-    expect(final?.status).toBe('done');
-    expect(final?.context.result).toBe('approved');
-
-    workflow.shutdown();
+    const final = await env.until(run._id, 'done');
+    expect(final.context.result).toBe('approved');
   });
 
   it('should complete a single-step workflow via DB fallback', async () => {
     let hookToken: string | undefined;
 
-    const workflow = createWorkflow('single-step-hook', {
+    const workflow = env.workflow('single-step-hook', {
       steps: {
         only: async (ctx) => {
           const hook = createHook(ctx, 'confirm');
@@ -97,7 +105,6 @@ describe('resumeHook DB fallback — full workflow completion', () => {
           return ctx.wait(hook.token, { hookToken: hook.token });
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -107,19 +114,17 @@ describe('resumeHook DB fallback — full workflow completion', () => {
     hookRegistry.unregister(run._id);
 
     // Resume — this is the last step, so workflow should complete
-    const result = await resumeHook(hookToken!, { confirmed: true });
+    await resumeHook(tokenOf(hookToken), { confirmed: true }, { container: env.container });
 
     // Single step, no next step → workflow should be 'done'
     const final = await workflow.get(run._id);
     expect(final?.status).toBe('done');
-
-    workflow.shutdown();
   });
 
   it('should advance currentStepId correctly on DB fallback resume', async () => {
     let hookToken: string | undefined;
 
-    const workflow = createWorkflow('hook-advance-step', {
+    const workflow = env.workflow('hook-advance-step', {
       steps: {
         step1: async (ctx) => {
           const hook = createHook(ctx, 'hook');
@@ -129,7 +134,6 @@ describe('resumeHook DB fallback — full workflow completion', () => {
         step2: async () => 'step2-result',
         step3: async () => 'step3-result',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -138,20 +142,12 @@ describe('resumeHook DB fallback — full workflow completion', () => {
     // Remove from hookRegistry (but workflowRegistry still has it)
     hookRegistry.unregister(run._id);
 
-    await resumeHook(hookToken!, { data: 'from-webhook' });
+    await resumeHook(tokenOf(hookToken), { data: 'from-webhook' }, { container: env.container });
 
     // Wait for full completion via auto-execute
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
-
-    const final = await workflow.get(run._id);
-    expect(final?.status).toBe('done');
+    const final = await env.until(run._id, 'done');
     // All 3 steps should be done
-    expect(final?.steps.filter((s) => s.status === 'done')).toHaveLength(3);
-
-    workflow.shutdown();
+    expect(final.steps.filter((s) => s.status === 'done')).toHaveLength(3);
   });
 });
 
@@ -160,30 +156,12 @@ describe('resumeHook DB fallback — full workflow completion', () => {
 // ============================================================================
 
 describe('SignalStore integration with event waits', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should resume workflow via SignalStore publish (cross-process simulation)', async () => {
-    const messages: Array<{ channel: string; data: unknown }> = [];
-    const listeners = new Map<string, Set<(data: unknown) => void>>();
+    const { store } = recordingSignalStore();
+    // A container with the custom signal store, on the env's connection.
+    const container = env.createContainer({ signalStore: store });
 
-    const mockSignalStore: SignalStore = {
-      publish(channel, data) {
-        messages.push({ channel, data });
-        const handlers = listeners.get(channel);
-        if (handlers) for (const h of handlers) h(data);
-      },
-      subscribe(channel, handler) {
-        if (!listeners.has(channel)) listeners.set(channel, new Set());
-        listeners.get(channel)!.add(handler);
-        return () => { listeners.get(channel)?.delete(handler); };
-      },
-    };
-
-    const container = createContainer({ signalStore: mockSignalStore });
-
-    const workflow = createWorkflow<{ eventData?: unknown }>('signal-store-event', {
+    const workflow = env.workflow<{ eventData?: unknown }>('signal-store-event', {
       steps: {
         waitForSignal: async (ctx) => {
           return ctx.waitFor('external:data-ready', 'Waiting for external data');
@@ -196,7 +174,6 @@ describe('SignalStore integration with event waits', () => {
       },
       context: () => ({}),
       container,
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -206,43 +183,20 @@ describe('SignalStore integration with event waits', () => {
     expect(waiting?.status).toBe('waiting');
 
     // Simulate cross-process event delivery via signal store
-    mockSignalStore.publish('streamline:event:external:data-ready', {
+    store.publish('streamline:event:external:data-ready', {
       runId: run._id,
       data: { temperature: 42 },
     });
 
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
-
-    const final = await workflow.get(run._id);
-    expect(final?.status).toBe('done');
-    expect(final?.context.eventData).toEqual({ temperature: 42 });
-
-    workflow.shutdown();
+    const final = await env.until(run._id, 'done');
+    expect(final.context.eventData).toEqual({ temperature: 42 });
   });
 
   it('should deliver ctx.emit() to signalStore (not just local eventBus)', async () => {
-    const published: Array<{ channel: string; data: unknown }> = [];
-    const listeners = new Map<string, Set<(data: unknown) => void>>();
+    const { store, published } = recordingSignalStore();
+    const container = env.createContainer({ signalStore: store });
 
-    const mockSignalStore: SignalStore = {
-      publish(channel, data) {
-        published.push({ channel, data });
-        const handlers = listeners.get(channel);
-        if (handlers) for (const h of handlers) h(data);
-      },
-      subscribe(channel, handler) {
-        if (!listeners.has(channel)) listeners.set(channel, new Set());
-        listeners.get(channel)!.add(handler);
-        return () => { listeners.get(channel)?.delete(handler); };
-      },
-    };
-
-    const container = createContainer({ signalStore: mockSignalStore });
-
-    const workflow = createWorkflow('emit-to-signal-store', {
+    const workflow = env.workflow('emit-to-signal-store', {
       steps: {
         emitter: async (ctx) => {
           ctx.emit('custom:event', { value: 42 });
@@ -250,51 +204,47 @@ describe('SignalStore integration with event waits', () => {
         },
       },
       container,
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     await workflow.execute(run._id);
 
     // ctx.emit() should have published to signal store
-    const signalMessages = published.filter(
-      (m) => m.channel === 'streamline:event:custom:event'
-    );
+    const signalMessages = published.filter((m) => m.channel === 'streamline:event:custom:event');
     expect(signalMessages).toHaveLength(1);
-    expect((signalMessages[0].data as Record<string, unknown>).data).toEqual({ value: 42 });
-
-    workflow.shutdown();
+    expect((signalMessages[0]?.data as Record<string, unknown> | undefined)?.data).toEqual({
+      value: 42,
+    });
   });
 
   it('should use default in-memory signal store when none configured', async () => {
-    const container = createContainer();
+    // The env's container was created without a signalStore option.
+    const container = env.container;
     expect(container.signalStore).toBeDefined();
 
     // In-memory store works for same-process events
     const received: unknown[] = [];
-    container.signalStore.subscribe('test', (data) => received.push(data));
-    container.signalStore.publish('test', { msg: 'hello' });
-    expect(received).toEqual([{ msg: 'hello' }]);
+    const unsubscribe = await container.signalStore.subscribe('test', (data) =>
+      received.push(data),
+    );
+    try {
+      container.signalStore.publish('test', { msg: 'hello' });
+      expect(received).toEqual([{ msg: 'hello' }]);
+    } finally {
+      unsubscribe();
+    }
   });
 });
-
-// ============================================================================
-// 3. Validate no MongoKit index warnings with proper setup
-// ============================================================================
 
 // ============================================================================
 // 2b. Hook DB fallback without any engine (true restart)
 // ============================================================================
 
 describe('Hook DB fallback without engine (true restart)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should set lastHeartbeat to past for immediate stale recovery when no engine exists', async () => {
     let hookToken: string | undefined;
 
-    const workflow = createWorkflow<{ result?: string }>('true-restart-hook', {
+    const workflow = env.workflow<{ result?: string }>('true-restart-hook', {
       steps: {
         waitStep: async (ctx) => {
           const hook = createHook(ctx, 'approval');
@@ -307,60 +257,41 @@ describe('Hook DB fallback without engine (true restart)', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     await workflow.execute(run._id);
 
-    // Remove from BOTH registries (simulating full process restart)
+    // Remove from the hook registry (simulating a process restart). We can't
+    // easily unregister from workflowRegistry, so it still has the engine in
+    // this test process and the DB-fallback resume auto-executes. The true
+    // no-engine case is when the process that started the workflow is gone.
     hookRegistry.unregister(run._id);
-    // Overwrite the workflow in registry with a dummy to simulate it being gone
-    const { workflowRegistry: wr } = await import('../../src/execution/engine.js');
-    // We can't easily unregister from workflowRegistry, but we can test the
-    // DB operations directly. The key behavior: lastHeartbeat is set to epoch.
 
-    // For this test, clear the workflowRegistry by registering a fake engine
-    // Actually, let's just verify the DB state after resume
-    // (workflowRegistry will still have the engine in this test process,
-    // so it will auto-execute. The true no-engine case is when the process
-    // that started the workflow is completely gone.)
-
-    // We verify the lastHeartbeat=epoch behavior by checking the atomic update
-    const { WorkflowRunModel } = await import('../../src/index.js');
-
-    hookRegistry.unregister(run._id);
     // Resume via DB fallback (workflowRegistry HAS the engine, so it will execute)
-    await resumeHook(hookToken!, { approved: true });
+    await resumeHook(tokenOf(hookToken), { approved: true }, { container: env.container });
 
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
-
-    const final = await workflow.get(run._id);
-    expect(final?.status).toBe('done');
-    expect(final?.context.result).toBe('completed');
-
-    workflow.shutdown();
+    const final = await env.until(run._id, 'done');
+    expect(final.context.result).toBe('completed');
   });
 });
 
+// ============================================================================
+// 3. Index completeness
+// ============================================================================
+
 describe('Index completeness', () => {
   it('should have all required indexes defined on the test DB', async () => {
-    // The test setup creates indexes. Verify they exist.
-    const { WorkflowRunModel } = await import('../../src/index.js');
-    const db = WorkflowRunModel.collection;
-
-    const indexes = await db.indexes();
+    // The env builds streamline's real indexes. Verify they exist.
+    const indexes = await env.runModel.collection.indexes();
     const indexKeyStrings = indexes.map((idx) => JSON.stringify(idx.key));
 
     // Check the critical keyset pagination indexes
     const hasStatusPausedDesc = indexKeyStrings.some(
-      (k) => k.includes('"status"') && k.includes('"paused"') && k.includes('"updatedAt":-1')
+      (k) => k.includes('"status"') && k.includes('"paused"') && k.includes('"updatedAt":-1'),
     );
     const hasStatusPausedAsc = indexKeyStrings.some(
-      (k) => k.includes('"status"') && k.includes('"paused"') && k.includes('"updatedAt":1')
+      (k) => k.includes('"status"') && k.includes('"paused"') && k.includes('"updatedAt":1'),
     );
 
     expect(hasStatusPausedDesc).toBe(true);

@@ -13,36 +13,34 @@
  *      heartbeat-backpressure suite staying green.)
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { SchedulingInfo } from '../../src/core/types.js';
 import {
   computeNextOccurrence,
   configureStreamlineLogger,
-  createWorkflow,
   validateRecurrence,
-  WorkflowRunModel,
 } from '../../src/index.js';
-import type { SchedulingInfo } from '../../src/core/types.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB } from '../utils/setup.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
+const env = useStreamlineEnv();
+
+beforeAll(() => {
   configureStreamlineLogger({ enabled: false });
 });
 
-afterAll(async () => {
+afterAll(() => {
   configureStreamlineLogger({ enabled: true });
-  await teardownTestDB();
 });
+
+/** The loop checkpoint `ctx.loop` persists on the step's output. */
+const checkpointN = (output: unknown) =>
+  (output as { __checkpoint?: { state?: { n: number } } } | undefined)?.__checkpoint?.state?.n;
 
 // ============================================================================
 // 1. Typed step outputs — ctx.outputs
 // ============================================================================
 
 describe('v2.6: ctx.outputs typed proxy', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('resolves sibling step outputs by property access (typed when TOutputs declared)', async () => {
     interface Outputs {
       fetch: { html: string };
@@ -50,7 +48,7 @@ describe('v2.6: ctx.outputs typed proxy', () => {
       save: { saved: boolean };
     }
 
-    const wf = createWorkflow<Record<string, never>, unknown, Outputs>('outputs-proxy', {
+    const wf = env.workflow<Record<string, never>, unknown, Outputs>('outputs-proxy', {
       steps: {
         fetch: async () => ({ html: '<li>a</li><li>b</li>' }),
         parse: async (ctx) => {
@@ -63,7 +61,6 @@ describe('v2.6: ctx.outputs typed proxy', () => {
           retries: 1,
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -72,15 +69,13 @@ describe('v2.6: ctx.outputs typed proxy', () => {
     expect(result.status).toBe('done');
     expect(result.steps.find((s) => s.stepId === 'parse')?.output).toEqual({ items: 2 });
     expect(result.steps.find((s) => s.stepId === 'save')?.output).toEqual({ saved: true });
-
-    wf.shutdown();
   });
 
   it('enumerates step ids and returns undefined for unknown/incomplete steps', async () => {
     let observedKeys: string[] = [];
     let unknownValue: unknown = 'sentinel';
 
-    const wf = createWorkflow('outputs-proxy-enum', {
+    const wf = env.workflow('outputs-proxy-enum', {
       steps: {
         first: async () => ({ ok: 1 }),
         second: async (ctx) => {
@@ -89,7 +84,6 @@ describe('v2.6: ctx.outputs typed proxy', () => {
           return { ok: 2 };
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -97,8 +91,6 @@ describe('v2.6: ctx.outputs typed proxy', () => {
 
     expect(observedKeys).toEqual(['first', 'second']);
     expect(unknownValue).toBeUndefined();
-
-    wf.shutdown();
   });
 });
 
@@ -107,14 +99,10 @@ describe('v2.6: ctx.outputs typed proxy', () => {
 // ============================================================================
 
 describe('v2.6: ctx.loop durable loop', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('runs body until done, threading state, and returns the final state', async () => {
     const iterations: number[] = [];
 
-    const wf = createWorkflow('loop-basic', {
+    const wf = env.workflow('loop-basic', {
       steps: {
         accumulate: async (ctx) => {
           const final = await ctx.loop(
@@ -128,7 +116,6 @@ describe('v2.6: ctx.loop durable loop', () => {
           return { total: final.sum };
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -138,15 +125,13 @@ describe('v2.6: ctx.loop durable loop', () => {
     // 0+1+2+3+4 = 10 → done at iteration 4 (five iterations: 0..4)
     expect(iterations).toEqual([0, 1, 2, 3, 4]);
     expect(result.steps[0]?.output).toEqual({ total: 10 });
-
-    wf.shutdown();
   });
 
   it('resumes from the last committed iteration after a mid-loop failure (crash recovery)', async () => {
     const executed: number[] = [];
     let crashed = false;
 
-    const wf = createWorkflow('loop-resume', {
+    const wf = env.workflow('loop-resume', {
       steps: {
         work: {
           handler: async (ctx) => {
@@ -170,7 +155,6 @@ describe('v2.6: ctx.loop durable loop', () => {
           retryDelay: 10,
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -179,6 +163,7 @@ describe('v2.6: ctx.loop durable loop', () => {
     // First attempt failed at iteration 2 → step scheduled for retry.
     // Drive the retry (waiting → running with retryAfter elapsed).
     if (result.status !== 'done') {
+      // Deliberate: let the 10ms retryDelay elapse (a clock wait, not an outcome).
       await new Promise((r) => setTimeout(r, 50));
       result = (await wf.engine.executeRetry(run._id)) ?? result;
     }
@@ -188,12 +173,10 @@ describe('v2.6: ctx.loop durable loop', () => {
     // retry resumed AT iteration 2 — not from scratch.
     expect(executed).toEqual([0, 1, 2, 3]);
     expect(result.steps[0]?.output).toEqual({ log: [0, 1, 2, 3] });
-
-    wf.shutdown();
   });
 
   it('fails the step NON-retriably when maxIterations is exceeded', async () => {
-    const wf = createWorkflow('loop-runaway', {
+    const wf = env.workflow('loop-runaway', {
       steps: {
         spin: {
           handler: async (ctx) => {
@@ -204,7 +187,6 @@ describe('v2.6: ctx.loop durable loop', () => {
           retryDelay: 10,
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -214,8 +196,6 @@ describe('v2.6: ctx.loop durable loop', () => {
     expect(result.steps[0]?.error?.message).toContain('maxIterations');
     // Non-retriable: exactly one attempt despite retries: 5.
     expect(result.steps[0]?.attempts).toBe(1);
-
-    wf.shutdown();
   });
 });
 
@@ -302,9 +282,9 @@ describe('v2.6: recurrence math (computeNextOccurrence)', () => {
 
   it('validateRecurrence rejects malformed patterns loudly', () => {
     expect(() => validateRecurrence({ pattern: 'custom' })).toThrow(/cronExpression/);
-    expect(() =>
-      validateRecurrence({ pattern: 'custom', cronExpression: 'not a cron' }),
-    ).toThrow(/Invalid recurrence.cronExpression/);
+    expect(() => validateRecurrence({ pattern: 'custom', cronExpression: 'not a cron' })).toThrow(
+      /Invalid recurrence.cronExpression/,
+    );
     expect(() => validateRecurrence({ pattern: 'weekly', daysOfWeek: [9] })).toThrow(/daysOfWeek/);
     expect(() => validateRecurrence({ pattern: 'monthly', dayOfMonth: 0 })).toThrow(/dayOfMonth/);
     expect(() => validateRecurrence({ pattern: 'daily', count: 0 })).toThrow(/count/);
@@ -313,22 +293,18 @@ describe('v2.6: recurrence math (computeNextOccurrence)', () => {
 });
 
 describe('v2.6: engine drives recurring schedules', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('spawns the next occurrence as an idempotency-keyed draft on scheduled pickup', async () => {
     let runs = 0;
 
-    const wf = createWorkflow('recurring-job', {
+    const wf = env.workflow('recurring-job', {
       steps: {
         tick: async () => {
           runs += 1;
           return { ran: runs };
         },
       },
-      autoExecute: false,
     });
+    const wfId = wf.engine.definition.id;
 
     // Create a scheduled draft, then stamp a recurrence + past fire time
     // (simulating a SchedulingService-created recurring run that is now due).
@@ -336,17 +312,12 @@ describe('v2.6: engine drives recurring schedules', () => {
       { job: 'nightly' },
       { scheduledExecutionTime: new Date(Date.now() + 60_000) },
     );
-    await WorkflowRunModel.updateOne(
-      { _id: draft._id },
-      {
-        $set: {
-          'scheduling.scheduledFor': '2026-06-10T03:00:00',
-          'scheduling.timezone': 'UTC',
-          'scheduling.executionTime': new Date(Date.now() - 1_000),
-          'scheduling.recurrence': { pattern: 'daily', occurrences: 1 },
-        },
-      },
-    );
+    await env.runs.update(draft._id, {
+      'scheduling.scheduledFor': '2026-06-10T03:00:00',
+      'scheduling.timezone': 'UTC',
+      'scheduling.executionTime': new Date(Date.now() - 1_000),
+      'scheduling.recurrence': { pattern: 'daily', occurrences: 1 },
+    });
 
     const result = await wf.engine.executeRetry(draft._id);
 
@@ -354,48 +325,37 @@ describe('v2.6: engine drives recurring schedules', () => {
     expect(runs).toBe(1);
 
     // Exactly one NEXT occurrence queued, advanced a day, dedup-keyed.
-    const next = await WorkflowRunModel.find({
-      workflowId: 'recurring-job',
-      status: 'draft',
-    }).lean();
+    const next = await env.runModel.find({ workflowId: wfId, status: 'draft' }).lean();
     expect(next).toHaveLength(1);
-    expect(next[0]!.scheduling?.recurrence?.occurrences).toBe(2);
-    expect(next[0]!.scheduling!.executionTime.getTime()).toBeGreaterThan(Date.now());
-    expect(next[0]!.idempotencyKey).toMatch(/^recurring-job:recur:/);
-    expect(next[0]!.input).toEqual({ job: 'nightly' });
-
-    wf.shutdown();
+    expect(next[0]?.scheduling?.recurrence?.occurrences).toBe(2);
+    expect(next[0]?.scheduling?.executionTime.getTime()).toBeGreaterThan(Date.now());
+    expect(next[0]?.idempotencyKey?.startsWith(`${wfId}:recur:`)).toBe(true);
+    expect(next[0]?.input).toEqual({ job: 'nightly' });
   });
 
   it('does NOT spawn a next occurrence once count is exhausted', async () => {
-    const wf = createWorkflow('recurring-finite', {
+    const wf = env.workflow('recurring-finite', {
       steps: { tick: async () => 'ok' },
-      autoExecute: false,
     });
 
-    const draft = await wf.engine.start({}, { scheduledExecutionTime: new Date(Date.now() + 60_000) });
-    await WorkflowRunModel.updateOne(
-      { _id: draft._id },
-      {
-        $set: {
-          'scheduling.scheduledFor': '2026-06-10T03:00:00',
-          'scheduling.timezone': 'UTC',
-          'scheduling.executionTime': new Date(Date.now() - 1_000),
-          'scheduling.recurrence': { pattern: 'daily', count: 2, occurrences: 2 },
-        },
-      },
+    const draft = await wf.engine.start(
+      {},
+      { scheduledExecutionTime: new Date(Date.now() + 60_000) },
     );
+    await env.runs.update(draft._id, {
+      'scheduling.scheduledFor': '2026-06-10T03:00:00',
+      'scheduling.timezone': 'UTC',
+      'scheduling.executionTime': new Date(Date.now() - 1_000),
+      'scheduling.recurrence': { pattern: 'daily', count: 2, occurrences: 2 },
+    });
 
     const result = await wf.engine.executeRetry(draft._id);
     expect(result?.status).toBe('done');
 
-    const drafts = await WorkflowRunModel.find({
-      workflowId: 'recurring-finite',
-      status: 'draft',
-    }).lean();
+    const drafts = await env.runModel
+      .find({ workflowId: wf.engine.definition.id, status: 'draft' })
+      .lean();
     expect(drafts).toHaveLength(0);
-
-    wf.shutdown();
   });
 });
 
@@ -404,16 +364,12 @@ describe('v2.6: engine drives recurring schedules', () => {
 // ============================================================================
 
 describe('v2.6: step middleware', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('fires beforeStep/afterStep in order with output + durationMs', async () => {
     const calls: string[] = [];
     let observedOutput: unknown;
     let observedDuration: number | undefined;
 
-    const wf = createWorkflow('mw-basic', {
+    const wf = env.workflow('mw-basic', {
       steps: {
         one: async () => ({ ok: 1 }),
         two: async () => ({ ok: 2 }),
@@ -433,7 +389,6 @@ describe('v2.6: step middleware', () => {
         // Second middleware proves chain ordering.
         { name: 'second', beforeStep: ({ stepId }) => void calls.push(`before2:${stepId}`) },
       ],
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -450,14 +405,12 @@ describe('v2.6: step middleware', () => {
     ]);
     expect(observedOutput).toEqual({ ok: 2 });
     expect(typeof observedDuration).toBe('number');
-
-    wf.shutdown();
   });
 
   it('fires onStepError for failures and onWait for suspensions', async () => {
     const events: string[] = [];
 
-    const wf = createWorkflow('mw-error-wait', {
+    const wf = env.workflow('mw-error-wait', {
       steps: {
         gate: async (ctx) => {
           if (!(ctx.context as Record<string, unknown>).resumed) {
@@ -479,7 +432,6 @@ describe('v2.6: step middleware', () => {
           onStepError: ({ stepId, error }) => void events.push(`error:${stepId}:${error.message}`),
         },
       ],
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -490,12 +442,10 @@ describe('v2.6: step middleware', () => {
     result = await wf.resume(run._id, { approved: true });
     expect(result.status).toBe('failed');
     expect(events).toContain('error:boom:kaboom');
-
-    wf.shutdown();
   });
 
   it('swallows middleware errors — a throwing hook cannot fail the step', async () => {
-    const wf = createWorkflow('mw-swallow', {
+    const wf = env.workflow('mw-swallow', {
       steps: { fine: async () => 'ok' },
       middleware: [
         {
@@ -508,7 +458,6 @@ describe('v2.6: step middleware', () => {
           },
         },
       ],
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -516,8 +465,6 @@ describe('v2.6: step middleware', () => {
 
     expect(result.status).toBe('done');
     expect(result.steps[0]?.output).toBe('ok');
-
-    wf.shutdown();
   });
 });
 
@@ -526,14 +473,10 @@ describe('v2.6: step middleware', () => {
 // ============================================================================
 
 describe('v2.6: ctx.stream', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('emits step:stream frames on the container bus with monotonic seq', async () => {
     const frames: Array<{ seq: number; frame: unknown; stepId: string }> = [];
 
-    const wf = createWorkflow('stream-frames', {
+    const wf = env.workflow('stream-frames', {
       steps: {
         speak: async (ctx) => {
           ctx.stream({ token: 'frame-a' });
@@ -542,30 +485,33 @@ describe('v2.6: ctx.stream', () => {
           return 'spoken';
         },
       },
-      autoExecute: false,
     });
 
-    wf.container.eventBus.on('step:stream', (p) => {
+    const listener = (p: { seq: number; frame: unknown; stepId: string }) => {
       frames.push({ seq: p.seq, frame: p.frame, stepId: p.stepId });
-    });
+    };
+    wf.container.eventBus.on('step:stream', listener);
 
-    const run = await wf.start({});
-    const result = await wf.execute(run._id);
+    try {
+      const run = await wf.start({});
+      const result = await wf.execute(run._id);
 
-    expect(result.status).toBe('done');
-    expect(frames.map((f) => f.seq)).toEqual([0, 1, 2]);
-    expect(frames.map((f) => (f.frame as { token: string }).token)).toEqual([
-      'frame-a',
-      'frame-b',
-      'frame-c',
-    ]);
-    expect(frames.every((f) => f.stepId === 'speak')).toBe(true);
+      expect(result.status).toBe('done');
+      expect(frames.map((f) => f.seq)).toEqual([0, 1, 2]);
+      expect(frames.map((f) => (f.frame as { token: string }).token)).toEqual([
+        'frame-a',
+        'frame-b',
+        'frame-c',
+      ]);
+      expect(frames.every((f) => f.stepId === 'speak')).toBe(true);
 
-    // Non-durable contract: nothing about the frames lands on the run doc.
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(JSON.stringify(doc)).not.toContain('frame-a');
-
-    wf.shutdown();
+      // Non-durable contract: nothing about the frames lands on the run doc.
+      const doc = await env.runs.get(run._id);
+      expect(JSON.stringify(doc)).not.toContain('frame-a');
+    } finally {
+      // The env's container (and its bus) outlives this test.
+      wf.container.eventBus.off('step:stream', listener);
+    }
   });
 });
 
@@ -575,14 +521,10 @@ describe('v2.6: ctx.stream', () => {
 // ============================================================================
 
 describe('v2.6: abort semantics', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('cancel mid-loop stops iterations and leaves the run cancelled (not failed)', async () => {
     let iterations = 0;
 
-    const wf = createWorkflow('loop-cancel', {
+    const wf = env.workflow('loop-cancel', {
       steps: {
         spin: async (ctx) => {
           await ctx.loop(
@@ -597,14 +539,13 @@ describe('v2.6: abort semantics', () => {
           return 'unreachable';
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     const execPromise = wf.execute(run._id).catch(() => {});
 
     // Let a few iterations commit, then cancel.
-    await new Promise((r) => setTimeout(r, 100));
+    await env.eventually(() => expect(iterations).toBeGreaterThanOrEqual(3));
     const cancelled = await wf.cancel(run._id);
     expect(cancelled.status).toBe('cancelled');
 
@@ -612,21 +553,20 @@ describe('v2.6: abort semantics', () => {
     const countAtCancel = iterations;
 
     // No zombie loop: iteration counter must stop advancing after cancel.
+    // Deliberate window (several 30ms iterations long) where nothing may happen.
     await new Promise((r) => setTimeout(r, 150));
     expect(iterations).toBe(countAtCancel);
 
     // Abort is not a failure: final status stays cancelled, no failed write.
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.status).toBe('cancelled');
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(doc?.status).toBe('cancelled');
   });
 
   it('ctx.stream frames emitted after cancellation are dropped silently', async () => {
     const frames: number[] = [];
     let resumeAfterAbort: (() => void) | undefined;
 
-    const wf = createWorkflow('stream-abort', {
+    const wf = env.workflow('stream-abort', {
       steps: {
         speak: async (ctx) => {
           ctx.stream({ token: 'pre-cancel' }); // seq 0 — delivered
@@ -639,32 +579,33 @@ describe('v2.6: abort semantics', () => {
           return 'done-anyway';
         },
       },
-      autoExecute: false,
     });
 
-    wf.container.eventBus.on('step:stream', (p) => frames.push(p.seq));
+    const listener = (p: { seq: number }) => frames.push(p.seq);
+    wf.container.eventBus.on('step:stream', listener);
 
-    const run = await wf.start({});
-    const execPromise = wf.execute(run._id).catch(() => {});
+    try {
+      const run = await wf.start({});
+      const execPromise = wf.execute(run._id).catch(() => {});
 
-    await new Promise((r) => setTimeout(r, 50));
-    await wf.cancel(run._id);
-    resumeAfterAbort?.();
-    await execPromise;
+      // The step is parked (pre-cancel frame sent, abort listener attached).
+      await env.eventually(() => expect(resumeAfterAbort).toBeDefined());
+      await wf.cancel(run._id);
+      resumeAfterAbort?.();
+      await execPromise;
 
-    // Only the pre-cancel frame arrived; the post-cancel one was dropped
-    // without erroring the handler (abort ≠ error).
-    expect(frames).toEqual([0]);
-
-    wf.shutdown();
+      // Only the pre-cancel frame arrived; the post-cancel one was dropped
+      // without erroring the handler (abort ≠ error).
+      expect(frames).toEqual([0]);
+    } finally {
+      wf.container.eventBus.off('step:stream', listener);
+    }
   });
 
   it('loop resumes exactly from committed state when cancel beats a checkpoint', async () => {
     // Sibling guarantee to crash-resume: checkpoint() refuses writes once
     // aborted, so a cancelled run can never commit a torn iteration.
-    let observedCheckpointAfterCancel: unknown = 'not-read';
-
-    const wf = createWorkflow('loop-cancel-checkpoint', {
+    const wf = env.workflow('loop-cancel-checkpoint', {
       steps: {
         spin: async (ctx) => {
           await ctx.loop(
@@ -681,26 +622,20 @@ describe('v2.6: abort semantics', () => {
           return 'unreachable';
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     const execPromise = wf.execute(run._id).catch(() => {});
-    await new Promise((r) => setTimeout(r, 60));
+    // Iterations 0+1 committed (n=2) → the third iteration is now in flight.
+    await env.until(run._id, (r) => checkpointN(r.steps[0]?.output) === 2);
     await wf.cancel(run._id);
     await execPromise;
 
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.status).toBe('cancelled');
+    const doc = await env.runs.get(run._id);
+    expect(doc?.status).toBe('cancelled');
     // The persisted checkpoint reflects only COMMITTED iterations (n=2 from
     // iterations 0+1) — the in-flight third iteration never wrote.
-    const output = doc!.steps[0]?.output as
-      | { __checkpoint?: { state?: { n: number } } }
-      | undefined;
-    observedCheckpointAfterCancel = output?.__checkpoint?.state?.n;
-    expect(observedCheckpointAfterCancel).toBe(2);
-
-    wf.shutdown();
+    expect(checkpointN(doc?.steps[0]?.output)).toBe(2);
   });
 });
 
@@ -709,12 +644,8 @@ describe('v2.6: abort semantics', () => {
 // ============================================================================
 
 describe('v2.6: payload size guards', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('fails a step NON-retriably when output exceeds maxPayloadBytes', async () => {
-    const wf = createWorkflow('payload-cap-output', {
+    const wf = env.workflow('payload-cap-output', {
       steps: {
         big: {
           handler: async () => ({ blob: 'x'.repeat(5_000) }),
@@ -723,7 +654,6 @@ describe('v2.6: payload size guards', () => {
         },
       },
       maxPayloadBytes: 1_000,
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -732,12 +662,10 @@ describe('v2.6: payload size guards', () => {
     expect(result.status).toBe('failed');
     expect(result.steps[0]?.error?.message).toContain('maxPayloadBytes');
     expect(result.steps[0]?.attempts).toBe(1); // non-retriable
-
-    wf.shutdown();
   });
 
   it('fails a step NON-retriably when a checkpoint exceeds maxPayloadBytes', async () => {
-    const wf = createWorkflow('payload-cap-checkpoint', {
+    const wf = env.workflow('payload-cap-checkpoint', {
       steps: {
         big: {
           handler: async (ctx) => {
@@ -749,7 +677,6 @@ describe('v2.6: payload size guards', () => {
         },
       },
       maxPayloadBytes: 1_000,
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -758,23 +685,18 @@ describe('v2.6: payload size guards', () => {
     expect(result.status).toBe('failed');
     expect(result.steps[0]?.error?.message).toContain('maxPayloadBytes');
     expect(result.steps[0]?.attempts).toBe(1);
-
-    wf.shutdown();
   });
 
   it('default is warn-only: large outputs still succeed without a configured cap', async () => {
-    const wf = createWorkflow('payload-warn-only', {
+    const wf = env.workflow('payload-warn-only', {
       steps: {
         big: async () => ({ blob: 'x'.repeat(2_000_000) }), // > 1MB warn threshold
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     const result = await wf.execute(run._id);
 
     expect(result.status).toBe('done');
-
-    wf.shutdown();
   });
 });

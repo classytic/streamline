@@ -225,6 +225,23 @@ export class InvalidStateError extends WorkflowError {
   }
 }
 
+/**
+ * The executing attempt no longer owns the step: stale recovery (or a
+ * give-up sweep) re-claimed it, or the run was cancelled. Its writes are
+ * refused so a superseded worker can never overwrite the current attempt's
+ * result. An `InvalidStateError`, so the engine stops and re-reads rather
+ * than treating it as a step failure.
+ */
+export class AttemptSupersededError extends InvalidStateError {
+  constructor(runId: string, stepId: string) {
+    super('write step state', 'superseded', ['owned attempt'], { runId, stepId });
+    this.message =
+      `Step "${stepId}" of run "${runId}" is no longer owned by this attempt — it was ` +
+      `recovered by another worker or the run was cancelled. This attempt's writes are refused.`;
+    this.name = 'AttemptSupersededError';
+  }
+}
+
 export class StepTimeoutError extends WorkflowError {
   constructor(stepId: string, timeoutMs: number, runId?: string) {
     super(`Step "${stepId}" exceeded timeout of ${timeoutMs}ms`, ErrorCode.STEP_TIMEOUT, {

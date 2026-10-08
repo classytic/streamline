@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import type { StepState, WorkflowRun } from '../../src/core/types.js';
 import {
   applyStepUpdates,
   buildStepUpdateOps,
@@ -17,7 +18,6 @@ import {
   runSetUnset,
   toPlainRun,
 } from '../../src/storage/update-builders.js';
-import type { StepState, WorkflowRun } from '../../src/core/types.js';
 
 describe('normalizeUpdate', () => {
   it('passes an all-operator update through unchanged', () => {
@@ -65,8 +65,9 @@ describe('runSet', () => {
 
     expect(out.$set?.status).toBe('running');
     expect(out.$set?.updatedAt).toBeInstanceOf(Date);
-    expect((out.$set?.updatedAt as Date).getTime()).toBeGreaterThanOrEqual(before);
-    expect((out.$set?.updatedAt as Date).getTime()).toBeLessThanOrEqual(after);
+    const updatedAt = out.$set?.updatedAt as Date;
+    expect(updatedAt.getTime()).toBeGreaterThanOrEqual(before);
+    expect(updatedAt.getTime()).toBeLessThanOrEqual(after);
   });
 
   it('preserves caller-supplied keys alongside updatedAt', () => {
@@ -150,7 +151,7 @@ describe('applyStepUpdates', () => {
     ];
     const out = applyStepUpdates('a', steps, { error: undefined });
     expect(out[0].error).toBeUndefined();
-    expect(Object.prototype.hasOwnProperty.call(out[0], 'error')).toBe(false);
+    expect(Object.hasOwn(out[0], 'error')).toBe(false);
   });
 });
 
@@ -196,7 +197,12 @@ describe('applyStepUpdates — output-history ring mirror', () => {
   it('appends a version, leaving the in-memory mirror matching the DB push', () => {
     const steps: StepState[] = [{ stepId: 'a', status: 'done', attempts: 1, output: { gen: 2 } }];
     const v = { version: 1, output: { gen: 1 }, at: new Date(0), attempt: 1 };
-    const out = applyStepUpdates('a', steps, { status: 'done', output: { gen: 2 } }, { version: v, keep: 3 });
+    const out = applyStepUpdates(
+      'a',
+      steps,
+      { status: 'done', output: { gen: 2 } },
+      { version: v, keep: 3 },
+    );
     expect(out[0].outputHistory).toEqual([v]);
   });
 

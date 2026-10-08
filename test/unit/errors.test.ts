@@ -154,12 +154,7 @@ describe('HttpError conformance — status + hierarchical code on every Workflow
 
   it.each([
     ['WorkflowNotFoundError', new WorkflowNotFoundError('r1'), 404, 'workflow.not_found'],
-    [
-      'StepNotFoundError',
-      new StepNotFoundError('s', 'wf', ['a']),
-      404,
-      'workflow.step.not_found',
-    ],
+    ['StepNotFoundError', new StepNotFoundError('s', 'wf', ['a']), 404, 'workflow.step.not_found'],
     ['StepTimeoutError', new StepTimeoutError('s', 5000, 'r1'), 408, 'workflow.step.timeout'],
     [
       'InvalidStateError',
@@ -179,13 +174,16 @@ describe('HttpError conformance — status + hierarchical code on every Workflow
       500,
       'workflow.max_retries_exceeded',
     ],
-  ])('%s carries the right status + hierarchical code', (_name, err, expectedStatus, expectedCode) => {
-    expect(err.status).toBe(expectedStatus);
-    expect(err.code).toBe(expectedCode);
-    // Sanity: it's still a WorkflowError + an Error.
-    expect(err).toBeInstanceOf(WorkflowError);
-    expect(err).toBeInstanceOf(Error);
-  });
+  ])(
+    '%s carries the right status + hierarchical code',
+    (_name, err, expectedStatus, expectedCode) => {
+      expect(err.status).toBe(expectedStatus);
+      expect(err.code).toBe(expectedCode);
+      // Sanity: it's still a WorkflowError + an Error.
+      expect(err).toBeInstanceOf(WorkflowError);
+      expect(err).toBeInstanceOf(Error);
+    },
+  );
 
   it('every entry in ERROR_STATUS_MAP is a valid HTTP status code', () => {
     for (const status of Object.values(ERROR_STATUS_MAP)) {

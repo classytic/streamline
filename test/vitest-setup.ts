@@ -8,8 +8,9 @@
  *    call `teardownTestDB` in their own afterAll — inconsistent cleanup
  *    across files caused "different connection strings" races).
  */
-import { afterAll } from 'vitest';
+
 import { configureLogger } from '@classytic/mongokit';
+import { afterAll } from 'vitest';
 import { teardownTestDB } from './utils/setup.js';
 
 configureLogger(false);

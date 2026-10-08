@@ -16,6 +16,8 @@ const StepStateSchema = new Schema<StepState>(
       required: true,
     },
     attempts: { type: Number, default: 0 },
+    // Ownership token of the executing attempt (see StepState.attemptId).
+    attemptId: { type: String, required: false },
     startedAt: Date,
     completedAt: Date,
     endedAt: Date,
@@ -149,6 +151,22 @@ export function buildWorkflowRunSchema(tenantField = 'context.tenantId'): Schema
       endedAt: Date,
       lastHeartbeat: Date, // For detecting stale running workflows
       paused: { type: Boolean, default: false }, // User-initiated pause - scheduler skips paused workflows
+      pauseReason: { type: String, required: false }, // Why paused (operator reason / version-unavailable)
+      compensationDue: { type: Boolean, required: false }, // failed, saga not yet entered (crash marker)
+      compensationAttemptId: { type: String, required: false }, // owns the compensation walk
+      // Durable signal inbox (pending `signal()` entries) — see SignalEntry.
+      signals: {
+        type: [
+          {
+            _id: false,
+            id: { type: String, required: true },
+            name: { type: String, required: true },
+            data: { type: Schema.Types.Mixed },
+            at: { type: Date, required: true },
+          },
+        ],
+        default: undefined,
+      },
       scheduling: SchedulingInfoSchema, // Optional: timezone-aware scheduling metadata
       stepLogs: { type: [StepLogEntrySchema], default: undefined }, // Persisted step-level logs from ctx.log()
       idempotencyKey: String, // Dedup key — non-terminal runs block duplicates
@@ -199,8 +217,20 @@ export function buildWorkflowRunSchema(tenantField = 'context.tenantId'): Schema
   // the same prefix (P11.1; the audit's highest-traffic redundant index rode it).
   WorkflowRunSchema.index({ status: 1, updatedAt: -1 });
 
-  // Idempotency: compound index for "find active run by key" query
-  WorkflowRunSchema.index({ idempotencyKey: 1, status: 1 }, { sparse: true });
+  // Idempotency lookups WITHOUT the tenant prefix — single-tenant
+  // `findActiveByIdempotencyKey` and the child-workflow adopt-by-key probe —
+  // cannot use the `{ [tenantField], idempotencyKey }` unique below. PARTIAL,
+  // not sparse: a sparse COMPOUND indexes every doc holding ANY field, and
+  // every run has `status`, so it took a key per run write and the planner
+  // would not use it for a plain query. `$gte: ''` = string keys only, and is
+  // implied by an equality lookup. syncRetentionIndexes drops the old sparse one.
+  WorkflowRunSchema.index(
+    { idempotencyKey: 1, status: 1 },
+    {
+      name: 'idempotencyKey_1_status_1_str',
+      partialFilterExpression: { idempotencyKey: { $gte: '' } },
+    },
+  );
 
   /**
    * Idempotency race-safety (PACKAGE_RULES §32).
@@ -223,8 +253,9 @@ export function buildWorkflowRunSchema(tenantField = 'context.tenantId'): Schema
    * (like `done`/`failed`/`cancelled`), so the key becomes reusable once the
    * saga fully settles.
    *
-   * `idempotencyKey: { $type: 'string' }` is the standard guard against
-   * `null` collisions when other docs lack the field (PACKAGE_RULES §35).
+   * `idempotencyKey: { $gte: '' }` is the guard against `null` collisions when
+   * other docs lack the field (PACKAGE_RULES §35) — string-only by type
+   * bracketing, like `$type: 'string'`, but usable by equality lookups.
    *
    * ⚠️ Production deployment — clean active duplicates first.
    *
@@ -270,8 +301,14 @@ export function buildWorkflowRunSchema(tenantField = 'context.tenantId'): Schema
     { [tenantField]: 1, idempotencyKey: 1 },
     {
       unique: true,
+      // New name: the filter changed, and Mongo refuses to redefine an existing
+      // index in place. `syncIndexes()` drops the old `$type` one (retention.ts).
+      name: `${tenantField}_1_idempotencyKey_1_str`,
       partialFilterExpression: {
-        idempotencyKey: { $type: 'string' },
+        // `$gte: ''` admits exactly the string keys (type bracketing) AND is
+        // implied by an equality query, so the active-key lookup can use this
+        // index. `$type: 'string'` is never implied — the planner skipped it.
+        idempotencyKey: { $gte: '' },
         // 'compensating' is still active → keeps blocking duplicate keys.
         // Terminal 'compensated'/'compensation_failed' are excluded (key reusable).
         status: { $in: ['draft', 'running', 'waiting', 'compensating'] },

@@ -17,35 +17,18 @@
  * assertions below (exactly one) fail. With the fix they pass.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { createContainer, createWorkflow } from '../../src/index.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB, waitFor } from '../utils/setup.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 describe('resumeStep waiting-step CAS', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('two concurrent resumes with different payloads → exactly one wins, advances once', async () => {
-    const container = createContainer();
     let countRuns = 0;
     let resumedEvents = 0;
     const seenPayloads: unknown[] = [];
 
-    container.eventBus.on('workflow:resumed', (payload: { data?: unknown }) => {
-      resumedEvents++;
-      seenPayloads.push(payload.data);
-    });
-
-    const workflow = createWorkflow<{ approval?: unknown }>('resume-cas', {
+    const workflow = env.workflow<{ approval?: unknown }>('resume-cas', {
       steps: {
         gate: async (ctx) => {
           await ctx.wait('awaiting approval', {});
@@ -58,40 +41,48 @@ describe('resumeStep waiting-step CAS', () => {
         },
       },
       context: () => ({}),
-      container,
-      autoExecute: false,
     });
 
-    const run = await workflow.start({});
-    await workflow.execute(run._id);
+    const onResumed = (payload: { data?: unknown }) => {
+      resumedEvents++;
+      seenPayloads.push(payload.data);
+    };
+    env.container.eventBus.on('workflow:resumed', onResumed);
 
-    const waiting = await workflow.get(run._id);
-    expect(waiting?.status).toBe('waiting');
-    expect(waiting?.currentStepId).toBe('gate');
+    try {
+      const run = await workflow.start({});
+      await workflow.execute(run._id);
 
-    // Fire two concurrent resumes with DIFFERENT payloads.
-    await Promise.allSettled([
-      workflow.resume(run._id, { approver: 'A' }),
-      workflow.resume(run._id, { approver: 'B' }),
-    ]);
+      const waiting = await workflow.get(run._id);
+      expect(waiting?.status).toBe('waiting');
+      expect(waiting?.currentStepId).toBe('gate');
 
-    await waitFor(150);
+      // Fire two concurrent resumes with DIFFERENT payloads.
+      await Promise.allSettled([
+        workflow.resume(run._id, { approver: 'A' }),
+        workflow.resume(run._id, { approver: 'B' }),
+      ]);
 
-    const final = await workflow.get(run._id);
-    expect(final?.status).toBe('done');
+      await env.until(run._id, 'done');
+      // Window for a (buggy) second advance / second resumed event to land.
+      await new Promise((r) => setTimeout(r, 150));
+      const final = await workflow.get(run._id);
+      expect(final?.status).toBe('done');
+      if (!final) throw new Error('run vanished');
 
-    // EXACTLY ONE winner: the next step ran once, one resume event fired.
-    expect(countRuns).toBe(1);
-    expect(resumedEvents).toBe(1);
+      // EXACTLY ONE winner: the next step ran once, one resume event fired.
+      expect(countRuns).toBe(1);
+      expect(resumedEvents).toBe(1);
 
-    // The persisted gate output and the count step's recorded approval agree
-    // (no torn last-write-wins between the two payloads).
-    const gateStep = final?.steps.find((s) => s.stepId === 'gate');
-    expect(gateStep?.status).toBe('done');
-    expect(final?.context.approval).toEqual(gateStep?.output);
-    expect(seenPayloads).toHaveLength(1);
-    expect(gateStep?.output).toEqual(seenPayloads[0]);
-
-    workflow.shutdown();
+      // The persisted gate output and the count step's recorded approval agree
+      // (no torn last-write-wins between the two payloads).
+      const gateStep = final.steps.find((s) => s.stepId === 'gate');
+      expect(gateStep?.status).toBe('done');
+      expect(final.context.approval).toEqual(gateStep?.output);
+      expect(seenPayloads).toHaveLength(1);
+      expect(gateStep?.output).toEqual(seenPayloads[0]);
+    } finally {
+      env.container.eventBus.off('workflow:resumed', onResumed);
+    }
   });
 });

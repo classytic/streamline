@@ -155,13 +155,59 @@ const TENANT_WORKFLOW_RECENT_INDEX_NAME = 'streamline_tenant_workflow_recent';
 const LEGACY_IDEMPOTENCY_INDEX_NAME = 'idempotencyKey_1';
 
 /**
+ * Key patterns streamline once declared and has retired, matched EXACTLY (name
+ * and order) so a host index is never caught. Each costs index writes on every
+ * run update while serving no engine query.
+ */
+const RETIRED_KEY_PATTERNS: ReadonlyArray<{ keys: readonly string[]; reason: string }> = [
+  {
+    // ≤2.8.1 keyset index; 2.8.2 replaced it with ESR `{ status, workflowId, updatedAt, _id }`.
+    keys: ['status', 'paused', 'workflowId', 'updatedAt', '_id'],
+    reason: 'superseded by the ESR { status, workflowId, updatedAt, _id } (2.8.2)',
+  },
+  {
+    // ≤2.8.1 multikey over WHOLE step subdocuments: one key per step per run write.
+    keys: ['status', 'paused', 'steps', 'updatedAt', '_id'],
+    reason: 'multikey over whole steps — a key per step on every run write (retired in 2.8.2)',
+  },
+];
+
+/** Why `ix` is a retired streamline index, or `undefined` if it is not one. */
+function retiredStreamlineIndex(ix: {
+  key?: Record<string, unknown>;
+  unique?: boolean;
+  sparse?: boolean;
+  partialFilterExpression?: unknown;
+}): string | undefined {
+  const keys = Object.keys(ix.key ?? {});
+  const same = (pattern: readonly string[]) =>
+    keys.length === pattern.length && pattern.every((k, i) => keys[i] === k);
+
+  // Tenant-scoped idempotency unique with a `$type: 'string'` filter — equality
+  // lookups cannot use it; `…_str` (`$gte: ''`) admits the same rows. Matched
+  // by filter shape: the tenant field is configurable.
+  const filter = ix.partialFilterExpression as { idempotencyKey?: { $type?: unknown } } | undefined;
+  if (ix.unique && filter?.idempotencyKey?.$type !== undefined) {
+    return "replaced by the equality-usable '…_str'";
+  }
+  // Sparse COMPOUND `{ idempotencyKey, status }` — indexes every run (all have
+  // `status`) and the planner won't use it for a plain query.
+  if (ix.sparse === true && same(['idempotencyKey', 'status'])) {
+    return "sparse compound indexed every run; replaced by partial 'idempotencyKey_1_status_1_str'";
+  }
+  return RETIRED_KEY_PATTERNS.find((p) => same(p.keys))?.reason;
+}
+
+/**
  * Idempotently build ALL of streamline's indexes on `workflow_runs` — the
  * deploy-time index-sync helper (mirrors the kernel `syncIndexes()` convention).
  *
  * Does three things, each idempotent:
  *   1. **Migration** — drops the legacy `idempotencyKey_1` unique index if
  *      present (pre-2.9 global idempotency), so it can't shadow the new
- *      tenant-scoped compound. No-op on a fresh DB or once dropped.
+ *      tenant-scoped compound, and every other index an older streamline
+ *      declared and later retired (exact key match — see
+ *      `retiredStreamlineIndex`). No-op on a fresh DB or once dropped.
  *   2. **Schema indexes** — builds the schema-defined indexes (compound
  *      partial-unique idempotency, status/heartbeat, …) via the model's
  *      NON-destructive `createIndexes()` — never drops host-added indexes
@@ -196,8 +242,25 @@ export async function syncRetentionIndexes(
       `[streamline] dropped legacy '${LEGACY_IDEMPOTENCY_INDEX_NAME}' index — idempotency is now tenant-scoped`,
     );
   } catch (err) {
+    // 27 IndexNotFound (already migrated) · 26 NamespaceNotFound (fresh DB —
+    // the collection does not exist yet; nothing to migrate).
     const code = (err as { code?: number }).code;
-    if (code !== 27) throw err;
+    if (code !== 27 && code !== 26) throw err;
+  }
+
+  // (1b) Migration: drop indexes earlier streamline versions declared and later
+  // retired. `createIndexes()` below never removes anything, so without this
+  // every deployment that ran an older version keeps paying their write cost.
+  const existing = await collection.indexes().catch((err: { code?: number }) => {
+    if (err.code === 26) return []; // fresh DB — no collection, no indexes
+    throw err;
+  });
+  for (const ix of existing) {
+    const reason = retiredStreamlineIndex(ix);
+    if (ix.name && reason) {
+      await collection.dropIndex(ix.name);
+      logger.info(`[streamline] dropped retired index '${ix.name}' — ${reason}`);
+    }
   }
 
   // (2) Build the schema-defined indexes (incl. the tenant-scoped compound

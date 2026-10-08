@@ -15,6 +15,11 @@
 import { describe, expect, it } from 'vitest';
 import { CommonQueries, WorkflowQueryBuilder } from '../../src/storage/query-builder.js';
 
+/** The `steps.$elemMatch` clause of a built filter (filters are typed as plain records). */
+function elemMatch(query: Record<string, unknown>): Record<string, unknown> {
+  return (query.steps as { $elemMatch: Record<string, unknown> }).$elemMatch;
+}
+
 describe('WorkflowQueryBuilder.withChildWaiting', () => {
   it('builds an $elemMatch on a waiting childWorkflow step (no cadence gate when reconcileBefore omitted)', () => {
     const query = WorkflowQueryBuilder.create().withChildWaiting().build();
@@ -28,7 +33,7 @@ describe('WorkflowQueryBuilder.withChildWaiting', () => {
       },
     });
     // No nextReconcileAt clause when reconcileBefore is absent.
-    expect(query.steps.$elemMatch['waitingFor.nextReconcileAt']).toBeUndefined();
+    expect(elemMatch(query)['waitingFor.nextReconcileAt']).toBeUndefined();
   });
 
   it('adds the reconcile-cadence gate when reconcileBefore is supplied', () => {
@@ -84,10 +89,10 @@ describe('CommonQueries.childWaiting', () => {
     const child = CommonQueries.childWaiting(new Date());
     const timer = CommonQueries.readyToResume(new Date());
 
-    expect(child.steps.$elemMatch['waitingFor.type']).toBe('childWorkflow');
-    expect(timer.steps.$elemMatch['waitingFor.type']).toBe('timer');
+    expect(elemMatch(child)['waitingFor.type']).toBe('childWorkflow');
+    expect(elemMatch(timer)['waitingFor.type']).toBe('timer');
     // The childWaiting query intentionally has no resumeAt clause — that's the
     // whole reason timer-ready never reclaims a childWorkflow wait.
-    expect(child.steps.$elemMatch['waitingFor.resumeAt']).toBeUndefined();
+    expect(elemMatch(child)['waitingFor.resumeAt']).toBeUndefined();
   });
 });

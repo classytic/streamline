@@ -4,39 +4,28 @@
  * This test suite validates all 6 critical fixes documented in CRITICAL_FIXES_V1.md
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import {
-  createWorkflow,
-  StepContext,
-  workflowDefinitionRepository,
-} from '../../src/index.js';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { getCPUUsage } from '../../src/config/engine-config.js';
+import { type StepContext, workflowDefinitionRepository } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+import { setupTestDB } from '../utils/setup.js';
 
-let mongoServer: MongoMemoryServer;
-
-beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
-  await mongoose.connect(mongoServer.getUri());
-
-  // Ensure indexes are created (critical for tests)
-  await Promise.all([
-    mongoose.connection.collection('workflow_definitions').createIndex(
-      { workflowId: 1, version: -1 },
-      { unique: true }
-    ),
-    mongoose.connection.collection('workflow_runs').createIndex({ workflowId: 1, status: 1 }),
-  ]);
-}, 60000); // Increase timeout for MongoDB download
-
-afterAll(async () => {
-  await mongoose.disconnect();
-  await mongoServer.stop();
-});
+const env = useStreamlineEnv();
 
 describe('Critical Fixes Regression Tests', () => {
+  // `workflowDefinitionRepository` is a default-connection singleton (bound to
+  // the global mongoose models, no container/connection seam) — this block
+  // tests that API itself, so it stays on the legacy global connection.
   describe('Issue 1: Workflow Versioning (HIGH)', () => {
+    beforeAll(async () => {
+      await setupTestDB();
+      // Ensure the versioning unique index exists (critical for these tests)
+      await mongoose.connection
+        .collection('workflow_definitions')
+        .createIndex({ workflowId: 1, version: -1 }, { unique: true });
+    });
+
     it('should allow multiple versions of the same workflow', async () => {
       // Create version 1.0.0
       const def1 = await workflowDefinitionRepository.create({
@@ -47,7 +36,6 @@ describe('Critical Fixes Regression Tests', () => {
           { id: 'step1', name: 'Step 1' },
           { id: 'step2', name: 'Step 2' },
         ],
-        createContext: (input: any) => input,
         isActive: true,
       });
 
@@ -61,7 +49,6 @@ describe('Critical Fixes Regression Tests', () => {
           { id: 'step2', name: 'Step 2' },
           { id: 'step3', name: 'Step 3 (new)' },
         ],
-        createContext: (input: any) => input,
         isActive: true,
       });
 
@@ -77,16 +64,16 @@ describe('Critical Fixes Regression Tests', () => {
 
       // Should get latest version
       const latest = await workflowDefinitionRepository.getLatestVersion('test-versioned-wf');
-      expect(latest.version).toBe('2.0.0');
+      expect(latest?.version).toBe('2.0.0');
 
       // Should get specific version
       const v1 = await workflowDefinitionRepository.getByVersion('test-versioned-wf', '1.0.0');
-      expect(v1.version).toBe('1.0.0');
-      expect(v1.steps).toHaveLength(2);
+      expect(v1?.version).toBe('1.0.0');
+      expect(v1?.steps).toHaveLength(2);
 
       const v2 = await workflowDefinitionRepository.getByVersion('test-versioned-wf', '2.0.0');
-      expect(v2.version).toBe('2.0.0');
-      expect(v2.steps).toHaveLength(3);
+      expect(v2?.version).toBe('2.0.0');
+      expect(v2?.steps).toHaveLength(3);
     });
 
     it('should reject duplicate workflowId + version combination', async () => {
@@ -95,7 +82,6 @@ describe('Critical Fixes Regression Tests', () => {
         name: 'Test',
         version: '1.0.0',
         steps: [{ id: 'step1', name: 'Step 1' }],
-        createContext: (input: any) => input,
         isActive: true,
       });
 
@@ -106,9 +92,8 @@ describe('Critical Fixes Regression Tests', () => {
           name: 'Test',
           version: '1.0.0', // Same combination
           steps: [{ id: 'step1', name: 'Step 1' }],
-          createContext: (input: any) => input,
           isActive: true,
-        })
+        }),
       ).rejects.toThrow();
     });
   });
@@ -117,9 +102,9 @@ describe('Critical Fixes Regression Tests', () => {
     it('should clear error field after step retry succeeds', async () => {
       let attemptCount = 0;
 
-      const workflow = createWorkflow<{ value: string }>('error-clear-test', {
+      const workflow = env.workflow<{ value: string }, { value: string }>('error-clear-test', {
         steps: {
-          flaky: async (ctx: StepContext<{ value: string }>) => {
+          flaky: async () => {
             attemptCount++;
             if (attemptCount === 1) {
               // First attempt fails
@@ -132,9 +117,8 @@ describe('Critical Fixes Regression Tests', () => {
             return { done: true };
           },
         },
-        context: (input: { value: string }) => ({ value: input.value }),
+        context: (input) => ({ value: input.value }),
         defaults: { retries: 3 },
-        autoExecute: false,
       });
 
       const run = await workflow.start({ value: 'test' });
@@ -151,15 +135,13 @@ describe('Critical Fixes Regression Tests', () => {
       expect(flakyStep?.attempts).toBe(2); // 1 failed + 1 succeeded
       expect(flakyStep?.error).toBeUndefined(); // Error MUST be cleared
       expect(flakyStep?.output).toBeDefined();
-      expect(flakyStep?.output.success).toBe(true);
-
-      workflow.shutdown();
+      expect((flakyStep?.output as { success?: boolean } | undefined)?.success).toBe(true);
     }, 10000);
 
     it('should clear waitingFor field after step resumes and completes', async () => {
-      const workflow = createWorkflow<{ approved?: boolean }>('waiting-clear-test', {
+      const workflow = env.workflow<{ approved?: boolean }>('waiting-clear-test', {
         steps: {
-          request: async (ctx: StepContext<{ approved?: boolean }>) => {
+          request: async (ctx) => {
             await ctx.wait('human-approval', { message: 'Please approve' });
             return { requested: true };
           },
@@ -168,17 +150,16 @@ describe('Critical Fixes Regression Tests', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
 
       const run = await workflow.start({});
 
       // Execute until waiting
       await workflow.execute(run._id);
-      let current = await workflow.get(run._id);
+      const current = await workflow.get(run._id);
 
-      expect(current!.status).toBe('waiting');
-      const requestStep = current!.steps.find((s) => s.stepId === 'request');
+      expect(current?.status).toBe('waiting');
+      const requestStep = current?.steps.find((s) => s.stepId === 'request');
       expect(requestStep?.waitingFor).toBeDefined();
       expect(requestStep?.waitingFor?.reason).toBe('human-approval');
 
@@ -193,8 +174,6 @@ describe('Critical Fixes Regression Tests', () => {
       expect(completedStep?.status).toBe('done');
       expect(completedStep?.waitingFor).toBeUndefined(); // WaitingFor MUST be cleared
       expect(completedStep?.error).toBeUndefined();
-
-      workflow.shutdown();
     });
   });
 
@@ -228,7 +207,7 @@ describe('Critical Fixes Regression Tests', () => {
       expect(usage).toBeGreaterThanOrEqual(0);
       expect(usage).toBeLessThanOrEqual(1);
 
-      // Wait > 5 seconds to make sample stale
+      // Wait > 5 seconds to make sample stale (the staleness window IS the feature)
       await new Promise((resolve) => setTimeout(resolve, 6000));
 
       const staleUsage = getCPUUsage();
@@ -242,14 +221,13 @@ describe('Critical Fixes Regression Tests', () => {
 
   describe('Issue 4: WorkflowRun.output Never Set (MEDIUM)', () => {
     it('should set workflow output to last step output on completion', async () => {
-      const workflow = createWorkflow<{ result?: string }>('output-test', {
+      const workflow = env.workflow<{ result?: string }>('output-test', {
         steps: {
           step1: async () => ({ value: 'first' }),
           step2: async () => ({ value: 'second' }),
           step3: async () => ({ value: 'final result', completed: true }),
         },
         context: () => ({}),
-        autoExecute: false,
       });
 
       const run = await workflow.start({});
@@ -262,12 +240,10 @@ describe('Critical Fixes Regression Tests', () => {
       // Output should match last step's output
       const lastStep = result.steps.find((s) => s.stepId === 'step3');
       expect(result.output).toEqual(lastStep?.output);
-
-      workflow.shutdown();
     });
 
     it('should have undefined output for incomplete workflows', async () => {
-      const workflow = createWorkflow('incomplete-test', {
+      const workflow = env.workflow('incomplete-test', {
         steps: {
           step1: async () => ({ value: 'first' }),
           step2: async (ctx: StepContext) => {
@@ -275,7 +251,6 @@ describe('Critical Fixes Regression Tests', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
 
       const run = await workflow.start({});
@@ -283,30 +258,27 @@ describe('Critical Fixes Regression Tests', () => {
 
       expect(result.status).toBe('waiting');
       expect(result.output).toBeUndefined(); // Not completed yet
-
-      workflow.shutdown();
     });
   });
 
   describe('Issue 5: Stale Data in rewindRun (MEDIUM)', () => {
     it('should clear output, error, and waitingFor when rewinding', async () => {
-      const workflow = createWorkflow<{ counter: number }>('rewind-test', {
+      const workflow = env.workflow<{ counter: number }>('rewind-test', {
         steps: {
-          step1: async (ctx: StepContext<{ counter: number }>) => {
+          step1: async (ctx) => {
             await ctx.set('counter', ctx.context.counter + 1);
             return { step: 1, counter: ctx.context.counter };
           },
-          step2: async (ctx: StepContext<{ counter: number }>) => {
+          step2: async (ctx) => {
             await ctx.set('counter', ctx.context.counter + 1);
             return { step: 2, counter: ctx.context.counter };
           },
-          step3: async (ctx: StepContext<{ counter: number }>) => {
+          step3: async (ctx) => {
             await ctx.set('counter', ctx.context.counter + 1);
             return { step: 3, counter: ctx.context.counter };
           },
         },
         context: () => ({ counter: 0 }),
-        autoExecute: false,
       });
 
       const run = await workflow.start({});
@@ -317,9 +289,9 @@ describe('Critical Fixes Regression Tests', () => {
       expect(completed.output).toBeDefined();
 
       // Verify all steps have output
-      completed.steps.forEach((step) => {
+      for (const step of completed.steps) {
         expect(step.output).toBeDefined();
-      });
+      }
 
       // Rewind to step2
       const rewound = await workflow.rewindTo(run._id, 'step2');
@@ -350,14 +322,12 @@ describe('Critical Fixes Regression Tests', () => {
       const reExecuted = await workflow.execute(run._id);
       expect(reExecuted.status).toBe('done');
       expect(reExecuted.output).toBeDefined(); // New output set
-
-      workflow.shutdown();
     });
   });
 
   describe('Issue 6: Duplicate Step IDs (LOW)', () => {
     it('should reject workflow with duplicate step IDs', () => {
-      const workflow = createWorkflow('duplicate-test', {
+      const workflow = env.workflow('duplicate-test', {
         steps: {
           validate: async () => ({ ok: true }),
           process: async () => ({ ok: true }),
@@ -369,12 +339,10 @@ describe('Critical Fixes Regression Tests', () => {
 
       // Creating workflow should work with unique step IDs
       expect(workflow.engine).toBeDefined();
-
-      workflow.shutdown();
     });
 
     it('should accept workflow with unique step IDs', () => {
-      const workflow = createWorkflow('unique-test', {
+      const workflow = env.workflow('unique-test', {
         steps: {
           validate: async () => ({ ok: true }),
           process: async () => ({ ok: true }),
@@ -385,8 +353,6 @@ describe('Critical Fixes Regression Tests', () => {
 
       // Should not throw - engine should be created
       expect(workflow.engine).toBeDefined();
-
-      workflow.shutdown();
     });
   });
 
@@ -395,16 +361,15 @@ describe('Critical Fixes Regression Tests', () => {
       // This test verifies that execute() calls scheduler.start() for retries
       // Note: With short delays (< 5s), inline handling may complete before we check
 
-      const workflow = createWorkflow('scheduler-start-test', {
+      const workflow = env.workflow('scheduler-start-test', {
         steps: {
           step1: async () => ({ done: true }),
         },
         context: () => ({}),
-        autoExecute: false,
       });
 
       // Initially scheduler should not be polling
-      let stats = workflow.engine.getSchedulerStats();
+      const stats = workflow.engine.getSchedulerStats();
       expect(stats.isPolling).toBe(false);
 
       // Start and execute a simple workflow
@@ -412,13 +377,11 @@ describe('Critical Fixes Regression Tests', () => {
       const result = await workflow.execute(run._id);
 
       expect(result.status).toBe('done');
-
-      workflow.shutdown();
     });
 
     it('should start scheduler when workflows are waiting', async () => {
       // Scheduler uses startIfNeeded() which only starts when workflows exist
-      const workflow = createWorkflow('scheduler-wait-test', {
+      const workflow = env.workflow('scheduler-wait-test', {
         steps: {
           step1: async () => ({ completed: true }),
           wait: async (ctx: StepContext) => {
@@ -426,11 +389,10 @@ describe('Critical Fixes Regression Tests', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
 
       // Initially not polling (no waiting workflows)
-      let stats = workflow.engine.getSchedulerStats();
+      const stats = workflow.engine.getSchedulerStats();
       expect(stats.isPolling).toBe(false);
 
       // Start and execute - will pause at wait step
@@ -441,26 +403,23 @@ describe('Critical Fixes Regression Tests', () => {
 
       // Now there's a waiting workflow - scheduler should start on next check
       // (In production, the scheduler would pick this up via its polling)
-
-      workflow.shutdown();
     });
   });
 
   describe('Issue 8: Data Corruption Guard for Missing StepState (LOW)', () => {
     it('should handle corrupted run where currentStepId does not exist in steps', async () => {
-      const workflow = createWorkflow<{ value: number }>('corruption-guard-test', {
+      const workflow = env.workflow<{ value: number }>('corruption-guard-test', {
         steps: {
-          step1: async (ctx: StepContext<{ value: number }>) => {
+          step1: async (ctx) => {
             await ctx.set('value', 1);
             return { done: true };
           },
-          step2: async (ctx: StepContext<{ value: number }>) => {
+          step2: async (ctx) => {
             await ctx.set('value', 2);
             return { done: true };
           },
         },
         context: () => ({ value: 0 }),
-        autoExecute: false,
       });
 
       const run = await workflow.start({});
@@ -471,8 +430,6 @@ describe('Critical Fixes Regression Tests', () => {
       // Verify normal execution works
       expect(result.status).toBe('done');
       expect(result.context.value).toBe(2);
-
-      workflow.shutdown();
     });
   });
 });

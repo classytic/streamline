@@ -7,43 +7,28 @@
  * - Adaptive polling (adjusts interval based on load)
  * - Metrics tracking
  * - Health checks
+ *
+ * The subject here IS the scheduler's behaviour over real polling time, so
+ * real poll intervals stay. Waits are on the scheduler's own stats (not a
+ * guessed sleep), except where a test asserts that NOTHING happens.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import mongoose from 'mongoose';
-import { createWorkflow } from '../../src/index.js';
-import { WorkflowRunModel } from '../../src/storage/models.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-// Track workflows for cleanup
-const createdWorkflows: { shutdown: () => void }[] = [];
+const env = useStreamlineEnv();
 
 describe('Smart Scheduler E2E', () => {
-  beforeEach(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect('mongodb://localhost:27017/streamline-test');
-    }
-    await WorkflowRunModel.deleteMany({});
-    createdWorkflows.length = 0;
-  });
-
-  afterEach(async () => {
-    // Shutdown all workflows first to stop background processes
-    createdWorkflows.forEach((w) => w.shutdown());
-    await WorkflowRunModel.deleteMany({});
-  });
-
   describe('Lazy Start', () => {
     it('should NOT start polling if no workflows exist', async () => {
-      const workflow = createWorkflow('test-workflow', {
+      const workflow = env.workflow('test-workflow', {
         steps: {
           step1: async () => ({ done: true }),
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
-      // Wait a bit
+      // Asserts that NOTHING starts — a real wait, not a guess at an outcome.
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       const stats = workflow.engine.getSchedulerStats();
@@ -52,16 +37,14 @@ describe('Smart Scheduler E2E', () => {
     });
 
     it('should start polling when first workflow is created', async () => {
-      const workflow = createWorkflow<{ value: number }>('sleep-workflow', {
+      const workflow = env.workflow<{ value: number }, { value: number }>('sleep-workflow', {
         steps: {
           sleep: async (ctx) => {
             await ctx.sleep(60000); // 60 second sleep (long enough to go through scheduler)
           },
         },
         context: (input) => ({ value: input.value }),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       // Configure scheduler options via engine
       workflow.engine.configure({
@@ -78,8 +61,8 @@ describe('Smart Scheduler E2E', () => {
       const run = await workflow.start({ value: 42 });
       await workflow.execute(run._id);
 
-      // Wait for scheduler to start
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Wait for scheduler to start (the original budget was 500ms)
+      await env.eventually(() => workflow.engine.getSchedulerStats().isPolling, { timeout: 500 });
 
       // Should now be polling
       stats = workflow.engine.getSchedulerStats();
@@ -89,16 +72,14 @@ describe('Smart Scheduler E2E', () => {
 
   describe('Auto-Stop', () => {
     it('should stop polling after idle timeout when no workflows', async () => {
-      const workflow = createWorkflow('quick-workflow', {
+      const workflow = env.workflow('quick-workflow', {
         steps: {
           sleep: async (ctx) => {
             await ctx.sleep(60000); // Long sleep to trigger scheduler
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       workflow.engine.configure({
         scheduler: {
@@ -112,15 +93,17 @@ describe('Smart Scheduler E2E', () => {
       await workflow.execute(run._id);
 
       // Scheduler should be polling now
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await env.eventually(() => workflow.engine.getSchedulerStats().isPolling, { timeout: 500 });
       let stats = workflow.engine.getSchedulerStats();
       expect(stats.isPolling).toBe(true);
 
       // Cancel the workflow (removes it from waiting pool)
       await workflow.cancel(run._id);
 
-      // Wait for idle timeout
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      // Wait for the idle timeout (2s) to stop polling — same 3s budget as before
+      await env.eventually(() => !workflow.engine.getSchedulerStats().isPolling, {
+        timeout: 3000,
+      });
 
       // Should have stopped polling
       stats = workflow.engine.getSchedulerStats();
@@ -130,16 +113,14 @@ describe('Smart Scheduler E2E', () => {
 
   describe('Adaptive Polling', () => {
     it('should adjust interval based on workflow count', async () => {
-      const workflow = createWorkflow('sleep-workflow', {
+      const workflow = env.workflow('sleep-workflow', {
         steps: {
           sleep: async (ctx) => {
             await ctx.sleep(60000); // 60 second sleep
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       workflow.engine.configure({
         scheduler: {
@@ -157,7 +138,9 @@ describe('Smart Scheduler E2E', () => {
       }
 
       // Wait for scheduler to poll (at least one poll cycle)
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await env.eventually(() => workflow.engine.getSchedulerStats().totalPolls > 0, {
+        timeout: 2000,
+      });
 
       // Scheduler should be polling (monitoring the waiting workflows)
       // Note: activeWorkflows counts workflows READY to process, not waiting workflows
@@ -167,23 +150,21 @@ describe('Smart Scheduler E2E', () => {
       expect(stats.totalPolls).toBeGreaterThan(0);
 
       // Verify we created the workflows (they exist in DB waiting)
-      const waitingCount = await WorkflowRunModel.countDocuments({ status: 'waiting' });
+      const waitingCount = await env.runModel.countDocuments({ status: 'waiting' });
       expect(waitingCount).toBeGreaterThanOrEqual(10);
     });
   });
 
   describe('Metrics & Health', () => {
     it('should track polling metrics', async () => {
-      const workflow = createWorkflow('test-workflow', {
+      const workflow = env.workflow('test-workflow', {
         steps: {
           sleep: async (ctx) => {
             await ctx.sleep(60000); // Long sleep to go through scheduler
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       workflow.engine.configure({
         scheduler: {
@@ -195,8 +176,9 @@ describe('Smart Scheduler E2E', () => {
       const run = await workflow.start({});
       await workflow.execute(run._id);
 
-      // Wait for a few polls
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // Wait for the first poll to be recorded. (After it, nothing is due for
+      // 60s, so the scheduler backs off — the old 2s sleep also saw one poll.)
+      await env.eventually(() => workflow.engine.getSchedulerStats().totalPolls > 0);
 
       const stats = workflow.engine.getSchedulerStats();
 
@@ -208,16 +190,14 @@ describe('Smart Scheduler E2E', () => {
     });
 
     it('should report healthy when working correctly', async () => {
-      const workflow = createWorkflow('test-workflow', {
+      const workflow = env.workflow('test-workflow', {
         steps: {
           step1: async (ctx) => {
             await ctx.sleep(60000); // Long sleep to go through scheduler
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       workflow.engine.configure({
         scheduler: {
@@ -229,8 +209,9 @@ describe('Smart Scheduler E2E', () => {
       const run = await workflow.start({});
       await workflow.execute(run._id);
 
-      // Wait for polling to start
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Wait until polling is established — the first poll recorded (an
+      // isPolling scheduler with no lastPollAt reports unhealthy).
+      await env.eventually(() => workflow.engine.getSchedulerStats().totalPolls > 0);
 
       // Should be healthy
       expect(workflow.engine.isSchedulerHealthy()).toBe(true);
@@ -241,7 +222,7 @@ describe('Smart Scheduler E2E', () => {
     it('should resume workflow at correct time', async () => {
       const step2ExecutedAt: number[] = [];
 
-      const workflow = createWorkflow('timer-workflow', {
+      const workflow = env.workflow('timer-workflow', {
         steps: {
           step1: async (ctx) => {
             await ctx.sleep(2000); // 2 seconds (short enough for inline execution)
@@ -252,9 +233,7 @@ describe('Smart Scheduler E2E', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       workflow.engine.configure({
         scheduler: {
@@ -281,41 +260,21 @@ describe('Smart Scheduler E2E', () => {
     it('should handle multiple engines without duplicate resumes', async () => {
       let resumeCount = 0;
 
-      const workflow1 = createWorkflow('multi-engine-workflow', {
-        steps: {
-          sleep: async (ctx) => {
-            resumeCount++;
-            await ctx.sleep(1000); // Short sleep for inline execution
-          },
+      const sleepSteps = {
+        sleep: async (ctx: { sleep(ms: number): Promise<void> }) => {
+          resumeCount++;
+          await ctx.sleep(1000); // Short sleep for inline execution
         },
-        context: () => ({}),
-        autoExecute: false,
-      });
-      createdWorkflows.push(workflow1);
+      };
 
-      const workflow2 = createWorkflow('multi-engine-workflow', {
-        steps: {
-          sleep: async (ctx) => {
-            resumeCount++;
-            await ctx.sleep(1000);
-          },
-        },
+      const workflow1 = env.workflow('multi-engine-workflow', {
+        steps: sleepSteps,
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow2);
 
-      const workflow3 = createWorkflow('multi-engine-workflow', {
-        steps: {
-          sleep: async (ctx) => {
-            resumeCount++;
-            await ctx.sleep(1000);
-          },
-        },
-        context: () => ({}),
-        autoExecute: false,
-      });
-      createdWorkflows.push(workflow3);
+      // Two more engines for the SAME workflow id (simulating 3 servers)
+      const workflow2 = env.redefine(workflow1, { steps: sleepSteps, context: () => ({}) });
+      const workflow3 = env.redefine(workflow1, { steps: sleepSteps, context: () => ({}) });
 
       // Configure all engines (simulating 3 servers)
       workflow1.engine.configure({ scheduler: { basePollInterval: 300 } });

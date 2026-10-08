@@ -25,26 +25,19 @@
  * persisted run shape after `start()`, which is what the gates control.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { createWorkflow, WorkflowRunModel } from '../../src/index.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB } from '../utils/setup.js';
+import { describe, expect, it } from 'vitest';
+import { createWorkflow } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
+
+type Ctx = Record<string, unknown>;
+type UserInput = { userId: string };
 
 describe('concurrency.throttle — N starts per windowMs per key', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('admits starts up to the limit immediately', async () => {
-    const wf = createWorkflow<{ userId: string }>('throttle-immediate', {
+    const wf = env.workflow<Ctx, UserInput>('throttle-immediate', {
       steps: { run: async () => 'ok' },
-      autoExecute: false,
       concurrency: {
         key: (input) => input.userId,
         throttle: { limit: 3, windowMs: 60_000 },
@@ -67,9 +60,8 @@ describe('concurrency.throttle — N starts per windowMs per key', () => {
     // anchored to when the oldest in-window start rolls off. Deeper bursts
     // are exercised in the scenarios suite — they stagger by
     // `windowMs / limit` after the tail.
-    const wf = createWorkflow<{ userId: string }>('throttle-queue', {
+    const wf = env.workflow<Ctx, UserInput>('throttle-queue', {
       steps: { run: async () => 'ok' },
-      autoExecute: false,
       concurrency: {
         key: (input) => input.userId,
         throttle: { limit: 2, windowMs: 5_000 },
@@ -83,18 +75,17 @@ describe('concurrency.throttle — N starts per windowMs per key', () => {
 
     expect(queued.meta?.streamlineGate).toBe('throttle');
 
-    const queuedRun = await WorkflowRunModel.findById(queued._id).lean();
-    const fireAt = queuedRun?.scheduling?.executionTime as Date | undefined;
+    const queuedRun = await env.runs.get(queued._id);
+    const fireAt = queuedRun?.scheduling?.executionTime;
     expect(fireAt).toBeInstanceOf(Date);
-    const expected = new Date(first.createdAt as Date).getTime() + 5_000;
+    const expected = new Date(first.createdAt).getTime() + 5_000;
     expect(Math.abs((fireAt as Date).getTime() - expected)).toBeLessThanOrEqual(1_000);
     expect((fireAt as Date).getTime()).toBeGreaterThanOrEqual(t0);
   });
 
   it('isolates throttle by concurrencyKey', async () => {
-    const wf = createWorkflow<{ userId: string }>('throttle-isolation', {
+    const wf = env.workflow<Ctx, UserInput>('throttle-isolation', {
       steps: { run: async () => 'ok' },
-      autoExecute: false,
       concurrency: {
         key: (input) => input.userId,
         throttle: { limit: 1, windowMs: 60_000 },
@@ -109,9 +100,11 @@ describe('concurrency.throttle — N starts per windowMs per key', () => {
   });
 
   it('throws when throttle is set without `key`', () => {
+    // Config validation at definition time — no database involved.
     expect(() =>
       createWorkflow('throttle-no-key', {
         steps: { run: async () => 'ok' },
+        container: env.container,
         concurrency: {
           throttle: { limit: 5, windowMs: 1_000 },
         } as never,
@@ -121,14 +114,9 @@ describe('concurrency.throttle — N starts per windowMs per key', () => {
 });
 
 describe('concurrency.debounce — collapse to last start in quiet window', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('first start in a quiet window creates a debounce draft', async () => {
-    const wf = createWorkflow<{ userId: string }>('debounce-first', {
+    const wf = env.workflow<Ctx, UserInput>('debounce-first', {
       steps: { run: async () => 'ok' },
-      autoExecute: false,
       concurrency: {
         key: (input) => input.userId,
         debounce: { windowMs: 30_000 },
@@ -140,15 +128,14 @@ describe('concurrency.debounce — collapse to last start in quiet window', () =
     expect(first.meta?.streamlineGate).toBe('debounce');
     expect(first.status).toBe('draft');
     // Scheduled `windowMs` in the future.
-    const fireAt = first.scheduling?.executionTime as Date | undefined;
+    const fireAt = first.scheduling?.executionTime;
     expect(fireAt).toBeInstanceOf(Date);
     expect((fireAt as Date).getTime()).toBeGreaterThan(Date.now() + 25_000);
   });
 
   it('subsequent starts within the window bump the SAME draft (no new run)', async () => {
-    const wf = createWorkflow<{ userId: string; rev: number }>('debounce-bump', {
+    const wf = env.workflow<Ctx, { userId: string; rev: number }>('debounce-bump', {
       steps: { run: async () => 'ok' },
-      autoExecute: false,
       concurrency: {
         key: (input) => input.userId,
         debounce: { windowMs: 30_000 },
@@ -164,21 +151,20 @@ describe('concurrency.debounce — collapse to last start in quiet window', () =
     expect(String(bumpedAgain._id)).toBe(String(first._id));
 
     // Exactly one run persisted for this key.
-    const count = await WorkflowRunModel.countDocuments({
-      workflowId: 'debounce-bump',
+    const count = await env.runModel.countDocuments({
+      workflowId: wf.engine.definition.id,
       concurrencyKey: 'u-1',
     });
     expect(count).toBe(1);
 
     // The persisted run carries the LATEST input (trailing-edge).
-    const persisted = await WorkflowRunModel.findById(first._id).lean();
-    expect((persisted?.input as { rev: number }).rev).toBe(3);
+    const persisted = await env.runs.get(first._id);
+    expect((persisted?.input as { rev?: number } | undefined)?.rev).toBe(3);
   });
 
   it('extends fireAt on each bump (next quiet window restart)', async () => {
-    const wf = createWorkflow<{ userId: string }>('debounce-extend', {
+    const wf = env.workflow<Ctx, UserInput>('debounce-extend', {
       steps: { run: async () => 'ok' },
-      autoExecute: false,
       concurrency: {
         key: (input) => input.userId,
         debounce: { windowMs: 10_000 },
@@ -186,21 +172,22 @@ describe('concurrency.debounce — collapse to last start in quiet window', () =
     });
 
     const first = await wf.start({ userId: 'u-1' });
-    const firstFireAt = (first.scheduling?.executionTime as Date).getTime();
+    expect(first.scheduling?.executionTime).toBeInstanceOf(Date);
+    const firstFireAt = first.scheduling?.executionTime.getTime() ?? Number.NaN;
 
-    // Wait a bit so the bump's nextFireAt is measurably later.
+    // Let the clock move so the bump's nextFireAt is measurably later
+    // (a clock gap, not a wait for an outcome).
     await new Promise((r) => setTimeout(r, 50));
 
     const bumped = await wf.start({ userId: 'u-1' });
-    const bumpedFireAt = (bumped.scheduling?.executionTime as Date).getTime();
+    const bumpedFireAt = bumped.scheduling?.executionTime.getTime() ?? Number.NaN;
 
     expect(bumpedFireAt).toBeGreaterThan(firstFireAt);
   });
 
   it('isolates debounce by concurrencyKey', async () => {
-    const wf = createWorkflow<{ userId: string }>('debounce-isolation', {
+    const wf = env.workflow<Ctx, UserInput>('debounce-isolation', {
       steps: { run: async () => 'ok' },
-      autoExecute: false,
       concurrency: {
         key: (input) => input.userId,
         debounce: { windowMs: 30_000 },
@@ -211,16 +198,18 @@ describe('concurrency.debounce — collapse to last start in quiet window', () =
     const u2 = await wf.start({ userId: 'u-2' });
 
     expect(String(u1._id)).not.toBe(String(u2._id));
-    const count = await WorkflowRunModel.countDocuments({
-      workflowId: 'debounce-isolation',
+    const count = await env.runModel.countDocuments({
+      workflowId: wf.engine.definition.id,
     });
     expect(count).toBe(2);
   });
 
   it('throws when debounce is set without `key`', () => {
+    // Config validation at definition time — no database involved.
     expect(() =>
       createWorkflow('debounce-no-key', {
         steps: { run: async () => 'ok' },
+        container: env.container,
         concurrency: {
           debounce: { windowMs: 1_000 },
         } as never,

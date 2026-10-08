@@ -9,25 +9,27 @@
 import { expect } from 'vitest';
 import type { RunStatus, StepStatus, WorkflowRun } from '../../src/core/types.js';
 
-function summarize(run: WorkflowRun | null | undefined): string {
+// `WorkflowRun<unknown>`: accept runs of any workflow context type.
+function summarize(run: WorkflowRun<unknown> | null | undefined): string {
   if (!run) return '<null>';
   const steps = run.steps.map((s) => `${s.stepId}=${s.status}`).join(',');
   return `run=${run._id} status=${run.status} steps=[${steps}] paused=${run.paused ?? false}`;
 }
 
-export function expectRunStatus(run: WorkflowRun | null | undefined, expected: RunStatus): void {
+export function expectRunStatus(
+  run: WorkflowRun<unknown> | null | undefined,
+  expected: RunStatus,
+): void {
   if (!run) {
     throw new Error(`expected run with status '${expected}' but run was ${run}`);
   }
   if (run.status !== expected) {
-    throw new Error(
-      `expected status '${expected}' but got '${run.status}' — ${summarize(run)}`,
-    );
+    throw new Error(`expected status '${expected}' but got '${run.status}' — ${summarize(run)}`);
   }
 }
 
 export function expectStepStatus(
-  run: WorkflowRun,
+  run: WorkflowRun<unknown>,
   stepId: string,
   expected: StepStatus,
 ): void {
@@ -48,10 +50,8 @@ export function expectStepStatus(
  * Assert the steps ran in the given order (completed steps only).
  * Ignores `skipped` and `pending` entries.
  */
-export function expectStepSequence(run: WorkflowRun, sequence: string[]): void {
-  const completed = run.steps
-    .filter((s) => s.status === 'done')
-    .map((s) => s.stepId);
+export function expectStepSequence(run: WorkflowRun<unknown>, sequence: string[]): void {
+  const completed = run.steps.filter((s) => s.status === 'done').map((s) => s.stepId);
   expect(completed).toEqual(sequence);
 }
 

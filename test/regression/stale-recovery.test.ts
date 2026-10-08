@@ -7,300 +7,248 @@
  * Critical for durable execution guarantee.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import { WorkflowEngine } from '../../src/execution/engine.js';
-import { SmartScheduler } from '../../src/execution/smart-scheduler.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { createContainer } from '../../src/core/container.js';
-import type { WorkflowDefinition, WorkflowHandlers } from '../../src/core/types.js';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  DEFAULT_SCHEDULER_CONFIG,
+  SmartScheduler,
+  type SmartSchedulerConfig,
+} from '../../src/execution/smart-scheduler.js';
+import type { Workflow } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let mongoServer: MongoMemoryServer;
+const env = useStreamlineEnv();
 
-beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
-  await mongoose.connect(mongoServer.getUri());
-}, 60000);
-
-afterAll(async () => {
-  await mongoose.disconnect();
-  await mongoServer.stop();
+/** Scheduler config for these tests: fixed (non-adaptive) intervals over the defaults. */
+const schedulerConfig = (overrides: Partial<SmartSchedulerConfig>): SmartSchedulerConfig => ({
+  ...DEFAULT_SCHEDULER_CONFIG,
+  basePollInterval: 60000,
+  minPollInterval: 60000,
+  maxPollInterval: 60000,
+  maxWorkflowsPerPoll: 100,
+  idleTimeout: 120000,
+  maxConsecutiveFailures: 5,
+  adaptivePolling: false,
+  ...overrides,
 });
 
-describe('Stale Workflow Recovery', () => {
-  let scheduler: SmartScheduler;
+/** A run left `running` by a crashed process: heartbeat 10 min old, steps untouched. */
+type Wf = Workflow<Record<string, unknown>>;
 
-  beforeEach(async () => {
-    await WorkflowRunModel.deleteMany({});
-  });
+const crashedRun = (wf: Wf, input: unknown = {}) =>
+  env.runs.insert(wf, { input, lastHeartbeat: new Date(Date.now() - 10 * 60 * 1000) });
+
+describe('Stale Workflow Recovery', () => {
+  let scheduler: SmartScheduler | undefined;
 
   afterEach(async () => {
     if (scheduler) {
       await scheduler.stop();
+      scheduler = undefined;
     }
-    await WorkflowRunModel.deleteMany({});
   });
 
+  /** Claim-and-re-execute recovery, as the test's stand-in engine wiring. */
+  const recoverVia = (wf: Wf) => async (runId: string) => {
+    const claimed = await env.container.repository.updateOne(
+      { _id: runId, status: 'running' },
+      { status: 'running', updatedAt: new Date(), lastHeartbeat: new Date() },
+    );
+    if (claimed.modifiedCount > 0) {
+      await wf.engine.execute(runId);
+    }
+  };
+
   it('should recover stale workflows via background check even when scheduler is idle', async () => {
-    const workflow: WorkflowDefinition = {
-      id: 'stale-test',
-      name: 'Stale Test Workflow',
-      version: '1.0.0',
-      steps: [{ id: 'step1', name: 'Step 1' }],
-      createContext: () => ({}),
-    };
-
-    const handlers: WorkflowHandlers = {
-      step1: async (ctx) => 'done',
-    };
-
-    const engine = new WorkflowEngine(workflow, handlers, createContainer());
-
-    // Create a running workflow with stale heartbeat (simulates crash)
-    const run = await engine.start({ test: true });
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      {
-        $set: {
-          status: 'running',
-          lastHeartbeat: new Date(Date.now() - 10 * 60 * 1000), // 10 min old (stale)
-        },
-      }
-    );
-
-    // Start scheduler with fast stale check interval
-    scheduler = new SmartScheduler(
-      workflowRunRepository,
-      async (runId) => {
-        await engine.resume(runId, {});
-      },
-      {
-        basePollInterval: 60000,
-        minPollInterval: 60000,
-        maxPollInterval: 60000,
-        maxWorkflowsPerPoll: 100,
-        idleTimeout: 120000,
-        maxConsecutiveFailures: 5,
-        adaptivePolling: false,
-        staleCheckInterval: 500, // Check every 500ms for testing
-      }
-    );
-
-    scheduler.setStaleRecoveryCallback(async (runId) => {
-      // Claim and re-execute the stale workflow
-      const claimed = await workflowRunRepository.updateOne(
-        { _id: runId, status: 'running' },
-        { status: 'running', updatedAt: new Date(), lastHeartbeat: new Date() }
-      );
-      if (claimed.modifiedCount > 0) {
-        await engine.execute(runId);
-      }
+    const wf = env.workflow<Record<string, unknown>>('stale-test', {
+      steps: { step1: async () => 'done' },
+      context: () => ({}),
     });
 
-    // Start scheduler (but no waiting workflows, so polling might not start)
-    scheduler.start();
+    // Idle: nothing to do at start, so polling does NOT start — only the
+    // background discovery check runs (every 500ms). Polling interval is 60s.
+    scheduler = new SmartScheduler(
+      env.container.repository,
+      async (runId) => {
+        await wf.engine.resume(runId, {});
+      },
+      schedulerConfig({ staleCheckInterval: 500 }),
+      undefined,
+      wf.engine.definition.id,
+    );
+    scheduler.setStaleRecoveryCallback(recoverVia(wf));
+    expect(await scheduler.startIfNeeded()).toBe(false);
 
-    // Wait for background stale check to detect and recover
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    // A worker crashes mid-run — nothing in any process is executing it.
+    const run = await crashedRun(wf);
 
-    // Verify workflow was recovered
-    const recovered = await WorkflowRunModel.findOne({ _id: run._id });
-    expect(recovered).toBeTruthy();
-
-    // Should have been processed (status changed from 'running')
-    expect(recovered!.status).not.toBe('running');
-
-    console.log(`✓ Stale workflow recovered via background check. Status: ${recovered!.status}`);
+    // Only discovery can find it; it must start polling AND recover at once —
+    // not a full 60s poll interval later.
+    const recovered = await env.until(run._id, 'done', { timeout: 4000 });
+    expect(recovered.status).toBe('done');
   }, 10000);
 
   it('should start polling when background check finds stale workflows', async () => {
-    const workflow: WorkflowDefinition = {
-      id: 'polling-start-test',
-      name: 'Polling Start Test',
-      version: '1.0.0',
-      steps: [{ id: 'step1', name: 'Step 1' }],
-      createContext: () => ({}),
-    };
-
-    const handlers: WorkflowHandlers = {
-      step1: async (ctx) => 'done',
-    };
-
-    const engine = new WorkflowEngine(workflow, handlers, createContainer());
+    const wf = env.workflow<Record<string, unknown>>('polling-start-test', {
+      steps: { step1: async () => 'done' },
+      context: () => ({}),
+    });
 
     // Create multiple stale workflows
-    const runs = await Promise.all([
-      engine.start({ index: 1 }),
-      engine.start({ index: 2 }),
-      engine.start({ index: 3 }),
+    await Promise.all([
+      crashedRun(wf, { index: 1 }),
+      crashedRun(wf, { index: 2 }),
+      crashedRun(wf, { index: 3 }),
     ]);
 
-    for (const run of runs) {
-      await WorkflowRunModel.updateOne(
-        { _id: run._id },
-        {
-          $set: {
-            status: 'running',
-            lastHeartbeat: new Date(Date.now() - 10 * 60 * 1000),
-          },
-        }
-      );
-    }
-
     scheduler = new SmartScheduler(
-      workflowRunRepository,
+      env.container.repository,
       async (runId) => {
-        await engine.resume(runId, {});
+        await wf.engine.resume(runId, {});
       },
-      {
+      schedulerConfig({
         basePollInterval: 100,
         minPollInterval: 100,
         maxPollInterval: 100,
-        maxWorkflowsPerPoll: 100,
-        idleTimeout: 120000,
-        maxConsecutiveFailures: 5,
-        adaptivePolling: false,
         staleCheckInterval: 300, // Fast check
-      }
+      }),
     );
 
-    scheduler.setStaleRecoveryCallback(async (runId) => {
-      const claimed = await workflowRunRepository.updateOne(
-        { _id: runId, status: 'running' },
-        { status: 'running', updatedAt: new Date(), lastHeartbeat: new Date() }
-      );
-      if (claimed.modifiedCount > 0) {
-        await engine.execute(runId);
-      }
-    });
+    scheduler.setStaleRecoveryCallback(recoverVia(wf));
 
     // Start scheduler
     await scheduler.startIfNeeded();
 
-    // Wait for background check and processing
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    // Wait for background check and processing (bounded, not a fixed sleep)
+    await env.untilCount({ status: { $ne: 'running' } }, 2, { timeout: 8000, interval: 50 });
 
     // Verify all stale workflows were processed
-    const processed = await WorkflowRunModel.countDocuments({ status: { $ne: 'running' } });
+    const processed = await env.runModel.countDocuments({ status: { $ne: 'running' } });
     expect(processed).toBeGreaterThanOrEqual(2); // At least 2 should be recovered
-
-    console.log(`✓ Background check triggered polling, processed ${processed}/3 stale workflows`);
   }, 10000);
+
+  it('a just-started run with no heartbeat yet is NOT stale; an old one is', async () => {
+    // A run has no heartbeat until its first step claim. Counting a missing
+    // heartbeat as stale with no age check let recovery claim a brand-new run
+    // out from under the worker starting it — two drivers, its step reset.
+    const wf = env.workflow('no-heartbeat', { steps: { only: async () => 'ok' } });
+    const fresh = await env.runs.insert(wf, { status: 'running' }); // no lastHeartbeat
+    const old = await env.runs.insert(wf, {
+      status: 'running',
+      updatedAt: new Date(Date.now() - 10 * 60 * 1000),
+    });
+
+    const stale = await env.container.repository.getStaleRunningWorkflows(5 * 60 * 1000, 10, {
+      bypassTenant: true,
+      workflowId: wf.engine.definition.id,
+    });
+    expect(stale.map((r) => r._id)).toEqual([old._id]);
+
+    // And the recovery CLAIM agrees with the sweep.
+    expect(await wf.engine.recoverStale(fresh._id, 5 * 60 * 1000)).toBeNull();
+    expect((await env.runs.get(fresh._id))?.recoveryAttempts ?? 0).toBe(0);
+  });
 
   it('should use index for efficient stale workflow queries', async () => {
     // Create mix of fresh and stale workflows
-    const workflows = await Promise.all(
-      Array.from({ length: 500 }, async (_, i) => {
+    await Promise.all(
+      Array.from({ length: 500 }, (_, i) => {
         const isStale = i < 250;
-        return await WorkflowRunModel.create({
+        return env.runs.insert('index-test', {
           _id: `run_${i}`,
-          workflowId: 'index-test',
           status: 'running',
           steps: [{ stepId: 'step1', status: 'running', attempts: 1 }],
           currentStepId: 'step1',
-          context: {},
-          input: {},
-          createdAt: new Date(),
-          updatedAt: new Date(),
           lastHeartbeat: new Date(Date.now() - (isStale ? 10 : 1) * 60 * 1000),
         });
-      })
+      }),
     );
 
     const start = Date.now();
-    const staleWorkflows = await workflowRunRepository.getStaleRunningWorkflows(5 * 60 * 1000, 50);
+    const staleWorkflows = await env.container.repository.getStaleRunningWorkflows(
+      5 * 60 * 1000,
+      50,
+    );
     const queryTime = Date.now() - start;
 
     expect(staleWorkflows).toHaveLength(50);
     expect(queryTime).toBeLessThan(50); // Should be fast with index
-
-    console.log(`✓ Stale query with index: ${queryTime}ms for 500 workflows`);
   }, 10000);
 
   it('should handle case where stale check fails gracefully', async () => {
     scheduler = new SmartScheduler(
-      workflowRunRepository,
-      async (runId) => {
+      env.container.repository,
+      async () => {
         throw new Error('Test error');
       },
-      {
-        basePollInterval: 60000,
-        minPollInterval: 60000,
-        maxPollInterval: 60000,
-        maxWorkflowsPerPoll: 100,
-        idleTimeout: 120000,
-        maxConsecutiveFailures: 5,
-        adaptivePolling: false,
-        staleCheckInterval: 200,
-      }
+      schedulerConfig({ staleCheckInterval: 100 }),
     );
 
-    // Temporarily break the repository method
-    const originalMethod = workflowRunRepository.getStaleRunningWorkflows;
-    workflowRunRepository.getStaleRunningWorkflows = async () => {
+    // Break the query the background discovery runs, and count the calls so
+    // the test proves the failing path was actually reached.
+    const repository = env.container.repository;
+    const originalMethod = repository.getStaleRunningWorkflows;
+    let calls = 0;
+    repository.getStaleRunningWorkflows = async () => {
+      calls++;
       throw new Error('Database error');
     };
 
-    scheduler.start();
-
-    // Wait for stale check to run (should not crash)
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    // Restore method
-    workflowRunRepository.getStaleRunningWorkflows = originalMethod;
+    try {
+      // Idle start: no polling, discovery only — the path that hits the query.
+      await scheduler.startIfNeeded();
+      // Discovery survives the error and keeps running on its interval.
+      await env.eventually(() => expect(calls).toBeGreaterThanOrEqual(2), { timeout: 3000 });
+    } finally {
+      repository.getStaleRunningWorkflows = originalMethod;
+    }
 
     // Scheduler should still be alive (stop() should work without errors)
-    expect(() => scheduler.stop()).not.toThrow();
-
-    console.log('✓ Stale check handles errors gracefully without crashing');
+    const running = scheduler;
+    expect(() => running.stop()).not.toThrow();
   }, 5000);
 
   it('should prevent re-arming of stale check after stop() (race condition fix)', async () => {
     let checkCount = 0;
 
-    scheduler = new SmartScheduler(
-      workflowRunRepository,
-      async (runId) => {},
-      {
-        basePollInterval: 60000,
-        minPollInterval: 60000,
-        maxPollInterval: 60000,
-        maxWorkflowsPerPoll: 100,
-        idleTimeout: 120000,
-        maxConsecutiveFailures: 5,
-        adaptivePolling: false,
-        staleCheckInterval: 100, // Fast interval for testing
-      }
+    const running = new SmartScheduler(
+      env.container.repository,
+      async () => {},
+      schedulerConfig({ staleCheckInterval: 100 }), // Fast interval for testing
     );
+    scheduler = running;
 
-    // Override checkForStaleWorkflows to track calls
-    const originalCheck = scheduler['checkForStaleWorkflows'].bind(scheduler);
-    scheduler['checkForStaleWorkflows'] = async function () {
+    // Override the background discovery check to track calls
+    let checkStarted: () => void = () => {};
+    const firstCheck = new Promise<void>((resolve) => {
+      checkStarted = resolve;
+    });
+    // Bracket access reaches the private member (dot access would not compile).
+    // biome-ignore lint/complexity/useLiteralKeys: private member
+    const originalCheck = running['discoverWork'].bind(running);
+    // biome-ignore lint/complexity/useLiteralKeys: private member
+    running['discoverWork'] = async () => {
       checkCount++;
+      checkStarted();
       // Simulate slow check
       await new Promise((resolve) => setTimeout(resolve, 50));
       return originalCheck();
     };
 
     // Start scheduler
-    scheduler.start();
+    running.start();
 
-    // Wait for first check to start
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    // Wait for the first check to start
+    await firstCheck;
 
     // Stop while check is running
-    scheduler.stop();
+    running.stop();
 
     const countAtStop = checkCount;
 
-    // Wait to ensure no new checks are scheduled
+    // Wait several intervals to ensure no new checks are scheduled
     await new Promise((resolve) => setTimeout(resolve, 300));
 
     // Verify no new checks after stop
     expect(checkCount).toBeLessThanOrEqual(countAtStop + 1); // At most 1 more if it was mid-execution
-
-    console.log(`✓ No stale checks after stop(). Checks: ${checkCount}`);
   }, 5000);
 });

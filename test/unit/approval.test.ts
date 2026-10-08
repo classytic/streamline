@@ -3,8 +3,8 @@ import type { WorkflowEventBus } from '../../src/core/events.js';
 import type { WorkflowRun } from '../../src/core/types.js';
 import { StepContextImpl, WaitSignal } from '../../src/execution/context.js';
 import {
-  type ApprovalDecision,
   type AnswerResult,
+  type ApprovalDecision,
   ask,
   readAnswer,
   readApprovalDecision,
@@ -34,8 +34,14 @@ function makeCtx(runId = 'run-1', stepId = 'gate'): StepContextImpl {
 // What `approve` / `reject` / `answer` put on the wire (their resume payload),
 // reconstructed here so the readers are tested against the exact marker shape
 // the resume side produces — a round-trip contract without a live engine.
-const approvedPayload = (data?: unknown) => ({ __approvalDecision: 'approved', ...(data !== undefined ? { data } : {}) });
-const rejectedPayload = (reason?: string) => ({ __approvalDecision: 'rejected', ...(reason !== undefined ? { reason } : {}) });
+const approvedPayload = (data?: unknown) => ({
+  __approvalDecision: 'approved',
+  ...(data !== undefined ? { data } : {}),
+});
+const rejectedPayload = (reason?: string) => ({
+  __approvalDecision: 'rejected',
+  ...(reason !== undefined ? { reason } : {}),
+});
 const answeredPayload = (value: unknown) => ({ __askAnswer: value });
 
 describe('readApprovalDecision', () => {
@@ -44,7 +50,9 @@ describe('readApprovalDecision', () => {
       status: 'approved',
       data: { note: 'LGTM' },
     });
-    expect(readApprovalDecision(approvedPayload())).toEqual<ApprovalDecision>({ status: 'approved' });
+    expect(readApprovalDecision(approvedPayload())).toEqual<ApprovalDecision>({
+      status: 'approved',
+    });
   });
 
   it('maps a reject payload → rejected (with reason)', () => {
@@ -62,7 +70,9 @@ describe('readApprovalDecision', () => {
   });
 
   it('maps the timeout sentinel → timed_out', () => {
-    expect(readApprovalDecision(makeWaitTimeout())).toEqual<ApprovalDecision>({ status: 'timed_out' });
+    expect(readApprovalDecision(makeWaitTimeout())).toEqual<ApprovalDecision>({
+      status: 'timed_out',
+    });
   });
 
   it('returns null for a non-approval output (unrelated step / still waiting)', () => {

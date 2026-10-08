@@ -16,41 +16,33 @@
  *      update shapes before Mongo silently drops keys.
  */
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { WorkflowRunModel } from '../../src/storage/models.js';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   createWorkflowRepository,
+  type WorkflowRepositoryConfig,
   type WorkflowRunRepository,
 } from '../../src/storage/run.repository.js';
-import type { WorkflowRun } from '../../src/core/types.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB } from '../utils/setup.js';
+import type { RunFields } from '../../src/testkit/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(setupTestDB);
-afterAll(teardownTestDB);
-afterEach(cleanupTestDB);
+const env = useStreamlineEnv();
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeRun(overrides: Partial<WorkflowRun>): WorkflowRun {
-  return {
-    _id: overrides._id ?? `run-${Math.random().toString(36).slice(2)}`,
-    workflowId: overrides.workflowId ?? 'test-wf',
-    status: overrides.status ?? 'running',
-    steps: overrides.steps ?? [],
-    currentStepId: overrides.currentStepId ?? null,
-    context: (overrides.context ?? {}) as Record<string, unknown>,
-    input: overrides.input ?? {},
-    createdAt: overrides.createdAt ?? new Date(),
-    updatedAt: overrides.updatedAt ?? new Date(),
-    ...overrides,
-  } as WorkflowRun;
+/** A fresh repository over the env's run model (its own database). */
+const makeRepo = (config: WorkflowRepositoryConfig = {}): WorkflowRunRepository =>
+  createWorkflowRepository({ ...config, model: env.runModel });
+
+/** Insert step-less runs of a generic workflow straight into the collection. */
+async function seed(runs: RunFields[]): Promise<void> {
+  for (const fields of runs) {
+    await env.runs.insert('test-wf', { steps: [], currentStepId: null, ...fields });
+  }
 }
 
-async function seed(runs: WorkflowRun[]): Promise<void> {
-  await WorkflowRunModel.create(runs);
-}
+const TENANT = { tenant: { tenantField: 'context.tenantId', required: true } } as const;
 
 // ---------------------------------------------------------------------------
 // updateMany — inherited from mongokit 3.11's Repository base class
@@ -60,14 +52,14 @@ describe('Repository.updateMany — inherited primitive', () => {
   let repo: WorkflowRunRepository;
 
   beforeEach(() => {
-    repo = createWorkflowRepository();
+    repo = makeRepo();
   });
 
   it('updates every matching run in a single roundtrip', async () => {
     await seed([
-      makeRun({ _id: 'a', status: 'running' }),
-      makeRun({ _id: 'b', status: 'running' }),
-      makeRun({ _id: 'c', status: 'waiting' }),
+      { _id: 'a', status: 'running' },
+      { _id: 'b', status: 'running' },
+      { _id: 'c', status: 'waiting' },
     ]);
 
     const now = new Date();
@@ -79,7 +71,7 @@ describe('Repository.updateMany — inherited primitive', () => {
     expect(result.matchedCount).toBe(2);
     expect(result.modifiedCount).toBe(2);
 
-    const after = await WorkflowRunModel.find({}).sort({ _id: 1 }).lean();
+    const after = await env.runModel.find({}).sort({ _id: 1 }).lean();
     expect(after.map((r) => r.status)).toEqual(['waiting', 'waiting', 'waiting']);
   });
 
@@ -98,20 +90,20 @@ describe('Repository.deleteMany — inherited primitive', () => {
   let repo: WorkflowRunRepository;
 
   beforeEach(() => {
-    repo = createWorkflowRepository();
+    repo = makeRepo();
   });
 
   it('deletes every matching run and reports the count', async () => {
     await seed([
-      makeRun({ _id: 'done-1', status: 'done' }),
-      makeRun({ _id: 'done-2', status: 'done' }),
-      makeRun({ _id: 'running-1', status: 'running' }),
+      { _id: 'done-1', status: 'done' },
+      { _id: 'done-2', status: 'done' },
+      { _id: 'running-1', status: 'running' },
     ]);
 
     const result = await repo.deleteMany({ status: 'done' });
     expect(result.deletedCount).toBe(2);
 
-    const remaining = await WorkflowRunModel.find({}).lean();
+    const remaining = await env.runModel.find({}).lean();
     expect(remaining.map((r) => r._id).sort()).toEqual(['running-1']);
   });
 });
@@ -121,18 +113,16 @@ describe('Repository.deleteMany — inherited primitive', () => {
 // ---------------------------------------------------------------------------
 
 describe('Bulk primitives + tenantFilterPlugin', () => {
-  it('updateMany with tenantId only touches that tenant\'s runs', async () => {
+  it("updateMany with tenantId only touches that tenant's runs", async () => {
     // Tenant-scoped repository — streamline's own plugin, not mongokit's.
-    const repo = createWorkflowRepository({
-      tenant: { tenantField: 'context.tenantId', required: true },
-    });
+    const repo = makeRepo(TENANT);
 
-    // Seed using raw model so we bypass create hooks — the goal here is to
-    // test the scoped update, not the scoped create.
+    // Seed straight into the collection so we bypass create hooks — the goal
+    // here is to test the scoped update, not the scoped create.
     await seed([
-      makeRun({ _id: 'a1', status: 'running', context: { tenantId: 'a' } }),
-      makeRun({ _id: 'a2', status: 'running', context: { tenantId: 'a' } }),
-      makeRun({ _id: 'b1', status: 'running', context: { tenantId: 'b' } }),
+      { _id: 'a1', status: 'running', context: { tenantId: 'a' } },
+      { _id: 'a2', status: 'running', context: { tenantId: 'a' } },
+      { _id: 'b1', status: 'running', context: { tenantId: 'b' } },
     ]);
 
     // Tenant A fires updateMany — should only hit A's runs even though the
@@ -147,38 +137,34 @@ describe('Bulk primitives + tenantFilterPlugin', () => {
     expect(result.modifiedCount).toBe(2);
 
     // B's run must remain untouched.
-    const b = await WorkflowRunModel.findById('b1').lean();
+    const b = await env.runs.get('b1');
     expect(b?.status).toBe('running');
   });
 
-  it('deleteMany with tenantId only removes that tenant\'s runs', async () => {
-    const repo = createWorkflowRepository({
-      tenant: { tenantField: 'context.tenantId', required: true },
-    });
+  it("deleteMany with tenantId only removes that tenant's runs", async () => {
+    const repo = makeRepo(TENANT);
 
     await seed([
-      makeRun({ _id: 'a1', status: 'done', context: { tenantId: 'a' } }),
-      makeRun({ _id: 'a2', status: 'done', context: { tenantId: 'a' } }),
-      makeRun({ _id: 'b1', status: 'done', context: { tenantId: 'b' } }),
+      { _id: 'a1', status: 'done', context: { tenantId: 'a' } },
+      { _id: 'a2', status: 'done', context: { tenantId: 'a' } },
+      { _id: 'b1', status: 'done', context: { tenantId: 'b' } },
     ]);
 
     const result = await repo.deleteMany({ status: 'done' }, { tenantId: 'a' });
     expect(result.deletedCount).toBe(2);
 
-    const remaining = await WorkflowRunModel.find({}).lean();
+    const remaining = await env.runModel.find({}).lean();
     expect(remaining.map((r) => r._id)).toEqual(['b1']);
   });
 
   it('rejects bulk operations without tenantId in strict mode', async () => {
-    const repo = createWorkflowRepository({
-      tenant: { tenantField: 'context.tenantId', required: true },
-    });
+    const repo = makeRepo(TENANT);
 
-    await seed([makeRun({ _id: 'a1', status: 'running', context: { tenantId: 'a' } })]);
+    await seed([{ _id: 'a1', status: 'running', context: { tenantId: 'a' } }]);
 
-    await expect(repo.updateMany({ status: 'running' }, { $set: { status: 'waiting' } })).rejects.toThrow(
-      /Missing tenantId/,
-    );
+    await expect(
+      repo.updateMany({ status: 'running' }, { $set: { status: 'waiting' } }),
+    ).rejects.toThrow(/Missing tenantId/);
     await expect(repo.deleteMany({ status: 'running' })).rejects.toThrow(/Missing tenantId/);
   });
 });
@@ -191,16 +177,16 @@ describe('hasConcurrencyDrafts', () => {
   let repo: WorkflowRunRepository;
 
   beforeEach(() => {
-    repo = createWorkflowRepository();
+    repo = makeRepo();
   });
 
   it('returns false when no concurrency-queued drafts exist', async () => {
     await seed([
       // Regular draft without concurrencyKey — not a concurrency-queued draft.
-      makeRun({ _id: 'plain-draft', status: 'draft' }),
+      { _id: 'plain-draft', status: 'draft' },
       // Draft with a scheduling block — that's a scheduled draft, not a
       // concurrency-queued draft (even with concurrencyKey set).
-      makeRun({
+      {
         _id: 'scheduled',
         status: 'draft',
         concurrencyKey: 'k',
@@ -209,33 +195,23 @@ describe('hasConcurrencyDrafts', () => {
           timezone: 'UTC',
           localTimeDisplay: '2030-01-01 09:00',
           executionTime: new Date('2030-01-01T09:00:00Z'),
+          isDSTTransition: false,
         },
-      } as never),
+      },
     ]);
     expect(await repo.hasConcurrencyDrafts()).toBe(false);
   });
 
   it('returns true when at least one concurrency-queued draft exists', async () => {
     await seed([
-      makeRun({ _id: 'done', status: 'done' }),
-      makeRun({
-        _id: 'concurrency-queued',
-        status: 'draft',
-        concurrencyKey: 'order-abc',
-      } as never),
+      { _id: 'done', status: 'done' },
+      { _id: 'concurrency-queued', status: 'draft', concurrencyKey: 'order-abc' },
     ]);
     expect(await repo.hasConcurrencyDrafts()).toBe(true);
   });
 
   it('ignores paused drafts', async () => {
-    await seed([
-      makeRun({
-        _id: 'paused-queued',
-        status: 'draft',
-        concurrencyKey: 'k',
-        paused: true,
-      } as never),
-    ]);
+    await seed([{ _id: 'paused-queued', status: 'draft', concurrencyKey: 'k', paused: true }]);
     expect(await repo.hasConcurrencyDrafts()).toBe(false);
   });
 });
@@ -250,13 +226,11 @@ describe('hasConcurrencyDrafts', () => {
 
 describe('tenantFilterPlugin hook priority', () => {
   it('injects tenant scope before lower-priority listeners observe the context', async () => {
-    const repo = createWorkflowRepository({
-      tenant: { tenantField: 'context.tenantId', required: true },
-    });
+    const repo = makeRepo(TENANT);
 
     await seed([
-      makeRun({ _id: 'a1', status: 'running', context: { tenantId: 'a' } }),
-      makeRun({ _id: 'b1', status: 'running', context: { tenantId: 'b' } }),
+      { _id: 'a1', status: 'running', context: { tenantId: 'a' } },
+      { _id: 'b1', status: 'running', context: { tenantId: 'b' } },
     ]);
 
     // Late listener at DEFAULT priority (500) — runs AFTER tenant filter
@@ -270,7 +244,13 @@ describe('tenantFilterPlugin hook priority', () => {
       },
     );
 
-    await repo.getAll({ filters: { status: 'running' }, tenantId: 'a' });
+    // `tenantId` rides on the params (the plugin reads it from the hook
+    // context); `GetAllParams` doesn't declare it, so it's typed here.
+    const params: NonNullable<Parameters<typeof repo.getAll>[0]> & { tenantId: string } = {
+      filters: { status: 'running' },
+      tenantId: 'a',
+    };
+    await repo.getAll(params);
     expect(observedFilters?.['context.tenantId']).toBe('a');
     expect(observedFilters?.status).toBe('running');
   });
@@ -284,43 +264,40 @@ describe('WorkflowRunRepository.updateOne — mixed-shape guardrail', () => {
   let repo: WorkflowRunRepository;
 
   beforeEach(() => {
-    repo = createWorkflowRepository();
+    repo = makeRepo();
   });
 
   it('accepts a plain field-shape patch (auto-wrapped in $set)', async () => {
-    await seed([makeRun({ _id: 'r1', status: 'running' })]);
+    await seed([{ _id: 'r1', status: 'running' }]);
 
     const result = await repo.updateOne({ _id: 'r1' }, { status: 'waiting' });
     expect(result.modifiedCount).toBe(1);
 
-    const after = await WorkflowRunModel.findById('r1').lean();
+    const after = await env.runs.get('r1');
     expect(after?.status).toBe('waiting');
   });
 
   it('accepts a well-formed $set update', async () => {
-    await seed([makeRun({ _id: 'r1', status: 'running' })]);
+    await seed([{ _id: 'r1', status: 'running' }]);
 
-    const result = await repo.updateOne(
-      { _id: 'r1' },
-      { $set: { status: 'waiting' } },
-    );
+    const result = await repo.updateOne({ _id: 'r1' }, { $set: { status: 'waiting' } });
     expect(result.modifiedCount).toBe(1);
   });
 
   it('throws loudly instead of silently dropping mixed shapes', async () => {
-    await seed([makeRun({ _id: 'r1', status: 'running' })]);
+    await seed([{ _id: 'r1', status: 'running' }]);
 
     await expect(
       repo.updateOne(
         { _id: 'r1' },
-        // @ts-expect-error — intentional misuse
+        // Intentional misuse — the update type admits it, so the runtime guard is the net.
         { $set: { status: 'done' }, someField: 'dropped-silently' },
       ),
     ).rejects.toThrow(/cannot mix operators.*raw field keys/);
 
     // And the run must NOT have been updated — the throw happens before the
     // write reaches Mongo.
-    const after = await WorkflowRunModel.findById('r1').lean();
+    const after = await env.runs.get('r1');
     expect(after?.status).toBe('running');
   });
 });

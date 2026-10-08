@@ -16,42 +16,23 @@
  *      terminal no-op preserves reason.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createContainer } from '../../src/core/container.js';
+import { afterEach, describe, expect, it } from 'vitest';
 import { globalEventBus } from '../../src/core/events.js';
 import type { TaskHookContext } from '../../src/core/types.js';
-import { createWorkflow } from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import type { Workflow } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let n = 0;
-const uid = (p: string) => `${p}-${Date.now()}-${++n}`;
+const env = useStreamlineEnv();
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function waitForStatus(
-  wf: { get: (id: string) => Promise<{ status: string } | null> },
-  runId: string,
-  statuses: string[],
-  timeoutMs = 8000,
-): Promise<{ status: string } & Record<string, unknown>> {
-  const want = new Set(statuses);
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const r = (await wf.get(runId)) as ({ status: string } & Record<string, unknown>) | null;
-    if (r && want.has(r.status)) return r;
-    await sleep(25);
-  }
-  throw new Error(`run ${runId} did not reach [${statuses}] within ${timeoutMs}ms`);
-}
 
 // ============================================================================
 // 1. Queryable progress
 // ============================================================================
 
 describe('v2.7: queryable step/run progress', () => {
-  useTestDb();
-
   it('reportProgress persists and getStepProgress reads it back', async () => {
-    const wf = createWorkflow(uid('progress'), {
+    const wf = env.workflow('progress', {
       steps: {
         work: async (ctx) => {
           ctx.reportProgress({ phase: 'start', percent: 0, message: 'beginning' });
@@ -60,7 +41,6 @@ describe('v2.7: queryable step/run progress', () => {
           return { ok: true };
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -72,15 +52,10 @@ describe('v2.7: queryable step/run progress', () => {
     expect(progress?.percent).toBe(100);
     expect(progress?.phase).toBe('end');
     expect(progress?.at).toBeInstanceOf(Date);
-
-    wf.shutdown();
   });
 
   it('throttles rapid updates to ≤N writes but the FINAL value always lands', async () => {
-    const container = createContainer();
-    const updateSpy = vi.spyOn(container.repository, 'updateOne');
-
-    const wf = createWorkflow(uid('progress-throttle'), {
+    const wf = env.workflow('progress-throttle', {
       steps: {
         burst: async (ctx) => {
           // Emit 50 frames rapidly within ~250ms — well inside the 1s throttle
@@ -92,22 +67,16 @@ describe('v2.7: queryable step/run progress', () => {
           return { done: true };
         },
       },
-      container,
-      autoExecute: false,
     });
 
     const run = await wf.start({});
 
     // Count only the lastProgress writes (isolate from other engine writes).
-    const progressWrites = () =>
-      updateSpy.mock.calls.filter((c) => {
-        const upd = c[1] as { $set?: Record<string, unknown> } | undefined;
-        return Object.keys(upd?.$set ?? {}).some((k) => k.endsWith('.lastProgress'));
-      }).length;
+    const traced = await env.trace(() => wf.execute(run._id));
+    const writes = traced
+      .updatesTo(run._id)
+      .filter((set) => Object.keys(set).some((k) => k.endsWith('.lastProgress'))).length;
 
-    await wf.execute(run._id);
-
-    const writes = progressWrites();
     // 50 frames over ~250ms with a 1s throttle + a final flush ⇒ a small,
     // bounded number of writes (immediate + a couple throttled + final),
     // FAR fewer than 51.
@@ -118,12 +87,10 @@ describe('v2.7: queryable step/run progress', () => {
     const progress = await wf.getStepProgress(run._id, 'burst');
     expect(progress?.percent).toBe(100);
     expect(progress?.message).toBe('frame 50');
-
-    wf.shutdown();
   });
 
   it('getRunProgress returns status + progress for all steps', async () => {
-    const wf = createWorkflow(uid('run-progress'), {
+    const wf = env.workflow('run-progress', {
       steps: {
         a: async (ctx) => {
           ctx.reportProgress({ phase: 'a-phase', percent: 100 });
@@ -134,7 +101,6 @@ describe('v2.7: queryable step/run progress', () => {
           return 2;
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -149,52 +115,42 @@ describe('v2.7: queryable step/run progress', () => {
     expect(a?.status).toBe('done');
     expect(a?.lastProgress?.phase).toBe('a-phase');
     expect(b?.lastProgress?.phase).toBe('b-phase');
-
-    wf.shutdown();
   });
 
   it('truncates an over-large message to keep the snapshot bounded', async () => {
-    const wf = createWorkflow(uid('progress-trunc'), {
+    const wf = env.workflow('progress-trunc', {
       steps: {
         work: async (ctx) => {
           ctx.reportProgress({ message: 'x'.repeat(5000) });
           return 1;
         },
       },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
     const progress = await wf.getStepProgress(run._id, 'work');
     // Message was truncated (or dropped) to fit the ~1KB bound.
     expect((progress?.message ?? '').length).toBeLessThan(5000);
-    wf.shutdown();
   });
 
   it('a fresh engine (restart) reads persisted progress', async () => {
-    const wfId = uid('progress-restart');
-    const wf1 = createWorkflow(wfId, {
+    const wf1 = env.workflow('progress-restart', {
       steps: {
         work: async (ctx) => {
           ctx.reportProgress({ phase: 'persisted', percent: 42 });
           return 1;
         },
       },
-      autoExecute: false,
     });
     const run = await wf1.start({});
     await wf1.execute(run._id);
     wf1.shutdown();
 
-    // Brand-new engine + fresh container/cache — must read from DB.
-    const wf2 = createWorkflow(wfId, {
-      steps: { work: async () => 1 },
-      autoExecute: false,
-    });
+    // Brand-new engine + fresh container/cache (same database) — must read from DB.
+    const wf2 = env.worker(wf1, { steps: { work: async () => 1 } });
     const progress = await wf2.getStepProgress(run._id, 'work');
     expect(progress?.phase).toBe('persisted');
     expect(progress?.percent).toBe(42);
-    wf2.shutdown();
   });
 });
 
@@ -203,11 +159,9 @@ describe('v2.7: queryable step/run progress', () => {
 // ============================================================================
 
 describe('v2.7: taskMiddleware guard + record', () => {
-  useTestDb();
-
   it('before-guard rejecting a step fails it NON-retriably with the reason', async () => {
     let execCount = 0;
-    const wf = createWorkflow(uid('tm-reject-step'), {
+    const wf = env.workflow('tm-reject-step', {
       steps: {
         guarded: async () => {
           execCount++;
@@ -220,7 +174,6 @@ describe('v2.7: taskMiddleware guard + record', () => {
         },
       ],
       defaults: { retries: 3 },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -234,13 +187,11 @@ describe('v2.7: taskMiddleware guard + record', () => {
     expect(failed?.error?.message).toContain('budget exceeded');
     // attempts === 1 proves no retry.
     expect(failed?.attempts).toBe(1);
-
-    wf.shutdown();
   });
 
   it('before-guard rejecting one scatter task rejects only it; siblings proceed', async () => {
     const ran: string[] = [];
-    const wf = createWorkflow(uid('tm-reject-task'), {
+    const wf = env.workflow('tm-reject-task', {
       steps: {
         fan: async (ctx) =>
           ctx.scatter({
@@ -265,7 +216,6 @@ describe('v2.7: taskMiddleware guard + record', () => {
         },
       ],
       defaults: { retries: 1 }, // don't retry — assert single-pass rejection
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -277,13 +227,11 @@ describe('v2.7: taskMiddleware guard + record', () => {
     expect(ran).toContain('a');
     expect(ran).toContain('c');
     expect(ran).not.toContain('blocked');
-
-    wf.shutdown();
   });
 
   it('after fires with durationMs + result on success and error on failure', async () => {
     const seen: Array<{ stepId: string; hasResult: boolean; hasError: boolean; dur: number }> = [];
-    const wf = createWorkflow(uid('tm-after'), {
+    const wf = env.workflow('tm-after', {
       steps: {
         ok: async () => {
           await sleep(10);
@@ -306,7 +254,6 @@ describe('v2.7: taskMiddleware guard + record', () => {
         },
       ],
       defaults: { retries: 1 },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -319,19 +266,15 @@ describe('v2.7: taskMiddleware guard + record', () => {
     expect(okRec?.dur).toBeGreaterThanOrEqual(0);
     expect(badRec?.hasError).toBe(true);
     expect(badRec?.hasResult).toBe(false);
-
-    wf.shutdown();
   });
 
   it('middleware absent = zero behavior change', async () => {
-    const wf = createWorkflow(uid('tm-absent'), {
+    const wf = env.workflow('tm-absent', {
       steps: { a: async () => 1, b: async () => 2 },
-      autoExecute: false,
     });
     const run = await wf.start({});
     const result = await wf.execute(run._id);
     expect(result.status).toBe('done');
-    wf.shutdown();
   });
 });
 
@@ -340,11 +283,9 @@ describe('v2.7: taskMiddleware guard + record', () => {
 // ============================================================================
 
 describe('v2.7: ctx.dedupe durable memoization', () => {
-  useTestDb();
-
   it('returns cached value on retry — fn runs once across a simulated crash+retry', async () => {
     let fnCalls = 0;
-    const wf = createWorkflow(uid('dedupe-cache'), {
+    const wf = env.workflow('dedupe-cache', {
       steps: {
         step: async (ctx) => {
           // Memoized effect — must run exactly once even though the step
@@ -362,7 +303,6 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
         },
       },
       defaults: { retries: 3, retryDelay: 10 },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -372,13 +312,11 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
     expect(result.status).toBe('done');
     // fn ran exactly once across the crash+retry (cache hit on attempt 2).
     expect(fnCalls).toBe(1);
-
-    wf.shutdown();
   });
 
   it('over-budget value is NOT cached — runs again on retry, warns', async () => {
     let fnCalls = 0;
-    const wf = createWorkflow(uid('dedupe-overbudget'), {
+    const wf = env.workflow('dedupe-overbudget', {
       steps: {
         step: async (ctx) => {
           await ctx.dedupe('big', async () => {
@@ -391,7 +329,6 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
         },
       },
       defaults: { retries: 3, retryDelay: 10 },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -399,8 +336,6 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
     expect(result.status).toBe('done');
     // Not cached ⇒ ran on both attempts.
     expect(fnCalls).toBe(2);
-
-    wf.shutdown();
   });
 
   it('scatter retries only the failed tasks; completed results intact', async () => {
@@ -409,7 +344,7 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
       execCounts[k] = (execCounts[k] ?? 0) + 1;
     };
 
-    const wf = createWorkflow(uid('scatter-failed-only'), {
+    const wf = env.workflow('scatter-failed-only', {
       steps: {
         fan: async (ctx) =>
           ctx.scatter({
@@ -429,7 +364,6 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
           }),
       },
       defaults: { retries: 3, retryDelay: 10 },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -443,8 +377,6 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
 
     const out = result.steps.find((s) => s.stepId === 'fan')?.output as Record<string, string>;
     expect(out).toEqual({ good1: 'g1', good2: 'g2', flaky: 'recovered' });
-
-    wf.shutdown();
   });
 });
 
@@ -453,12 +385,9 @@ describe('v2.7: ctx.dedupe durable memoization', () => {
 // ============================================================================
 
 describe('v2.7: operator pause/resume', () => {
-  useTestDb();
-
   it('pause mid-run: current step completes but next step is not claimed', async () => {
-    const wfId = uid('pause-midrun');
     const ran: string[] = [];
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('pause-midrun', {
       steps: {
         first: async (ctx) => {
           ran.push('first');
@@ -472,13 +401,12 @@ describe('v2.7: operator pause/resume', () => {
           return 2;
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     // Kick off execution (parks at the wait in `first`).
     await wf.execute(run._id);
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
     // Pause while waiting, then resume the wait — the paused gate should stop
     // the engine from claiming `second`.
@@ -490,17 +418,14 @@ describe('v2.7: operator pause/resume', () => {
     // the run was paused, verify the flag was honored: after resume the run
     // continues.
     await wf.resumeOperator(run._id, { data: 'answer' });
-    const done = await waitForStatus(wf, run._id, ['done']);
+    const done = await env.until(run._id, 'done');
     expect(done.status).toBe('done');
     expect(ran).toEqual(['first', 'second']);
-
-    wf.shutdown();
   });
 
   it('pause of a terminal run is a no-op; double-pause is idempotent', async () => {
-    const wf = createWorkflow(uid('pause-terminal'), {
+    const wf = env.workflow('pause-terminal', {
       steps: { a: async () => 1 },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
@@ -511,51 +436,46 @@ describe('v2.7: operator pause/resume', () => {
     const afterPause = await wf.pause(run._id, { reason: 'too late' });
     expect(afterPause.status).toBe('done');
     expect(afterPause.paused).toBeFalsy();
-
-    wf.shutdown();
   });
 
   it('double-pause is idempotent (second pause no-op)', async () => {
-    const wf = createWorkflow(uid('double-pause'), {
+    const wf = env.workflow('double-pause', {
       steps: {
         wait: async (ctx) => ctx.wait('hold'),
         after: async () => 'x',
       },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
     await wf.pause(run._id);
     const second = await wf.pause(run._id, { reason: 'again' });
     expect(second.paused).toBe(true);
-
-    wf.shutdown();
   });
 
   it('emits workflow:paused with the reason', async () => {
-    const wf = createWorkflow(uid('pause-event'), {
+    const wf = env.workflow('pause-event', {
       steps: {
         wait: async (ctx) => ctx.wait('hold'),
       },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
     const events: Array<{ runId: string; reason?: string }> = [];
     const listener = (p: { runId: string; reason?: string }) => events.push(p);
     wf.container.eventBus.on('workflow:paused', listener);
 
-    await wf.pause(run._id, { reason: 'maintenance' });
-    expect(events).toHaveLength(1);
-    expect(events[0].runId).toBe(run._id);
-    expect(events[0].reason).toBe('maintenance');
-
-    wf.container.eventBus.off('workflow:paused', listener);
-    wf.shutdown();
+    try {
+      await wf.pause(run._id, { reason: 'maintenance' });
+      expect(events).toHaveLength(1);
+      expect(events[0]?.runId).toBe(run._id);
+      expect(events[0]?.reason).toBe('maintenance');
+    } finally {
+      wf.container.eventBus.off('workflow:paused', listener);
+    }
   });
 });
 
@@ -564,10 +484,8 @@ describe('v2.7: operator pause/resume', () => {
 // ============================================================================
 
 describe('v2.7: getRunMetrics', () => {
-  useTestDb();
-
   it('aggregates durations + attempts across a multi-step run incl. a retried step', async () => {
-    const wf = createWorkflow(uid('metrics'), {
+    const wf = env.workflow('metrics', {
       steps: {
         quick: async () => 1,
         flaky: async (ctx) => {
@@ -576,7 +494,6 @@ describe('v2.7: getRunMetrics', () => {
         },
       },
       defaults: { retries: 3, retryDelay: 10 },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -591,12 +508,10 @@ describe('v2.7: getRunMetrics', () => {
     expect(metrics?.totalDurationMs).toBeGreaterThanOrEqual(0);
     // No cost recorded ⇒ totalCost undefined.
     expect(metrics?.totalCost).toBeUndefined();
-
-    wf.shutdown();
   });
 
   it('sums cost when middleware records it, undefined when none', async () => {
-    const wf = createWorkflow(uid('metrics-cost'), {
+    const wf: Workflow<Record<string, unknown>> = env.workflow('metrics-cost', {
       steps: { a: async () => 1, b: async () => 2 },
       taskMiddleware: [
         {
@@ -615,7 +530,6 @@ describe('v2.7: getRunMetrics', () => {
           },
         },
       ],
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -624,26 +538,21 @@ describe('v2.7: getRunMetrics', () => {
     const metrics = await wf.getRunMetrics(run._id);
     expect(metrics?.totalCost).toBe(10); // 2 steps × 5
     expect(metrics?.steps.every((s) => s.cost === 5)).toBe(true);
-
-    wf.shutdown();
   });
 
   it('in-flight runs are queryable', async () => {
-    const wf = createWorkflow(uid('metrics-inflight'), {
+    const wf = env.workflow('metrics-inflight', {
       steps: {
         wait: async (ctx) => ctx.wait('hold'),
       },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
     const metrics = await wf.getRunMetrics(run._id);
     expect(metrics?.status).toBe('waiting');
     expect(metrics?.steps).toHaveLength(1);
-
-    wf.shutdown();
   });
 });
 
@@ -652,68 +561,60 @@ describe('v2.7: getRunMetrics', () => {
 // ============================================================================
 
 describe('v2.7: cancel with reason', () => {
-  useTestDb();
-
   it('persists the reason on the run and in the event payload', async () => {
-    const wf = createWorkflow(uid('cancel-reason'), {
+    const wf = env.workflow('cancel-reason', {
       steps: { wait: async (ctx) => ctx.wait('hold') },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
     const events: Array<{ runId: string; data?: { reason?: string } }> = [];
     const listener = (p: { runId: string; data?: { reason?: string } }) => events.push(p);
     wf.container.eventBus.on('workflow:cancelled', listener);
 
-    const cancelled = await wf.cancel(run._id, { reason: 'user withdrew' });
-    expect(cancelled.status).toBe('cancelled');
-    expect(cancelled.cancellationReason).toBe('user withdrew');
+    try {
+      const cancelled = await wf.cancel(run._id, { reason: 'user withdrew' });
+      expect(cancelled.status).toBe('cancelled');
+      expect(cancelled.cancellationReason).toBe('user withdrew');
 
-    const persisted = await wf.get(run._id);
-    expect((persisted as { cancellationReason?: string })?.cancellationReason).toBe(
-      'user withdrew',
-    );
+      const persisted = await wf.get(run._id);
+      expect((persisted as { cancellationReason?: string })?.cancellationReason).toBe(
+        'user withdrew',
+      );
 
-    expect(events).toHaveLength(1);
-    expect(events[0].data?.reason).toBe('user withdrew');
-
-    wf.container.eventBus.off('workflow:cancelled', listener);
-    wf.shutdown();
+      expect(events).toHaveLength(1);
+      expect(events[0]?.data?.reason).toBe('user withdrew');
+    } finally {
+      wf.container.eventBus.off('workflow:cancelled', listener);
+    }
   });
 
   it('cancel without reason leaves cancellationReason undefined', async () => {
-    const wf = createWorkflow(uid('cancel-noreason'), {
+    const wf = env.workflow('cancel-noreason', {
       steps: { wait: async (ctx) => ctx.wait('hold') },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
     const cancelled = await wf.cancel(run._id);
     expect(cancelled.status).toBe('cancelled');
     expect(cancelled.cancellationReason).toBeUndefined();
-
-    wf.shutdown();
   });
 
   it('terminal-run cancel is a no-op — reason not overwritten', async () => {
-    const wf = createWorkflow(uid('cancel-terminal'), {
+    const wf = env.workflow('cancel-terminal', {
       steps: { wait: async (ctx) => ctx.wait('hold') },
-      autoExecute: false,
     });
     const run = await wf.start({});
     await wf.execute(run._id);
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
     await wf.cancel(run._id, { reason: 'first reason' });
     // Second cancel with a different reason must NOT overwrite.
     const again = await wf.cancel(run._id, { reason: 'second reason' });
     expect(again.cancellationReason).toBe('first reason');
-
-    wf.shutdown();
   });
 
   afterEach(() => {

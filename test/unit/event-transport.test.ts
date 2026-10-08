@@ -47,13 +47,17 @@ describe('createEvent', () => {
     // EventContext now extends primitives' OperationContext: `actorId` is the
     // canonical name on the context; it's mapped onto the arc-compatible
     // `meta.userId` field so the wire contract is unchanged.
-    const evt = createEvent('streamline:workflow.completed', { runId: 'r1' }, {
-      actorId: 'u1',
-      organizationId: 'org-42',
-      correlationId: 'trace-abc',
-      resource: 'workflow-run',
-      resourceId: 'r1',
-    });
+    const evt = createEvent(
+      'streamline:workflow.completed',
+      { runId: 'r1' },
+      {
+        actorId: 'u1',
+        organizationId: 'org-42',
+        correlationId: 'trace-abc',
+        resource: 'workflow-run',
+        resourceId: 'r1',
+      },
+    );
     expect(evt.meta.userId).toBe('u1');
     expect(evt.meta.organizationId).toBe('org-42');
     expect(evt.meta.correlationId).toBe('trace-abc');

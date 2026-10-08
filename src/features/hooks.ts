@@ -27,9 +27,13 @@
  */
 
 import { randomBytes } from 'node:crypto';
+import type { StreamlineContainer } from '../core/container.js';
 import type { StepContext, WorkflowRun } from '../core/types.js';
 import { hookRegistry, workflowRegistry } from '../execution/engine.js';
-import { workflowConcurrencyCounterRepository } from '../storage/concurrency-counter.repository.js';
+import {
+  type WorkflowConcurrencyCounterRepository,
+  workflowConcurrencyCounterRepository,
+} from '../storage/concurrency-counter.repository.js';
 import { type WorkflowRunRepository, workflowRunRepository } from '../storage/run.repository.js';
 import { makeWaitCancelled } from './wait-resolution.js';
 
@@ -164,6 +168,13 @@ export async function resumeHook(
      * singleton (legacy default).
      */
     repository?: WorkflowRunRepository;
+    /**
+     * The container the run lives in — its repository AND its strict-
+     * concurrency counter, on one connection. Wins over `repository`. Pass it
+     * when streamline is bound to a non-default connection, so the DB-fallback
+     * resume never reaches the default-connection singletons.
+     */
+    container?: Pick<StreamlineContainer, 'repository' | 'concurrencyCounterRepository'>;
   },
 ): Promise<{ runId: string; run: WorkflowRun }> {
   const [runId] = token.split(':');
@@ -180,7 +191,10 @@ export async function resumeHook(
   }
 
   // Fallback: DB-based resume (cross-process / post-restart)
-  return resumeViaDb(runId, token, payload, options?.repository);
+  return resumeViaDb(runId, token, payload, {
+    repository: options?.container?.repository ?? options?.repository,
+    counters: options?.container?.concurrencyCounterRepository,
+  });
 }
 
 /**
@@ -209,13 +223,14 @@ export async function cancelHook(
     reason?: string;
     /** See {@link resumeHook} — repository for the DB-fallback path. */
     repository?: WorkflowRunRepository;
+    /** See {@link resumeHook} — the run's container (wins over `repository`). */
+    container?: Pick<StreamlineContainer, 'repository' | 'concurrencyCounterRepository'>;
   },
 ): Promise<{ runId: string; run: WorkflowRun }> {
-  return resumeHook(
-    token,
-    makeWaitCancelled(options?.reason),
-    options?.repository !== undefined ? { repository: options.repository } : undefined,
-  );
+  return resumeHook(token, makeWaitCancelled(options?.reason), {
+    ...(options?.repository !== undefined && { repository: options.repository }),
+    ...(options?.container !== undefined && { container: options.container }),
+  });
 }
 
 /** Resume using the in-memory engine reference (fast path) */
@@ -263,8 +278,12 @@ async function resumeViaDb(
   runId: string,
   token: string,
   payload: unknown,
-  repositoryOverride?: WorkflowRunRepository,
+  overrides: {
+    repository?: WorkflowRunRepository | undefined;
+    counters?: WorkflowConcurrencyCounterRepository | undefined;
+  },
 ): Promise<{ runId: string; run: WorkflowRun }> {
+  const repositoryOverride = overrides.repository;
   // Bootstrap read: the run's workflowId (needed to resolve the owning
   // engine) isn't known yet, so read via the override or the singleton —
   // both wrap the same collection, and reads don't mutate.
@@ -352,18 +371,17 @@ async function resumeViaDb(
     if (engine) {
       engine.container.eventBus.emit('workflow:completed', { runId, data: payload });
     } else {
-      // No engine in this process — no bus listeners to notify, so
-      // replicate the slot release explicitly: read the strict-concurrency
-      // marker the engine stamps on gated runs and decrement the counter
-      // (same decrement `releaseSlotOnTerminal` performs; `releaseSlot`
-      // is `count > 0`-guarded). In-process `workflow:completed` observers
-      // don't exist by definition here; cross-process observers get the
-      // event via the host's transport bridge on the owning worker.
-      const counterId = (run.meta as Record<string, unknown> | undefined)?.concurrencyCounterId as
-        | string
-        | undefined;
+      // No engine in this process — no bus listeners to notify, so release
+      // the strict-concurrency slot here, through the same once-per-run claim
+      // `releaseSlotOnTerminal` uses (a re-emitted event elsewhere loses).
+      // In-process `workflow:completed` observers don't exist by definition
+      // here; cross-process observers get the event via the host's transport
+      // bridge on the owning worker.
+      // The counter lives beside the run (same container/connection); the
+      // default-connection singleton only when the caller gave neither.
+      const counterId = await repository.claimSlotRelease(runId, ['done']);
       if (counterId) {
-        await workflowConcurrencyCounterRepository.releaseSlot(counterId);
+        await (overrides.counters ?? workflowConcurrencyCounterRepository).releaseSlot(counterId);
       }
     }
   } else if (engine) {
@@ -435,11 +453,14 @@ function toPendingHook(run: WorkflowRun, token?: string): PendingHook | null {
  * await resumeHook(token, req.body);
  * ```
  */
-export async function getHookByToken(token: string): Promise<PendingHook | null> {
+export async function getHookByToken(
+  token: string,
+  options?: { container?: Pick<StreamlineContainer, 'repository'> },
+): Promise<PendingHook | null> {
   const [runId] = token.split(':');
   if (!runId) return null;
 
-  const run = await workflowRunRepository.getById(runId);
+  const run = await (options?.container?.repository ?? workflowRunRepository).getById(runId);
   if (!run || run.status !== 'waiting') return null;
 
   return toPendingHook(run as WorkflowRun, token);
@@ -465,8 +486,11 @@ export async function getHookByToken(token: string): Promise<PendingHook | null>
 export async function listPendingHooks(options?: {
   workflowId?: string;
   limit?: number;
+  /** Read through this container's repository (non-default connection / plugins). */
+  container?: Pick<StreamlineContainer, 'repository'>;
 }): Promise<PendingHook[]> {
-  const runs = await workflowRunRepository.getWaitingRuns('human', options?.limit ?? 100, {
+  const repository = options?.container?.repository ?? workflowRunRepository;
+  const runs = await repository.getWaitingRuns('human', options?.limit ?? 100, {
     ...(options?.workflowId !== undefined ? { workflowId: options.workflowId } : {}),
   });
 

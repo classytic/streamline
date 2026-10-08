@@ -154,8 +154,13 @@ await ctx.sleep(3_600_000); // survives process restart; scheduler re-picks it u
 
 ```typescript
 const data = await ctx.waitFor('user-action');
-// Resumes on: globalEventBus.emit('user-action', { runId, data }),
-// container.eventBus.emit(...), or a cross-process signal store.
+// Durable: workflow.signal(runId, 'user-action', data) — never lost to timing.
+// Delivered now if the run waits, else queued until the next waitFor (even
+// across restarts). Exactly one waitFor consumes each signal.
+//
+// Fire-and-forget (reaches only a live listener at that instant):
+// globalEventBus.emit('user-action', { runId, data }), container.eventBus.emit(...),
+// or a cross-process signal store.
 ```
 
 ### Parallel / scatter
@@ -685,7 +690,7 @@ workflow.engine.configure({ scheduler: { maxConcurrentExecutions: 10 } });
 ## API summary
 
 **Workflow** (from `createWorkflow`):
-`start(input, opts?)` · `execute(runId)` · `resume(runId, payload?)` · `get(runId)` · `cancel(runId)` · `pause(runId)` · `rewindTo(runId, stepId)` · `waitFor(runId, opts?)` · `shutdown()`
+`start(input, opts?)` · `execute(runId)` · `resume(runId, payload?)` · `signal(runId, name, data?, opts?)` · `get(runId)` · `cancel(runId)` · `pause(runId)` · `rewindTo(runId, stepId)` · `waitFor(runId, opts?)` · `shutdown()`
 
 **StepContext** (inside handlers):
 `ctx.outputs` (typed) · `ctx.set` · `ctx.getOutput` · `ctx.wait` · `ctx.waitFor` · `ctx.sleep` · `ctx.loop` · `ctx.stream` · `ctx.heartbeat` · `ctx.emit` · `ctx.log` · `ctx.checkpoint` · `ctx.getCheckpoint` · `ctx.scatter` · `ctx.joinBranches` · `ctx.goto` · `ctx.startChildWorkflow` · `ctx.outputHistory` · `ctx.pinOutput` · `ctx.idempotencyKey` · `ctx.signal` (AbortSignal)
@@ -752,16 +757,60 @@ export const myWorkflow: Workflow<MyCtx, MyInput> = createWorkflow('my', { /* ..
 
 See [docs/examples/](./docs/examples): hello-world, wait, sleep, parallel, conditional, newsletter automation, AI pipeline.
 
-## Testing your workflows
+## Testing your workflows — `@classytic/streamline/testkit`
+
+A real harness, the same one streamline's own suite runs on: an isolated
+streamline world on an ephemeral MongoDB (its own connection, container and
+real indexes), run-shape fixtures for crash / due / waiting / mid-saga states,
+deterministic scheduler ticks, and outcome waits instead of sleeps. Runner-
+agnostic — wire `clear()` / `close()` into your hooks.
 
 ```bash
-npm test            # dev loop — unit + integration (fast)
-npm run test:all    # before publish — unit + integration + long (full gate; prepublishOnly runs this)
-npm run test:long   # nightly / slow CI — long-running scenarios only
+npm i -D mongodb-memory-server   # optional peer; or point it at a real MongoDB via { uri } / MONGODB_URI
 ```
 
-See [TESTING.md](./TESTING.md) for tier conventions + helpers, and
-[docs/contributing/PUBLISH_CHECKLIST.md](./docs/contributing/PUBLISH_CHECKLIST.md) for the release flow.
+```typescript
+import { createStreamlineTestEnv } from '@classytic/streamline/testkit';
+
+const env = await createStreamlineTestEnv();      // { replset: true } for transactions
+afterEach(() => env.clear());
+afterAll(() => env.close());
+
+it('ships after approval', async () => {
+  const wf = env.workflow('order', {
+    steps: {
+      approve: async (ctx) => ctx.waitFor('approved'),
+      ship: async (ctx) => ({ shipped: ctx.getOutput('approve') }),
+    },
+  });
+  const run = await wf.start({});
+  await wf.execute(run._id);
+  await wf.signal(run._id, 'approved', { by: 'ops' });
+  expect((await env.until(run._id, 'done')).output).toEqual({ shipped: { by: 'ops' } });
+});
+
+it('recovers a run its worker died on', async () => {
+  const wf = env.workflow('order', { steps: { charge: async () => 'ok' } });
+  const run = await env.runs.staleRunning(wf);   // the shape a crashed worker leaves
+  await env.tick(wf);                            // one scheduler poll, deterministically
+  await env.until(run._id, 'done');
+});
+```
+
+| | |
+|---|---|
+| `env.workflow(name, config)` | `createWorkflow` with a unique id, the env's container, `autoExecute: false` |
+| `env.runs.*` | `insert` · `staleRunning` · `retryDue` · `timerDue` · `waitingFor` · `scheduledDue` · `failedAwaitingCompensation` · `staleCompensating` · `get` |
+| `env.until(runId, status \| predicate)` | wait for an outcome; on timeout, names the status it last saw |
+| `env.eventually(check)` · `env.untilCount(filter, n)` | wait on any condition · on runs you have no id for |
+| `env.tick(wf)` · `env.runs.makeDue(id)` | one scheduler poll and the work it dispatched · skip a real retry/timer delay |
+| `env.worker(wf, config)` · `env.redefine(wf, config)` | a second process of the workflow · a new version in this one |
+| `env.runs.update(id, update)` · `env.counter(wf, key)` | edit a stored run (cache-safe) · read a strict-concurrency bucket |
+| `env.trace(fn)` | every MongoDB command `fn` sent — `writes`, `reads`, `updatesTo(runId)`, `readsOf(runId)`, bytes |
+
+Contributing to streamline itself: [TESTING.md](./TESTING.md) (tiers, the
+harness, anti-patterns) and
+[docs/contributing/PUBLISH_CHECKLIST.md](./docs/contributing/PUBLISH_CHECKLIST.md).
 
 ## What's new in 2.6
 

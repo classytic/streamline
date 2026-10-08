@@ -10,24 +10,22 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { createContainer, createWorkflow, WorkflowRunModel } from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-function tenantWorkflow(id: string) {
-  const container = createContainer({
-    repository: { tenant: { tenantField: 'context.tenantId', required: true } },
-  });
-  return createWorkflow<{ tenantId: string }, { tenantId: string }>(id, {
+const env = useStreamlineEnv({
+  container: { repository: { tenant: { tenantField: 'context.tenantId', required: true } } },
+});
+
+function tenantWorkflow(name: string) {
+  // autoExecute: false (the env default) — the run stays 'running'
+  // (non-terminal), so it is cancellable + idempotency-active.
+  return env.workflow<{ tenantId: string }, { tenantId: string }>(name, {
     steps: { work: async () => 'done' },
     context: (input) => ({ tenantId: input.tenantId }),
-    autoExecute: false, // run stays 'running' (non-terminal) — cancellable + idempotency-active
-    container,
   });
 }
 
 describe('Multi-tenant isolation — control API', () => {
-  useTestDb();
-
   it('F1: a foreign tenant cannot get or cancel another tenant’s run', async () => {
     const wf = tenantWorkflow('iso-control');
     const run = await wf.start({ tenantId: 'org-A' }, { tenantId: 'org-A' });
@@ -46,13 +44,11 @@ describe('Multi-tenant isolation — control API', () => {
     // Same tenant → allowed.
     const cancelled = await wf.cancel(run._id, { tenantId: 'org-A', reason: 'test' });
     expect(cancelled.status).toBe('cancelled');
-
-    wf.shutdown();
   });
 
   it('F2: the same idempotency key is unique PER TENANT (no cross-tenant collision)', async () => {
     const wf = tenantWorkflow('iso-idempotency');
-    await WorkflowRunModel.syncIndexes(); // ensure the compound unique index is built
+    await env.runModel.syncIndexes(); // ensure the compound unique index is built
 
     const key = 'order-42';
     const a = await wf.start({ tenantId: 'org-A' }, { tenantId: 'org-A', idempotencyKey: key });
@@ -61,9 +57,10 @@ describe('Multi-tenant isolation — control API', () => {
     expect(b._id).not.toBe(a._id);
 
     // Same tenant + same key → idempotent (returns the existing run).
-    const aAgain = await wf.start({ tenantId: 'org-A' }, { tenantId: 'org-A', idempotencyKey: key });
+    const aAgain = await wf.start(
+      { tenantId: 'org-A' },
+      { tenantId: 'org-A', idempotencyKey: key },
+    );
     expect(aAgain._id).toBe(a._id);
-
-    wf.shutdown();
   });
 });

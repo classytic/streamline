@@ -17,14 +17,17 @@
  *   3. Short-lived failures (under threshold) do NOT abort the step.
  */
 
-import { afterAll, beforeAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { createWorkflow } from '../../src/index.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TIMING } from '../../src/config/constants.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB } from '../utils/setup.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(setupTestDB);
-afterAll(teardownTestDB);
-afterEach(cleanupTestDB);
+const env = useStreamlineEnv();
+
+// The spies below inject FAULTS into the env container's repository (which
+// outlives each test) — always put the real methods back.
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 // We're manipulating the executor's heartbeat interval and the repository's
 // `updateOne` method to simulate failures quickly. Keep these helpers small
@@ -41,7 +44,7 @@ describe('heartbeat backpressure', () => {
   it('aborts the step after HEARTBEAT_FAILURE_ABORT_THRESHOLD consecutive failures', async () => {
     const restoreInterval = speedUpHeartbeat(20);
 
-    const wf = createWorkflow('heartbeat-abort', {
+    const wf = env.workflow('heartbeat-abort', {
       steps: {
         slow: async (ctx) => {
           // Block long enough for the heartbeat loop to tick past the
@@ -57,7 +60,6 @@ describe('heartbeat backpressure', () => {
           });
         },
       },
-      autoExecute: false,
     });
 
     // Break heartbeat writes — every call to updateOne with only a
@@ -83,16 +85,20 @@ describe('heartbeat backpressure', () => {
       );
 
     const errorEvents: string[] = [];
-    wf.container.eventBus.on('engine:error', (payload) => {
+    const onError = (payload: { context: string }) => {
       errorEvents.push(payload.context);
-    });
+    };
+    wf.container.eventBus.on('engine:error', onError);
 
-    const run = await wf.start({});
-    const result = await wf.execute(run._id);
-
-    spy.mockRestore();
-    restoreInterval();
-    wf.shutdown();
+    let result: Awaited<ReturnType<typeof wf.execute>>;
+    try {
+      const run = await wf.start({});
+      result = await wf.execute(run._id);
+    } finally {
+      spy.mockRestore();
+      restoreInterval();
+      wf.container.eventBus.off('engine:error', onError);
+    }
 
     // Either the step handler saw the signal flip and resolved 'aborted',
     // or the step's own failure path ran due to the abort error bubbling.
@@ -115,11 +121,10 @@ describe('heartbeat backpressure', () => {
   it('a few transient heartbeat failures (below threshold) do NOT abort the step', async () => {
     const restoreInterval = speedUpHeartbeat(20);
 
-    const wf = createWorkflow('heartbeat-transient', {
+    const wf = env.workflow('heartbeat-transient', {
       steps: {
         quick: async () => 'ok',
       },
-      autoExecute: false,
     });
 
     const repo = wf.container.repository;
@@ -147,14 +152,20 @@ describe('heartbeat backpressure', () => {
     );
 
     const errorEvents: string[] = [];
-    wf.container.eventBus.on('engine:error', (p) => errorEvents.push(p.context));
+    const onError = (p: { context: string }) => {
+      errorEvents.push(p.context);
+    };
+    wf.container.eventBus.on('engine:error', onError);
 
-    const run = await wf.start({});
-    const result = await wf.execute(run._id);
-
-    vi.restoreAllMocks();
-    restoreInterval();
-    wf.shutdown();
+    let result: Awaited<ReturnType<typeof wf.execute>>;
+    try {
+      const run = await wf.start({});
+      result = await wf.execute(run._id);
+    } finally {
+      vi.restoreAllMocks();
+      restoreInterval();
+      wf.container.eventBus.off('engine:error', onError);
+    }
 
     expect(result.status).toBe('done');
     expect(errorEvents).not.toContain('heartbeat-abort');

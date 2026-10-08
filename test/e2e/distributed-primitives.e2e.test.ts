@@ -8,48 +8,47 @@
  * 6. Priority
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitFor } from '../utils/setup.js';
-import {
-  createWorkflow,
-  NonRetriableError,
-  WorkflowRunModel,
-  configureStreamlineLogger,
-} from '../../src/index.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { configureStreamlineLogger, NonRetriableError } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
+const env = useStreamlineEnv();
+
+beforeAll(() => {
   configureStreamlineLogger({ enabled: false });
 });
 
-afterAll(async () => {
+afterAll(() => {
   configureStreamlineLogger({ enabled: true });
-  await teardownTestDB();
 });
+
+/** A promise plus the function that resolves it — "the step is in flight". */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 // ============================================================================
 // 1. NonRetriableError
 // ============================================================================
 
 describe('NonRetriableError', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should immediately fail step without retrying', async () => {
     let attempts = 0;
 
-    const wf = createWorkflow('non-retriable-test', {
+    const wf = env.workflow('non-retriable-test', {
       steps: {
         validate: {
           handler: async () => {
             attempts++;
-            throw new NonRetriableError('Invalid credentials — retrying won\'t help');
+            throw new NonRetriableError("Invalid credentials — retrying won't help");
           },
           retries: 5,
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -57,9 +56,7 @@ describe('NonRetriableError', () => {
 
     expect(result.status).toBe('failed');
     expect(attempts).toBe(1); // No retries
-    expect(result.steps[0].error?.message).toContain('Invalid credentials');
-
-    wf.shutdown();
+    expect(result.steps[0]?.error?.message).toContain('Invalid credentials');
   });
 
   it('should have retriable=false on the error instance', () => {
@@ -75,16 +72,11 @@ describe('NonRetriableError', () => {
 // ============================================================================
 
 describe('Idempotency key', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should return existing run when starting with duplicate key', async () => {
-    const wf = createWorkflow('idemp-test', {
+    const wf = env.workflow('idemp-test', {
       steps: {
         step1: async () => 'ok',
       },
-      autoExecute: false,
     });
 
     // First start — creates the run
@@ -98,21 +90,16 @@ describe('Idempotency key', () => {
     // Different key — should create new
     const run3 = await wf.start({}, { idempotencyKey: 'order:456' });
     expect(run3._id).not.toBe(run1._id);
-
-    wf.shutdown();
   });
 
   it('should store idempotencyKey in the run document', async () => {
-    const wf = createWorkflow('idemp-store-test', {
+    const wf = env.workflow('idemp-store-test', {
       steps: { a: async () => 'ok' },
-      autoExecute: false,
     });
 
     const run = await wf.start({}, { idempotencyKey: 'unique-key-1' });
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.idempotencyKey).toBe('unique-key-1');
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(doc?.idempotencyKey).toBe('unique-key-1');
   });
 });
 
@@ -121,38 +108,41 @@ describe('Idempotency key', () => {
 // ============================================================================
 
 describe('cancelOn', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should auto-cancel workflow when matching event fires', async () => {
-    const wf = createWorkflow('cancel-on-test', {
+    const started = deferred();
+    const wf = env.workflow('cancel-on-test', {
       steps: {
         slow: async (ctx) => {
-          await new Promise((r) => setTimeout(r, 10000));
+          started.resolve();
+          // A 10s step that returns early once aborted — the run must stay
+          // cancelled even though the handler then returns a value.
+          await new Promise<void>((r) => {
+            const timer = setTimeout(r, 10000);
+            ctx.signal.addEventListener('abort', () => {
+              clearTimeout(timer);
+              r();
+            });
+          });
           return 'should not complete';
         },
       },
       cancelOn: [{ event: 'order.cancelled' }],
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     const execPromise = wf.execute(run._id).catch(() => {});
 
-    // Give step time to start
-    await waitFor(50);
+    // Fire only once the step is in flight
+    await started.promise;
 
     // Fire the cancel event
-    wf.container.eventBus.emit('order.cancelled' as any, { runId: run._id });
+    wf.container.eventBus.emit('order.cancelled', { runId: run._id });
 
-    await waitFor(100);
+    await env.until(run._id, 'cancelled');
     await execPromise;
 
-    const final = await WorkflowRunModel.findById(run._id).lean();
-    expect(final!.status).toBe('cancelled');
-
-    wf.shutdown();
+    const final = await env.runs.get(run._id);
+    expect(final?.status).toBe('cancelled');
   });
 });
 
@@ -161,21 +151,16 @@ describe('cancelOn', () => {
 // ============================================================================
 
 describe('Concurrency control', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should queue runs as draft when concurrency limit reached', async () => {
-    const wf = createWorkflow<{ userId: string }>('concurrency-test', {
+    const wf = env.workflow<{ userId: string }, { userId: string }>('concurrency-test', {
       steps: {
         process: async () => {
           await new Promise((r) => setTimeout(r, 100));
           return 'done';
         },
       },
-      concurrency: { limit: 2, key: (input: { userId: string }) => input.userId },
-      context: (input: { userId: string }) => ({ userId: input.userId }),
-      autoExecute: false,
+      concurrency: { limit: 2, key: (input) => input.userId },
+      context: (input) => ({ userId: input.userId }),
     });
 
     // Start 2 runs for user-A — should both be running
@@ -191,8 +176,6 @@ describe('Concurrency control', () => {
     // Different user — should be running (separate key)
     const run4 = await wf.start({ userId: 'user-B' });
     expect(run4.status).toBe('running');
-
-    wf.shutdown();
   });
 });
 
@@ -201,35 +184,23 @@ describe('Concurrency control', () => {
 // ============================================================================
 
 describe('Event trigger', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should auto-start workflow when trigger event fires', async () => {
-    let started = false;
-
-    const wf = createWorkflow('trigger-test', {
+    const wf = env.workflow('trigger-test', {
       steps: {
-        process: async () => {
-          started = true;
-          return 'triggered';
-        },
+        process: async () => 'triggered',
       },
       trigger: { event: 'user.created' },
-      autoExecute: false,
     });
+    const workflowId = wf.engine.definition.id;
 
     // Fire the trigger event
-    wf.container.eventBus.emit('user.created' as any, { data: { name: 'Alice' } });
+    wf.container.eventBus.emit('user.created', { data: { name: 'Alice' } });
 
-    // Wait for async start
-    await waitFor(200);
+    // Wait for the async start to create a run
+    const runs = await env.untilCount({ workflowId }, 1);
 
     // A run should have been created
-    const runs = await WorkflowRunModel.find({ workflowId: 'trigger-test' }).lean();
     expect(runs.length).toBeGreaterThanOrEqual(1);
-
-    wf.shutdown();
   });
 });
 
@@ -238,34 +209,24 @@ describe('Event trigger', () => {
 // ============================================================================
 
 describe('Priority', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should store priority on the run document', async () => {
-    const wf = createWorkflow('priority-test', {
+    const wf = env.workflow('priority-test', {
       steps: { a: async () => 'ok' },
-      autoExecute: false,
     });
 
     const run = await wf.start({}, { priority: 10 });
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.priority).toBe(10);
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(doc?.priority).toBe(10);
   });
 
   it('should default priority to 0', async () => {
-    const wf = createWorkflow('priority-default-test', {
+    const wf = env.workflow('priority-default-test', {
       steps: { a: async () => 'ok' },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.priority).toBe(0);
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(doc?.priority).toBe(0);
   });
 });
 
@@ -274,12 +235,8 @@ describe('Priority', () => {
 // ============================================================================
 
 describe('Smoke: combined distributed primitives', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should support idempotency + priority + cancelOn in one workflow', async () => {
-    const wf = createWorkflow('combined-test', {
+    const wf = env.workflow('combined-test', {
       steps: {
         process: async (ctx) => {
           await ctx.wait('Waiting for approval');
@@ -287,14 +244,16 @@ describe('Smoke: combined distributed primitives', () => {
         finalize: async () => 'done',
       },
       cancelOn: [{ event: 'order.cancelled' }],
-      autoExecute: false,
     });
 
     // Start with idempotency + priority
-    const run1 = await wf.start({}, {
-      idempotencyKey: 'combined:1',
-      priority: 5,
-    });
+    const run1 = await wf.start(
+      {},
+      {
+        idempotencyKey: 'combined:1',
+        priority: 5,
+      },
+    );
     expect(run1.priority).toBe(5);
     expect(run1.idempotencyKey).toBe('combined:1');
 
@@ -306,12 +265,9 @@ describe('Smoke: combined distributed primitives', () => {
     await wf.execute(run1._id);
 
     // Cancel via event
-    wf.container.eventBus.emit('order.cancelled' as any, { runId: run1._id });
-    await waitFor(100);
+    wf.container.eventBus.emit('order.cancelled', { runId: run1._id });
 
-    const final = await WorkflowRunModel.findById(run1._id).lean();
-    expect(final!.status).toBe('cancelled');
-
-    wf.shutdown();
+    const final = await env.until(run1._id, 'cancelled');
+    expect(final.status).toBe('cancelled');
   });
 });

@@ -4,36 +4,44 @@
  * Tests the scheduler's ability to poll and execute scheduled workflows.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
-import mongoose from 'mongoose';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { SmartScheduler } from '../../src/execution/smart-scheduler.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_SCHEDULER_CONFIG, SmartScheduler } from '../../src/execution/smart-scheduler.js';
+import type { RunFields } from '../../src/testkit/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
+
+/** A scheduled `draft` run whose execution time is `executionTime`. */
+function scheduledDraft(id: string, executionTime: Date, fields: RunFields = {}) {
+  return env.runs.insert('test-workflow', {
+    _id: id,
+    status: 'draft',
+    steps: [],
+    currentStepId: null,
+    scheduling: {
+      scheduledFor: executionTime.toISOString(),
+      timezone: 'UTC',
+      localTimeDisplay: 'test',
+      executionTime,
+      isDSTTransition: false,
+    },
+    ...fields,
+  });
+}
 
 describe('SmartScheduler - Scheduled Workflow Polling', () => {
   let scheduler: SmartScheduler;
-  let executeCallback: ReturnType<typeof vi.fn>;
-  let resumeCallback: ReturnType<typeof vi.fn>;
 
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test');
-    }
-  });
-
-  afterAll(async () => {
-    await mongoose.connection.close();
-  });
-
-  beforeEach(async () => {
-    await WorkflowRunModel.deleteMany({});
-
+  beforeEach(() => {
     // Mock callbacks
-    resumeCallback = vi.fn().mockResolvedValue(undefined);
-    executeCallback = vi.fn().mockResolvedValue(undefined);
+    const resumeCallback = vi.fn<(runId: string) => Promise<void>>().mockResolvedValue(undefined);
+    const executeCallback = vi
+      .fn<(runId: string) => Promise<unknown>>()
+      .mockResolvedValue(undefined);
 
     // Create scheduler with short intervals for testing
-    scheduler = new SmartScheduler(workflowRunRepository, resumeCallback, {
+    scheduler = new SmartScheduler(env.container.repository, resumeCallback, {
+      ...DEFAULT_SCHEDULER_CONFIG,
       basePollInterval: 100, // 100ms for faster tests
       maxPollInterval: 500,
       minPollInterval: 50,
@@ -56,54 +64,20 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
     it('should return scheduled workflows with executionTime <= now', async () => {
       const pastTime = new Date(Date.now() - 60000); // 1 minute ago
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-past-1',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: pastTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: pastTime,
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-past-1', pastTime);
 
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(new Date());
 
       expect(result.data).toHaveLength(1);
-      expect(result.data[0]._id).toBe('scheduled-past-1');
+      expect(result.data[0]?._id).toBe('scheduled-past-1');
     });
 
     it('should NOT return scheduled workflows with executionTime > now', async () => {
       const futureTime = new Date(Date.now() + 60000); // 1 minute in future
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-future-1',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: futureTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: futureTime,
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-future-1', futureTime);
 
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(new Date());
 
       expect(result.data).toHaveLength(0);
     });
@@ -111,27 +85,9 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
     it('should NOT return paused scheduled workflows', async () => {
       const pastTime = new Date(Date.now() - 60000);
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-paused-1',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        paused: true, // Paused
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: pastTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: pastTime,
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-paused-1', pastTime, { paused: true });
 
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(new Date());
 
       expect(result.data).toHaveLength(0);
     });
@@ -139,26 +95,9 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
     it('should NOT return non-draft status workflows', async () => {
       const pastTime = new Date(Date.now() - 60000);
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-running-1',
-        workflowId: 'test-workflow',
-        status: 'running', // Not draft
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: pastTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: pastTime,
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-running-1', pastTime, { status: 'running' }); // Not draft
 
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(new Date());
 
       expect(result.data).toHaveLength(0);
     });
@@ -166,31 +105,15 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
     it('should respect limit parameter', async () => {
       const pastTime = new Date(Date.now() - 60000);
 
-      // Create 10 scheduled workflows
+      // Create 10 scheduled workflows (staggered times)
       for (let i = 0; i < 10; i++) {
-        await WorkflowRunModel.create({
-          _id: `scheduled-limit-${i}`,
-          workflowId: 'test-workflow',
-          status: 'draft',
-          steps: [],
-          currentStepId: null,
-          context: {},
-          input: {},
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          scheduling: {
-            scheduledFor: pastTime,
-            timezone: 'UTC',
-            localTimeDisplay: 'test',
-            executionTime: new Date(pastTime.getTime() + i * 1000), // Stagger times
-            isDSTTransition: false,
-          },
-        });
+        await scheduledDraft(`scheduled-limit-${i}`, new Date(pastTime.getTime() + i * 1000));
       }
 
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date(), {
-        limit: 5,
-      });
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(
+        new Date(),
+        { limit: 5 },
+      );
 
       expect(result.data).toHaveLength(5);
     });
@@ -199,69 +122,16 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
       const now = Date.now();
 
       // Create workflows with different execution times
-      await WorkflowRunModel.create({
-        _id: 'scheduled-sort-3',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: new Date(now - 10000),
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: new Date(now - 10000), // Oldest
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-sort-3', new Date(now - 10000)); // Newest
+      await scheduledDraft('scheduled-sort-1', new Date(now - 30000)); // Oldest
+      await scheduledDraft('scheduled-sort-2', new Date(now - 20000));
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-sort-1',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: new Date(now - 30000),
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: new Date(now - 30000), // Oldest
-          isDSTTransition: false,
-        },
-      });
-
-      await WorkflowRunModel.create({
-        _id: 'scheduled-sort-2',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: new Date(now - 20000),
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: new Date(now - 20000),
-          isDSTTransition: false,
-        },
-      });
-
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(new Date());
 
       expect(result.data).toHaveLength(3);
-      expect(result.data[0]._id).toBe('scheduled-sort-1'); // Oldest first
-      expect(result.data[1]._id).toBe('scheduled-sort-2');
-      expect(result.data[2]._id).toBe('scheduled-sort-3'); // Newest last
+      expect(result.data[0]?._id).toBe('scheduled-sort-1'); // Oldest first
+      expect(result.data[1]?._id).toBe('scheduled-sort-2');
+      expect(result.data[2]?._id).toBe('scheduled-sort-3'); // Newest last
     });
   });
 
@@ -269,24 +139,7 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
     it('should detect scheduled workflows as active', async () => {
       const pastTime = new Date(Date.now() - 60000);
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-active-1',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: pastTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: pastTime,
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-active-1', pastTime);
 
       const started = await scheduler.startIfNeeded();
 
@@ -297,24 +150,7 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
     it('should NOT start if only future scheduled workflows exist', async () => {
       const futureTime = new Date(Date.now() + 3600000); // 1 hour in future
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-future-only',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: futureTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: futureTime,
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-future-only', futureTime);
 
       const started = await scheduler.startIfNeeded();
 
@@ -324,34 +160,13 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
   });
 
   describe('Scheduled Workflow Execution', () => {
-    // These tests verify the scheduler integration
-    // Skip timing-sensitive tests that are flaky in CI environments
-
     it('should NOT execute paused scheduled workflows via query', async () => {
       const pastTime = new Date(Date.now() - 1000);
 
-      await WorkflowRunModel.create({
-        _id: 'scheduled-paused-exec',
-        workflowId: 'test-workflow',
-        status: 'draft',
-        steps: [],
-        currentStepId: null,
-        context: {},
-        input: {},
-        paused: true,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: pastTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: pastTime,
-          isDSTTransition: false,
-        },
-      });
+      await scheduledDraft('scheduled-paused-exec', pastTime, { paused: true });
 
       // Query should not return paused workflow
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date());
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(new Date());
       expect(result.data).toHaveLength(0);
     });
   });
@@ -361,35 +176,17 @@ describe('SmartScheduler - Scheduled Workflow Polling', () => {
       const pastTime = new Date(Date.now() - 60000);
 
       // Create 150 scheduled workflows (more than default limit of 100)
-      const createPromises = [];
-      for (let i = 0; i < 150; i++) {
-        createPromises.push(
-          WorkflowRunModel.create({
-            _id: `scheduled-batch-${i}`,
-            workflowId: 'test-workflow',
-            status: 'draft',
-            steps: [],
-            currentStepId: null,
-            context: {},
-            input: {},
-            createdAt: new Date(),
-            updatedAt: new Date(),
-            scheduling: {
-              scheduledFor: pastTime,
-              timezone: 'UTC',
-              localTimeDisplay: 'test',
-              executionTime: new Date(pastTime.getTime() + i),
-              isDSTTransition: false,
-            },
-          })
-        );
-      }
-      await Promise.all(createPromises);
+      await Promise.all(
+        Array.from({ length: 150 }, (_, i) =>
+          scheduledDraft(`scheduled-batch-${i}`, new Date(pastTime.getTime() + i)),
+        ),
+      );
 
       // First poll should get up to limit (100)
-      const result = await workflowRunRepository.getScheduledWorkflowsReadyToExecute(new Date(), {
-        limit: 100,
-      });
+      const result = await env.container.repository.getScheduledWorkflowsReadyToExecute(
+        new Date(),
+        { limit: 100 },
+      );
 
       // Result should have data property with workflows
       expect(result).toBeDefined();

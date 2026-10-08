@@ -1,14 +1,14 @@
-import { describe, it, expect, beforeAll } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+import { describe, expect, it } from 'vitest';
+import type { ConditionalStep, WorkflowRun } from '../../../src/index.js';
 import {
-  createWorkflow,
-  isConditionalStep,
-  shouldSkipStep,
   conditions,
   createCondition,
+  isConditionalStep,
+  shouldSkipStep,
 } from '../../../src/index.js';
-import type { ConditionalStep, WorkflowRun } from '../../../src/index.js';
+import { useStreamlineEnv } from '../../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 interface OrderContext {
   orderId: string;
@@ -20,11 +20,11 @@ interface OrderContext {
   notified?: boolean;
 }
 
-describe('Conditional Workflow', () => {
-  beforeAll(setupTestDB);
+type OrderInput = Pick<OrderContext, 'orderId' | 'amount' | 'country' | 'priority'>;
 
+describe('Conditional Workflow', () => {
   it('should skip steps based on condition', async () => {
-    const workflow = createWorkflow<OrderContext>('conditional-order-test', {
+    const workflow = env.workflow<OrderContext, OrderInput>('conditional-order-test', {
       steps: {
         validate: async (ctx) => {
           const { amount, country } = ctx.context;
@@ -55,13 +55,12 @@ describe('Conditional Workflow', () => {
           return { sent: true };
         },
       },
-      context: (input: any) => ({
+      context: (input) => ({
         orderId: input.orderId,
         amount: input.amount,
         country: input.country,
         priority: input.priority,
       }),
-      autoExecute: false,
     });
 
     // Test express order
@@ -75,8 +74,14 @@ describe('Conditional Workflow', () => {
     const expressResult = await workflow.execute(expressRun._id);
 
     expect(expressResult.status).toBe('done');
-    expect(expressResult.steps.find((s) => s.stepId === 'express')?.output).toHaveProperty('method', 'express');
-    expect(expressResult.steps.find((s) => s.stepId === 'standard')?.output).toHaveProperty('skipped', true);
+    expect(expressResult.steps.find((s) => s.stepId === 'express')?.output).toHaveProperty(
+      'method',
+      'express',
+    );
+    expect(expressResult.steps.find((s) => s.stepId === 'standard')?.output).toHaveProperty(
+      'skipped',
+      true,
+    );
 
     // Test standard order
     const standardRun = await workflow.start({
@@ -89,17 +94,21 @@ describe('Conditional Workflow', () => {
     const standardResult = await workflow.execute(standardRun._id);
 
     expect(standardResult.status).toBe('done');
-    expect(standardResult.steps.find((s) => s.stepId === 'express')?.output).toHaveProperty('skipped', true);
-    expect(standardResult.steps.find((s) => s.stepId === 'standard')?.output).toHaveProperty('method', 'standard');
-
-    workflow.shutdown();
+    expect(standardResult.steps.find((s) => s.stepId === 'express')?.output).toHaveProperty(
+      'skipped',
+      true,
+    );
+    expect(standardResult.steps.find((s) => s.stepId === 'standard')?.output).toHaveProperty(
+      'method',
+      'standard',
+    );
   });
 
   it('should validate isConditionalStep type guard', () => {
     const conditionalStep: ConditionalStep = {
       id: 'cond-1',
       name: 'Conditional Step',
-      condition: (ctx: any) => ctx.value > 10,
+      condition: (ctx) => (ctx as { value: number }).value > 10,
     };
 
     const regularStep = {
@@ -115,7 +124,7 @@ describe('Conditional Workflow', () => {
     interface TestContext {
       value: number;
       status: string;
-      data?: string;
+      data?: string | undefined;
     }
 
     const ctx: TestContext = {
@@ -144,16 +153,16 @@ describe('Conditional Workflow', () => {
     expect(
       conditions.and<TestContext>(
         conditions.hasValue('data'),
-        conditions.greaterThan('value', 10)
-      )(ctx)
+        conditions.greaterThan('value', 10),
+      )(ctx),
     ).toBe(true);
 
     // or
     expect(
       conditions.or<TestContext>(
         conditions.equals('status', 'inactive'),
-        conditions.hasValue('data')
-      )(ctx)
+        conditions.hasValue('data'),
+      )(ctx),
     ).toBe(true);
 
     // not
@@ -182,7 +191,7 @@ describe('Conditional Workflow', () => {
     const skipIfStep: ConditionalStep = {
       id: 'step1',
       name: 'Step 1',
-      skipIf: (ctx: OrderContext) => ctx.amount < 100,
+      skipIf: (ctx) => (ctx as OrderContext).amount < 100,
     };
 
     const shouldSkip = await shouldSkipStep(skipIfStep, mockRun.context, mockRun);
@@ -192,7 +201,7 @@ describe('Conditional Workflow', () => {
     const runIfStep: ConditionalStep = {
       id: 'step2',
       name: 'Step 2',
-      runIf: (ctx: OrderContext) => ctx.amount >= 100,
+      runIf: (ctx) => (ctx as OrderContext).amount >= 100,
     };
 
     const shouldSkipRunIf = await shouldSkipStep(runIfStep, mockRun.context, mockRun);
@@ -206,8 +215,8 @@ describe('Conditional Workflow', () => {
     }
 
     const isAdult = createCondition<CustomContext>((ctx) => ctx.age >= 18);
-    const hasValidEmail = createCondition<CustomContext>((ctx) =>
-      ctx.email.includes('@') && ctx.email.includes('.')
+    const hasValidEmail = createCondition<CustomContext>(
+      (ctx) => ctx.email.includes('@') && ctx.email.includes('.'),
     );
 
     const validAdult: CustomContext = { email: 'user@example.com', age: 25 };

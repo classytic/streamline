@@ -7,34 +7,23 @@
  * 5. External event subscriptions (createEventSink)
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitFor } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createEventSink,
-  WorkflowRunModel,
-  type StepLogEntry,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { createEventSink, type StepLogEntry } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
+const env = useStreamlineEnv();
 
-afterAll(async () => {
-  await teardownTestDB();
-});
+/** ctx.log() persistence is a fire-and-forget $push — wait until `n` entries landed. */
+const hasLogs = (n: number) => (run: { stepLogs?: StepLogEntry[] }) =>
+  (run.stepLogs?.length ?? 0) >= n;
 
 // ============================================================================
 // 1. Persisted Step-Level Logging
 // ============================================================================
 
 describe('Step-level logging (stepLogs)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should persist ctx.log() calls to the run document', async () => {
-    const workflow = createWorkflow('log-test', {
+    const workflow = env.workflow('log-test', {
       steps: {
         greet: async (ctx) => {
           ctx.log('Starting greet step');
@@ -42,22 +31,18 @@ describe('Step-level logging (stepLogs)', () => {
           return 'hello';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     await workflow.execute(run._id);
 
-    // Give log persistence a moment (fire-and-forget $push operations)
-    await waitFor(500);
-
-    // Read directly from MongoDB to check stepLogs
-    const doc = await WorkflowRunModel.findById(run._id).lean();
+    // Read directly from MongoDB once the (fire-and-forget) log writes land
+    const doc = await env.until(run._id, hasLogs(2));
     expect(doc).toBeTruthy();
-    expect(doc!.stepLogs).toBeDefined();
-    expect(doc!.stepLogs!.length).toBeGreaterThanOrEqual(2);
+    expect(doc.stepLogs).toBeDefined();
+    expect(doc.stepLogs!.length).toBeGreaterThanOrEqual(2);
 
-    const logs = doc!.stepLogs as StepLogEntry[];
+    const logs = doc.stepLogs as StepLogEntry[];
     expect(logs[0].stepId).toBe('greet');
     expect(logs[0].message).toBe('Starting greet step');
     expect(logs[0].attempt).toBeGreaterThanOrEqual(1);
@@ -65,8 +50,6 @@ describe('Step-level logging (stepLogs)', () => {
 
     expect(logs[1].message).toBe('Processing user');
     expect(logs[1].data).toEqual({ userId: 'u-123' });
-
-    workflow.shutdown();
   });
 });
 
@@ -75,14 +58,10 @@ describe('Step-level logging (stepLogs)', () => {
 // ============================================================================
 
 describe('Configurable retry backoff', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should accept retryDelay and retryBackoff per step — retries inline for short delays', async () => {
     let attempts = 0;
 
-    const workflow = createWorkflow('retry-config-test', {
+    const workflow = env.workflow('retry-config-test', {
       steps: {
         flaky: {
           handler: async () => {
@@ -95,7 +74,6 @@ describe('Configurable retry backoff', () => {
           retryBackoff: 'linear',
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -104,14 +82,12 @@ describe('Configurable retry backoff', () => {
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
     expect(attempts).toBe(3); // 2 failures + 1 success
-
-    workflow.shutdown();
   });
 
   it('should support workflow-level retry defaults', async () => {
     let attempts = 0;
 
-    const workflow = createWorkflow('retry-defaults-test', {
+    const workflow = env.workflow('retry-defaults-test', {
       steps: {
         step1: async () => {
           attempts++;
@@ -124,7 +100,6 @@ describe('Configurable retry backoff', () => {
         retryDelay: 50,
         retryBackoff: 'fixed',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -133,8 +108,6 @@ describe('Configurable retry backoff', () => {
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
     expect(attempts).toBe(2); // 1 failure + 1 success
-
-    workflow.shutdown();
   });
 });
 
@@ -143,43 +116,39 @@ describe('Configurable retry backoff', () => {
 // ============================================================================
 
 describe('Typed checkpoint', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should support typed checkpoint and getCheckpoint', async () => {
     interface Progress {
       processedCount: number;
       lastId: string;
     }
 
-    const workflow = createWorkflow<{ items: string[] }>('checkpoint-typed-test', {
-      steps: {
-        process: async (ctx) => {
-          const prev = ctx.getCheckpoint<Progress>();
-          const start = prev ? prev.processedCount : 0;
+    const workflow = env.workflow<{ items: string[] }, { items: string[] }>(
+      'checkpoint-typed-test',
+      {
+        steps: {
+          process: async (ctx) => {
+            const prev = ctx.getCheckpoint<Progress>();
+            const start = prev ? prev.processedCount : 0;
 
-          for (let i = start; i < ctx.context.items.length; i++) {
-            await ctx.checkpoint<Progress>({
-              processedCount: i + 1,
-              lastId: ctx.context.items[i],
-            });
-          }
+            for (let i = start; i < ctx.context.items.length; i++) {
+              await ctx.checkpoint<Progress>({
+                processedCount: i + 1,
+                lastId: ctx.context.items[i],
+              });
+            }
 
-          return { total: ctx.context.items.length };
+            return { total: ctx.context.items.length };
+          },
         },
+        context: (input) => ({ items: input.items }),
       },
-      context: (input: { items: string[] }) => ({ items: input.items }),
-      autoExecute: false,
-    });
+    );
 
     const run = await workflow.start({ items: ['a', 'b', 'c'] });
     const result = await workflow.execute(run._id);
 
     expect(result.status).toBe('done');
     expect(result.output).toEqual({ total: 3 });
-
-    workflow.shutdown();
   });
 });
 
@@ -188,12 +157,8 @@ describe('Typed checkpoint', () => {
 // ============================================================================
 
 describe('Per-step metrics', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should record completedAt and durationMs on completed steps', async () => {
-    const workflow = createWorkflow('metrics-test', {
+    const workflow = env.workflow('metrics-test', {
       steps: {
         fast: async () => {
           return 'quick';
@@ -203,17 +168,16 @@ describe('Per-step metrics', () => {
           return 'delayed';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     await workflow.execute(run._id);
 
-    const doc = await WorkflowRunModel.findById(run._id).lean();
+    const doc = await env.runs.get(run._id);
     expect(doc).toBeTruthy();
 
-    const fastStep = doc!.steps.find((s: any) => s.stepId === 'fast');
-    const slowStep = doc!.steps.find((s: any) => s.stepId === 'slow');
+    const fastStep = doc!.steps.find((s) => s.stepId === 'fast');
+    const slowStep = doc!.steps.find((s) => s.stepId === 'slow');
 
     // Fast step
     expect(fastStep!.status).toBe('done');
@@ -227,12 +191,10 @@ describe('Per-step metrics', () => {
     expect(slowStep!.completedAt).toBeDefined();
     expect(slowStep!.durationMs).toBeDefined();
     expect(slowStep!.durationMs).toBeGreaterThanOrEqual(90);
-
-    workflow.shutdown();
   });
 
   it('should record durationMs on failed steps', async () => {
-    const workflow = createWorkflow('metrics-fail-test', {
+    const workflow = env.workflow('metrics-fail-test', {
       steps: {
         failing: {
           handler: async () => {
@@ -242,18 +204,15 @@ describe('Per-step metrics', () => {
           retries: 1,
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     await workflow.execute(run._id);
 
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    const failingStep = doc!.steps.find((s: any) => s.stepId === 'failing');
+    const doc = await env.runs.get(run._id);
+    const failingStep = doc!.steps.find((s) => s.stepId === 'failing');
     expect(failingStep!.durationMs).toBeDefined();
     expect(failingStep!.durationMs).toBeGreaterThanOrEqual(40);
-
-    workflow.shutdown();
   });
 });
 
@@ -262,19 +221,14 @@ describe('Per-step metrics', () => {
 // ============================================================================
 
 describe('createEventSink', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should receive workflow lifecycle events via sink', async () => {
-    const events: Array<{ event: string; payload: any }> = [];
+    const events: Array<{ event: string; payload: unknown }> = [];
 
-    const workflow = createWorkflow('sink-test', {
+    const workflow = env.workflow('sink-test', {
       steps: {
         step1: async () => 'result1',
         step2: async () => 'result2',
       },
-      autoExecute: false,
     });
 
     const unsub = createEventSink(
@@ -296,18 +250,15 @@ describe('createEventSink', () => {
 
     // Unsubscribe
     unsub();
-
-    workflow.shutdown();
   });
 
   it('should filter events by runId', async () => {
-    const events: Array<{ event: string; payload: any }> = [];
+    const events: Array<{ event: string; payload: unknown }> = [];
 
-    const workflow = createWorkflow('sink-filter-test', {
+    const workflow = env.workflow('sink-filter-test', {
       steps: {
         step1: async () => 'ok',
       },
-      autoExecute: false,
     });
 
     const run1 = await workflow.start({});
@@ -323,10 +274,9 @@ describe('createEventSink', () => {
     await workflow.execute(run1._id);
 
     // Should have the completion event for run1
-    expect(events.some((e) => e.payload.runId === run1._id)).toBe(true);
+    expect(events.some((e) => (e.payload as { runId?: string }).runId === run1._id)).toBe(true);
 
     unsub();
-    workflow.shutdown();
   });
 });
 
@@ -335,10 +285,6 @@ describe('createEventSink', () => {
 // ============================================================================
 
 describe('Smoke test: all v2.1 features combined', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should run a workflow using logs, metrics, typed checkpoint, and event sink', async () => {
     const sinkEvents: string[] = [];
 
@@ -346,7 +292,7 @@ describe('Smoke test: all v2.1 features combined', () => {
       items: string[];
     }
 
-    const workflow = createWorkflow<MyCtx>('smoke-v21', {
+    const workflow = env.workflow<MyCtx, { items: string[] }>('smoke-v21', {
       steps: {
         setup: async (ctx) => {
           ctx.log('Initializing pipeline', { count: ctx.context.items.length });
@@ -365,8 +311,7 @@ describe('Smoke test: all v2.1 features combined', () => {
           return { success: true };
         },
       },
-      context: (input: { items: string[] }) => ({ items: input.items }),
-      autoExecute: false,
+      context: (input) => ({ items: input.items }),
     });
 
     // Subscribe to events
@@ -380,14 +325,13 @@ describe('Smoke test: all v2.1 features combined', () => {
 
     const run = await workflow.start({ items: ['a', 'b', 'c'] });
     const result = await workflow.execute(run._id);
-    await waitFor(300);
 
     // Verify final status
     expect(result.status).toBe('done');
 
-    // Verify metrics
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    for (const step of doc!.steps) {
+    // Verify metrics (read once the fire-and-forget log writes landed)
+    const doc = await env.until(run._id, hasLogs(4));
+    for (const step of doc.steps) {
       if (step.status === 'done') {
         expect(step.completedAt).toBeDefined();
         expect(typeof step.durationMs).toBe('number');
@@ -395,14 +339,13 @@ describe('Smoke test: all v2.1 features combined', () => {
     }
 
     // Verify logs
-    expect(doc!.stepLogs).toBeDefined();
-    expect(doc!.stepLogs!.length).toBeGreaterThanOrEqual(4);
+    expect(doc.stepLogs).toBeDefined();
+    expect(doc.stepLogs!.length).toBeGreaterThanOrEqual(4);
 
     // Verify events
     expect(sinkEvents).toContain('step:completed');
     expect(sinkEvents).toContain('workflow:completed');
 
     unsub();
-    workflow.shutdown();
   });
 });

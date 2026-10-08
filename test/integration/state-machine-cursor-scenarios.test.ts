@@ -15,18 +15,17 @@
  * Style: Setup → Script → Assert per testing-infrastructure.md §6.
  */
 
-import { describe, expect, it } from 'vitest';
 import { IllegalTransitionError } from '@classytic/primitives/state-machine';
+import { describe, expect, it } from 'vitest';
 import {
-  RUN_MACHINE,
-  STEP_MACHINE,
+  isTerminalState,
   isValidRunTransition,
   isValidStepTransition,
-  isTerminalState,
-  workflowRunRepository,
-  WorkflowRunModel,
+  RUN_MACHINE,
+  STEP_MACHINE,
 } from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import type { RunFields } from '../../src/testkit/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
 describe('RUN_MACHINE — workflow status state machine (replaces dead validators)', () => {
   it('exposes the same transition table the legacy validators encoded', () => {
@@ -131,42 +130,30 @@ describe('STEP_MACHINE — step status state machine', () => {
 });
 
 describe('cursor()-based stale scanner — streaming reads', () => {
-  useTestDb();
+  const env = useStreamlineEnv();
+
+  /** A `running` run whose heartbeat is `ageMs` old. */
+  const runningWithHeartbeat = (workflowId: string, ageMs: number, fields: RunFields = {}) => {
+    const heartbeat = new Date(Date.now() - ageMs);
+    return env.runs.insert(workflowId, {
+      status: 'running',
+      steps: [],
+      createdAt: new Date(Date.now() - 120_000),
+      updatedAt: heartbeat,
+      lastHeartbeat: heartbeat,
+      ...fields,
+    });
+  };
 
   it('cursorStaleRunning yields stale runs one at a time and respects consumer break', async () => {
-    // Setup: seed 5 stale running workflows + 3 fresh ones.
-    const now = Date.now();
-    const staleHeartbeat = new Date(now - 60_000); // 60s old
-    const freshHeartbeat = new Date(now - 1_000); //  1s old
-
-    for (let i = 0; i < 5; i++) {
-      await WorkflowRunModel.create({
-        _id: `stale-${i}`,
-        workflowId: 'stale-test',
-        status: 'running',
-        steps: [],
-        context: {},
-        createdAt: new Date(now - 120_000),
-        updatedAt: staleHeartbeat,
-        lastHeartbeat: staleHeartbeat,
-      });
-    }
-    for (let i = 0; i < 3; i++) {
-      await WorkflowRunModel.create({
-        _id: `fresh-${i}`,
-        workflowId: 'stale-test',
-        status: 'running',
-        steps: [],
-        context: {},
-        createdAt: new Date(now - 5_000),
-        updatedAt: freshHeartbeat,
-        lastHeartbeat: freshHeartbeat,
-      });
-    }
+    // Setup: seed 5 stale running workflows (60s old) + 3 fresh ones (1s old).
+    const stale = new Set<string>();
+    for (let i = 0; i < 5; i++) stale.add((await runningWithHeartbeat('stale-test', 60_000))._id);
+    for (let i = 0; i < 3; i++) await runningWithHeartbeat('stale-test', 1_000);
 
     // Script: cursor through stale runs, breaking at 3.
     const seen: string[] = [];
-    for await (const run of workflowRunRepository.cursorStaleRunning(30_000, {
+    for await (const run of env.container.repository.cursorStaleRunning(30_000, {
       bypassTenant: true,
     })) {
       seen.push(run._id);
@@ -176,29 +163,16 @@ describe('cursor()-based stale scanner — streaming reads', () => {
     // Assert: exactly 3 yielded; all are stale (not fresh); all distinct.
     expect(seen).toHaveLength(3);
     for (const id of seen) {
-      expect(id.startsWith('stale-')).toBe(true);
+      expect(stale.has(id)).toBe(true);
     }
     expect(new Set(seen).size).toBe(3);
   });
 
   it('cursorStaleRunning yields all stale runs when not bounded by break', async () => {
-    const now = Date.now();
-    const staleHeartbeat = new Date(now - 60_000);
-    for (let i = 0; i < 4; i++) {
-      await WorkflowRunModel.create({
-        _id: `stale-all-${i}`,
-        workflowId: 'stale-all-test',
-        status: 'running',
-        steps: [],
-        context: {},
-        createdAt: new Date(now - 120_000),
-        updatedAt: staleHeartbeat,
-        lastHeartbeat: staleHeartbeat,
-      });
-    }
+    for (let i = 0; i < 4; i++) await runningWithHeartbeat('stale-all-test', 60_000);
 
     const seen: string[] = [];
-    for await (const run of workflowRunRepository.cursorStaleRunning(30_000, {
+    for await (const run of env.container.repository.cursorStaleRunning(30_000, {
       bypassTenant: true,
     })) {
       seen.push(run._id);
@@ -208,39 +182,16 @@ describe('cursor()-based stale scanner — streaming reads', () => {
   });
 
   it('cursorStaleRunning excludes paused runs (notPaused() in the query)', async () => {
-    const now = Date.now();
-    const staleHeartbeat = new Date(now - 60_000);
-
-    await WorkflowRunModel.create({
-      _id: 'stale-active',
-      workflowId: 'paused-test',
-      status: 'running',
-      steps: [],
-      context: {},
-      createdAt: new Date(now - 120_000),
-      updatedAt: staleHeartbeat,
-      lastHeartbeat: staleHeartbeat,
-      paused: false,
-    });
-    await WorkflowRunModel.create({
-      _id: 'stale-paused',
-      workflowId: 'paused-test',
-      status: 'running',
-      steps: [],
-      context: {},
-      createdAt: new Date(now - 120_000),
-      updatedAt: staleHeartbeat,
-      lastHeartbeat: staleHeartbeat,
-      paused: true,
-    });
+    const active = await runningWithHeartbeat('paused-test', 60_000, { paused: false });
+    await runningWithHeartbeat('paused-test', 60_000, { paused: true });
 
     const seen: string[] = [];
-    for await (const run of workflowRunRepository.cursorStaleRunning(30_000, {
+    for await (const run of env.container.repository.cursorStaleRunning(30_000, {
       bypassTenant: true,
     })) {
       seen.push(run._id);
     }
 
-    expect(seen).toEqual(['stale-active']);
+    expect(seen).toEqual([active._id]);
   });
 });

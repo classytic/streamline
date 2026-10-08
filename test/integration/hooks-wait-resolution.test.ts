@@ -14,34 +14,10 @@
 
 import { describe, expect, it } from 'vitest';
 import { makeWaitCancelled, makeWaitTimeout } from '../../src/features/wait-resolution.js';
-import {
-  cancelHook,
-  createHook,
-  createWorkflow,
-  getWaitResolution,
-  resumeHook,
-} from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import { cancelHook, createHook, getWaitResolution, resumeHook } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let n = 0;
-const uid = (p: string) => `${p}-${Date.now()}-${++n}`;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function waitForStatus(
-  wf: { get: (id: string) => Promise<{ status: string } | null> },
-  runId: string,
-  statuses: string[],
-  timeoutMs = 8000,
-): Promise<{ status: string } & Record<string, unknown>> {
-  const want = new Set(statuses);
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const r = (await wf.get(runId)) as ({ status: string } & Record<string, unknown>) | null;
-    if (r && want.has(r.status)) return r;
-    await sleep(30);
-  }
-  throw new Error(`run ${runId} did not reach [${statuses}] within ${timeoutMs}ms`);
-}
+const env = useStreamlineEnv();
 
 /** Shared step that records how the `request` wait resolved. */
 type DecideOut = { kind: string; reason?: string | null; approved?: boolean };
@@ -53,8 +29,8 @@ function decideStepOutput(run: { steps?: Array<{ stepId: string; output?: unknow
  * Approval flow with a fast scheduler (so the expiry sweep fires in-test
  * rather than on the 60s production cadence) and a deterministic token.
  */
-function approvalFlow(wfId: string, opts?: { expiresInMs?: number }) {
-  return createWorkflow(wfId, {
+function approvalFlow(opts?: { expiresInMs?: number }) {
+  return env.workflow('appr', {
     steps: {
       request: async (ctx) => {
         const hook = createHook(ctx, 'manager approval', {
@@ -76,58 +52,52 @@ function approvalFlow(wfId: string, opts?: { expiresInMs?: number }) {
         return { kind: 'answered', approved: (out as { approved?: boolean })?.approved ?? false };
       },
     },
+    autoExecute: true,
     scheduler: { basePollInterval: 100, minPollInterval: 50, maxPollInterval: 500 },
   });
 }
 
 describe('hands-off: wait resolution (timeout / cancel / normal)', () => {
-  useTestDb();
-
   it('expiresAt: the scheduler auto-resumes a timed-out wait with a timeout sentinel', async () => {
-    const wfId = uid('appr-timeout');
-    const wf = approvalFlow(wfId, { expiresInMs: 150 });
+    const wf = approvalFlow({ expiresInMs: 150 });
 
     const run = await wf.start({});
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
-    // No one resumes — the expiry sweep should drive it to completion.
-    const final = await waitForStatus(wf, run._id, ['done']);
+    // No one resumes — the background scheduler's expiry sweep (the subject
+    // here) must drive it to completion once the deadline passes.
+    const final = await env.until(run._id, 'done', { timeout: 8000 });
     expect(decideStepOutput(final)).toMatchObject({ kind: 'timeout' });
-
-    wf.shutdown();
   });
 
   it('cancelHook: withdraws a pending wait with a cancelled sentinel + reason', async () => {
-    const wfId = uid('appr-cancel');
-    const wf = approvalFlow(wfId);
+    const wf = approvalFlow();
 
     const run = await wf.start({});
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
-    await cancelHook(`${run._id}:approve`, { reason: 'request was deleted' });
+    await cancelHook(`${run._id}:approve`, {
+      reason: 'request was deleted',
+      container: env.container,
+    });
 
-    const final = await waitForStatus(wf, run._id, ['done']);
+    const final = await env.until(run._id, 'done');
     expect(decideStepOutput(final)).toMatchObject({
       kind: 'cancelled',
       reason: 'request was deleted',
     });
-
-    wf.shutdown();
   });
 
   it('normal resumeHook still delivers the real payload (no sentinel leakage)', async () => {
-    const wfId = uid('appr-normal');
-    const wf = approvalFlow(wfId);
+    const wf = approvalFlow();
 
     const run = await wf.start({});
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
 
-    await resumeHook(`${run._id}:approve`, { approved: true });
+    await resumeHook(`${run._id}:approve`, { approved: true }, { container: env.container });
 
-    const final = await waitForStatus(wf, run._id, ['done']);
+    const final = await env.until(run._id, 'done');
     expect(decideStepOutput(final)).toMatchObject({ kind: 'answered', approved: true });
-
-    wf.shutdown();
   });
 
   it('getWaitResolution discriminates the sentinels (unit)', () => {

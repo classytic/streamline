@@ -1,9 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import { assertAndClaim } from '@classytic/primitives/state-machine';
 import { TIMING } from '../config/constants.js';
 import type { StreamlineContainer } from '../core/container.js';
 import { RUN_MACHINE } from '../core/status.js';
 import type { StepState, WorkflowHandlers, WorkflowRun } from '../core/types.js';
+import { staleHeartbeatOr } from '../storage/query-builder.js';
 import { toError } from '../utils/errors.js';
+import { calculateRetryDelay, resolveBackoffMultiplier } from '../utils/helpers.js';
 import { GotoSignal, StepContextImpl, WaitSignal } from './context.js';
 import type { WorkflowEngineOptions } from './engine.js';
 
@@ -18,6 +21,16 @@ export interface SagaEngine<TContext> {
   readonly container: StreamlineContainer;
   readonly options: WorkflowEngineOptions;
   get(runId: string): Promise<WorkflowRun<TContext> | null>;
+  /** Let `cancel()` / `shutdown()` abort the walk's `ctx.signal` in-process. */
+  trackAbort(runId: string, controller: AbortController): () => void;
+}
+
+/** Claim patch that hands the walk to a fresh owner and clears the crash marker. */
+function ownWalk(token: string, now: Date): Record<string, unknown> {
+  return {
+    $set: { compensationAttemptId: token, lastHeartbeat: now, updatedAt: now },
+    $unset: { compensationDue: '' },
+  };
 }
 
 /**
@@ -47,17 +60,16 @@ export async function runCompensation<TContext>(
   if (!compensationHandlers) return run;
 
   const runId = run._id;
-  const now = new Date();
+  const token = randomUUID();
 
-  // FIRST durable action: failed → compensating. assertAndClaim runs the
-  // sync state-machine assertion then an atomic CAS; null = another worker
-  // already entered (multi-worker entry race resolves to one winner). The
-  // loser returns the current state and does NOT build a (possibly stale)
-  // compensation list.
+  // FIRST durable action: failed → compensating, stamping this walk's owner
+  // token. assertAndClaim runs the sync state-machine assertion then an atomic
+  // CAS; null = another worker already entered (one winner). The loser
+  // returns the current state and does NOT build a (possibly stale) list.
   const claimed = await assertAndClaim(RUN_MACHINE, engine.container.repository, runId, {
     from: 'failed',
     to: 'compensating',
-    patch: { lastHeartbeat: now, updatedAt: now },
+    patch: ownWalk(token, new Date()),
     options: { bypassTenant: true },
   });
 
@@ -69,16 +81,18 @@ export async function runCompensation<TContext>(
   }
 
   engine.container.cache.delete(runId);
-  return driveCompensation(engine, runId);
+  return driveCompensation(engine, runId, token);
 }
 
 /**
- * Crash-recovery entrypoint for a run left in `compensating` after a process
- * died mid-rollback. Reclaims via a stale-heartbeat-guarded CAS
- * (compensating → compensating, so only a genuinely-stale run is reclaimed —
- * a live compensation heartbeats and won't match) and re-drives the walk.
- * The walk skips per-step compensations already `done` (effectively-once),
- * so step N+1 isn't compensated twice.
+ * Crash-recovery entrypoint for the two stuck saga shapes:
+ *   - `compensating` with a stale heartbeat: the walker died mid-rollback.
+ *     Reclaimed compensating → compensating under a NEW owner token, so a
+ *     stalled-but-alive old walker's writes are refused from here on.
+ *   - `failed` + `compensationDue`, untouched past the threshold: the process
+ *     died between the failure write and `failed → compensating`. Entered now.
+ * Either way the walk skips per-step compensations already `done`
+ * (effectively-once), so step N+1 isn't compensated twice.
  *
  * Wired into the scheduler's poll via `getStaleCompensatingRuns`.
  */
@@ -87,28 +101,38 @@ export async function recoverCompensation<TContext>(
   runId: string,
   staleThresholdMs: number,
 ): Promise<WorkflowRun<TContext> | null> {
+  if (!engine.options.compensationHandlers) return null;
   const staleTime = new Date(Date.now() - staleThresholdMs);
-  const claimed = await engine.container.repository.claim(
+  const token = randomUUID();
+  const repo = engine.container.repository;
+
+  const reclaimed = await repo.claim(
     runId,
     {
       from: 'compensating',
       to: 'compensating',
       where: {
-        $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
+        $or: staleHeartbeatOr(staleTime),
       },
     },
-    {
-      $set: { lastHeartbeat: new Date(), updatedAt: new Date() },
-      $inc: { recoveryAttempts: 1 },
-    },
+    { ...ownWalk(token, new Date()), $inc: { recoveryAttempts: 1 } },
     { bypassTenant: true },
   );
+  const claimed =
+    reclaimed ??
+    (await assertAndClaim(RUN_MACHINE, repo, runId, {
+      from: 'failed',
+      to: 'compensating',
+      where: { compensationDue: true, updatedAt: { $lt: staleTime } },
+      patch: ownWalk(token, new Date()),
+      options: { bypassTenant: true },
+    }));
 
-  if (!claimed) return null; // live compensation or already settled — not ours
+  if (!claimed) return null; // live, settled, or not ours
 
   engine.container.cache.delete(runId);
   engine.container.eventBus.emit('workflow:recovered', { runId });
-  return driveCompensation(engine, runId);
+  return driveCompensation(engine, runId, token);
 }
 
 /**
@@ -137,16 +161,25 @@ export async function recoverCompensation<TContext>(
 export async function driveCompensation<TContext>(
   engine: SagaEngine<TContext>,
   runId: string,
+  token: string,
 ): Promise<WorkflowRun<TContext>> {
   const compensationHandlers = engine.options.compensationHandlers ?? {};
+  const owned = ownedWalk(runId, token);
 
-  // Real heartbeat for the duration of the rollback so a long compensation
-  // is not marked stale by markStaleAsFailed mid-flight. The AbortController
-  // is wired into each compensation ctx so a cancel/timeout aborts cleanly.
+  // Owned heartbeat for the duration of the rollback, so a long compensation
+  // is not reclaimed as stale. When it matches nothing, this walk was
+  // cancelled (any process) or superseded by recovery: abort `ctx.signal` so
+  // the handler can stop, and the walk stops claiming further steps.
   const abortController = new AbortController();
+  const untrack = engine.trackAbort(runId, abortController);
   const heartbeatTimer = setInterval(() => {
     engine.container.repository
-      .updateOne({ _id: runId }, { lastHeartbeat: new Date() }, { bypassTenant: true })
+      .updateOne(owned, { lastHeartbeat: new Date() }, { bypassTenant: true })
+      .then((res) => {
+        if (res.modifiedCount === 0 && !abortController.signal.aborted) {
+          abortController.abort(new Error('Compensation no longer owned (cancelled or recovered)'));
+        }
+      })
       .catch(() => {
         // ignore — the stale threshold is far longer than the interval
       });
@@ -175,33 +208,43 @@ export async function driveCompensation<TContext>(
     for (const stepState of toCompensate) {
       // Skip steps already compensated (effectively-once on re-entry).
       if (stepState.compensation?.status === 'done') continue;
-
-      // Honor cancel mid-compensation: a CANCELLED_GUARD on the per-step
-      // write would reject anyway, but short-circuit early. Cancellation
-      // does NOT roll back already-run compensations (documented).
-      const reread = await engine.get(runId);
-      if (reread && reread.status !== 'compensating') {
-        // Cancelled or otherwise transitioned out — stop driving.
-        return reread;
-      }
+      // Cancelled or superseded: stop. Cancellation does NOT roll back
+      // compensations that already ran (documented).
+      if (abortController.signal.aborted) break;
 
       const handler = compensationHandlers[stepState.stepId];
       if (!handler) continue;
 
-      const ok = await compensateOneStep(engine, runId, stepState, handler, abortController);
-      if (!ok) anyFailed = true;
+      const outcome = await compensateOneStep(
+        engine,
+        runId,
+        token,
+        stepState,
+        handler,
+        abortController,
+      );
+      if (outcome === 'stopped') break;
+      if (outcome === 'failed') anyFailed = true;
     }
 
-    // Terminal transition: compensating → compensated | compensation_failed.
+    // Terminal transition: compensating → compensated | compensation_failed,
+    // only by the owner. A cancelled or superseded walk matches nothing here
+    // and returns the persisted state; the new owner settles the run.
     const target: 'compensated' | 'compensation_failed' = anyFailed
       ? 'compensation_failed'
       : 'compensated';
-    const settled = await assertAndClaim(RUN_MACHINE, engine.container.repository, runId, {
-      from: 'compensating',
-      to: target,
-      patch: { endedAt: new Date(), updatedAt: new Date() },
-      options: { bypassTenant: true },
-    });
+    const settled = abortController.signal.aborted
+      ? null
+      : await assertAndClaim(RUN_MACHINE, engine.container.repository, runId, {
+          from: 'compensating',
+          to: target,
+          where: { compensationAttemptId: token },
+          patch: {
+            $set: { endedAt: new Date(), updatedAt: new Date() },
+            $unset: { compensationAttemptId: '' },
+          },
+          options: { bypassTenant: true },
+        });
 
     engine.container.cache.delete(runId);
 
@@ -215,149 +258,228 @@ export async function driveCompensation<TContext>(
     return (await engine.get(runId)) ?? fresh;
   } finally {
     clearInterval(heartbeatTimer);
+    untrack();
   }
+}
+
+/** Filter every write of one compensation walk carries: still compensating, still ours. */
+function ownedWalk(runId: string, token: string): Record<string, unknown> {
+  return { _id: runId, status: 'compensating', compensationAttemptId: token };
 }
 
 /**
  * Compensate a single step with retry, then memoize the outcome DB-first via
  * a NUMERIC-INDEX guarded CAS (NOT mongokit claim() — it cannot forward
- * arrayFilters). Returns true on success (or already-done), false if the
- * handler exhausted retries / threw fatally.
+ * arrayFilters).
  *
- * The pending→done flip is written AFTER the handler resolves and guarded on
- * `status:'compensating'` + `steps.<i>.compensation.status:'pending'` so a
- * concurrent recovery (or a re-entry) cannot double-flip — the second writer
- * gets modifiedCount:0 and treats it as already-done.
+ * Every write is owned by this walk (`compensationAttemptId`), so after a
+ * cancel or a recovery reclaim none of them land: `'stopped'` tells the walk
+ * to stop. Attempts are PERSISTED per try, so a crash mid-retry resumes the
+ * budget instead of restarting it. Defaults follow the documented contract:
+ * 3 attempts, 1000ms base delay, exponential backoff; `compensateTimeout`
+ * bounds one attempt (it aborts `ctx.signal` and counts as a failed try).
+ *
+ * Delivery is at-least-once: a crash after the handler's side effect but
+ * before the done flip re-runs it. Pass `ctx.idempotencyKey('compensate')` to
+ * external providers.
  */
 export async function compensateOneStep<TContext>(
   engine: SagaEngine<TContext>,
   runId: string,
+  token: string,
   stepState: StepState,
   handler: WorkflowHandlers<unknown>[string],
   abortController: AbortController,
-): Promise<boolean> {
+): Promise<'done' | 'failed' | 'stopped'> {
   const cfg = engine.options.compensationConfigs?.[stepState.stepId];
-  const maxAttempts = Math.max(1, cfg?.retries ?? 1);
-  const baseDelay = cfg?.retryDelay ?? 0;
+  const maxAttempts = Math.max(1, cfg?.retries ?? COMPENSATION_DEFAULTS.retries);
+  const baseDelay = cfg?.retryDelay ?? COMPENSATION_DEFAULTS.retryDelay;
+  const multiplier = resolveBackoffMultiplier(cfg?.retryBackoff, TIMING.RETRY_MULTIPLIER);
+  const owned = ownedWalk(runId, token);
 
   // Re-read the freshest run for the ctx (context/output the handler reads).
   const run = (await engine.get(runId)) ?? null;
-  if (!run) return false;
+  if (!run) return 'stopped';
   const stepIndex = run.steps.findIndex((s) => s.stepId === stepState.stepId);
-  if (stepIndex === -1) return false;
+  if (stepIndex === -1) return 'failed';
 
-  // Mark compensation pending + startedAt (idempotent — only sets if absent).
-  if (!run.steps[stepIndex]?.compensation) {
-    await engine.container.repository.updateOne(
-      { _id: runId, status: 'compensating' },
-      {
-        $set: {
-          [`steps.${stepIndex}.compensation`]: {
-            status: 'pending',
-            attempts: 0,
-            startedAt: new Date(),
+  // Owned "begin" write BEFORE the handler: marks the compensation pending on
+  // first entry (a touch on re-entry). Matching nothing means the walk was
+  // cancelled or superseded — stop before running another side effect.
+  const begun = await engine.container.repository.updateOne(
+    owned,
+    run.steps[stepIndex]?.compensation
+      ? { $set: { updatedAt: new Date() } }
+      : {
+          $set: {
+            [`steps.${stepIndex}.compensation`]: {
+              status: 'pending',
+              attempts: 0,
+              startedAt: new Date(),
+            },
+            updatedAt: new Date(),
           },
-          updatedAt: new Date(),
         },
-      },
-      { bypassTenant: true },
-    );
-  }
+    { bypassTenant: true },
+  );
+  if (begun.modifiedCount === 0) return 'stopped';
 
-  let lastError: Error | undefined;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  const prior = run.steps[stepIndex]?.compensation;
+  // A previous walker already exhausted this step and recorded it — the
+  // outcome is settled; only the run-level settle was lost.
+  if (prior?.status === 'failed') return 'failed';
+
+  const statusPath = `steps.${stepIndex}.compensation.status`;
+  const attemptsPath = `steps.${stepIndex}.compensation.attempts`;
+  let lastError: Error | undefined = prior?.error ? new Error(prior.error.message) : undefined;
+
+  // Resume the persisted budget: a crash mid-retry must not hand the step a
+  // fresh set of attempts.
+  for (let attempt = (prior?.attempts ?? 0) + 1; attempt <= maxAttempts; attempt++) {
+    if (abortController.signal.aborted) return 'stopped';
+
+    // Per-attempt signal: aborted by the walk (cancel/superseded) or by this
+    // attempt's timeout — a timeout must not stop the whole walk.
+    const attemptCtl = new AbortController();
+    const relay = () => attemptCtl.abort(abortController.signal.reason);
+    abortController.signal.addEventListener('abort', relay, { once: true });
+    let timer: NodeJS.Timeout | undefined;
+
     try {
       const ctx = new StepContextImpl(
         runId,
         stepState.stepId,
         run.context,
         run.input,
-        stepState.attempts,
+        attempt,
         run,
         engine.container.repository,
         engine.container.eventBus,
-        abortController.signal,
+        attemptCtl.signal,
         engine.container.signalStore,
+        engine.options.maxStepLogs,
+        engine.options.maxPayloadBytes,
+        undefined,
+        // ctx writes (set/checkpoint/heartbeat) are owned by this walk too.
+        { status: 'compensating', compensationAttemptId: token },
       );
 
-      const result = (handler as (ctx: unknown) => Promise<unknown>)(ctx);
+      const handlerRun = Promise.resolve((handler as (ctx: unknown) => Promise<unknown>)(ctx));
+      const output = await (cfg?.timeout
+        ? Promise.race([
+            handlerRun,
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                const err = new Error(`Compensation timeout after ${cfg.timeout}ms`);
+                attemptCtl.abort(err);
+                reject(err);
+              }, cfg.timeout);
+            }),
+          ])
+        : handlerRun);
 
       // RUNTIME GUARD: a compensation handler must not suspend. If a
       // WaitSignal / GotoSignal escapes, fail the compensation rather than
       // hang (the define-time static scan is best-effort).
-      const output = await result;
       if (output instanceof WaitSignal || output instanceof GotoSignal) {
-        throw new Error(
-          `Compensation handler for step "${stepState.stepId}" attempted to suspend — ` +
-            `compensation must be non-suspending`,
-        );
+        throw new SuspendInCompensationError(stepState.stepId);
       }
 
-      // Success → memoize pending→done via numeric-index guarded CAS.
-      const res = await engine.container.repository.updateOne(
-        {
-          _id: runId,
-          status: 'compensating',
-          [`steps.${stepIndex}.compensation.status`]: 'pending',
-        },
+      // Success → memoize pending→done, owned. Matching nothing means the walk
+      // lost ownership while the handler ran: the effect happened, but the new
+      // owner decides (it re-runs this step — at-least-once, documented).
+      const flipped = await engine.container.repository.updateOne(
+        { ...owned, [statusPath]: 'pending' },
         {
           $set: {
-            [`steps.${stepIndex}.compensation.status`]: 'done',
+            [statusPath]: 'done',
             [`steps.${stepIndex}.compensation.completedAt`]: new Date(),
             updatedAt: new Date(),
           },
-          $inc: { [`steps.${stepIndex}.compensation.attempts`]: 1 },
+          $inc: { [attemptsPath]: 1 },
         },
         { bypassTenant: true },
       );
-
-      // modifiedCount:0 → a concurrent writer already flipped it to done, or
-      // the run left `compensating` (cancel). Treat as success (idempotent).
       engine.container.cache.delete(runId);
+      if (flipped.modifiedCount === 0) return 'stopped';
+
       engine.container.eventBus.emit('step:compensated', {
         runId,
         stepId: stepState.stepId,
       });
-      void res;
-      return true;
+      return 'done';
     } catch (err) {
-      const e = err as Error;
-      // A WaitSignal/GotoSignal thrown synchronously also lands here.
-      if (e instanceof WaitSignal || e instanceof GotoSignal) {
-        lastError = new Error(
-          `Compensation handler for step "${stepState.stepId}" attempted to suspend — ` +
-            `compensation must be non-suspending`,
-        );
-        break; // non-retriable
-      }
-      lastError = e;
+      if (abortController.signal.aborted) return 'stopped';
+      const suspended =
+        err instanceof SuspendInCompensationError ||
+        err instanceof WaitSignal ||
+        err instanceof GotoSignal;
+      lastError = suspended ? new SuspendInCompensationError(stepState.stepId) : toError(err);
       engine.container.eventBus.emit('engine:error', {
         runId,
-        error: toError(err),
+        error: lastError,
         context: `compensation-${stepState.stepId}`,
       });
+
+      // Persist the spent attempt before waiting — the budget survives a crash.
+      const recorded = await engine.container.repository.updateOne(
+        owned,
+        {
+          $set: {
+            [`steps.${stepIndex}.compensation.error`]: { message: lastError.message },
+            updatedAt: new Date(),
+          },
+          $inc: { [attemptsPath]: 1 },
+        },
+        { bypassTenant: true },
+      );
+      if (recorded.modifiedCount === 0) return 'stopped';
+      if (suspended) break; // non-retriable
+
       if (attempt < maxAttempts && baseDelay > 0) {
-        const mult = cfg?.retryBackoff === 'exponential' ? 2 ** (attempt - 1) : 1;
-        await new Promise((r) => setTimeout(r, baseDelay * mult));
+        const delay = calculateRetryDelay(
+          baseDelay,
+          attempt - 1,
+          multiplier,
+          TIMING.MAX_RETRY_DELAY_MS,
+          0,
+        );
+        await new Promise((r) => setTimeout(r, delay));
       }
+    } finally {
+      if (timer) clearTimeout(timer);
+      abortController.signal.removeEventListener('abort', relay);
     }
   }
 
-  // Exhausted retries → record failed compensation status.
-  await engine.container.repository.updateOne(
-    { _id: runId, status: 'compensating' },
+  // Exhausted (or non-retriable) → record the failed outcome, owned.
+  const failed = await engine.container.repository.updateOne(
+    owned,
     {
       $set: {
-        [`steps.${stepIndex}.compensation.status`]: 'failed',
+        [statusPath]: 'failed',
         [`steps.${stepIndex}.compensation.error`]: {
           message: lastError?.message ?? 'compensation failed',
         },
         updatedAt: new Date(),
       },
-      $inc: { [`steps.${stepIndex}.compensation.attempts`]: 1 },
     },
     { bypassTenant: true },
   );
   engine.container.cache.delete(runId);
-  return false;
+  return failed.modifiedCount === 0 ? 'stopped' : 'failed';
+}
+
+/** Documented `compensateRetries` / `compensateRetryDelay` defaults. */
+const COMPENSATION_DEFAULTS = { retries: 3, retryDelay: 1000 } as const;
+
+/** A compensation handler tried to wait/goto — never retried. */
+class SuspendInCompensationError extends Error {
+  constructor(stepId: string) {
+    super(
+      `Compensation handler for step "${stepId}" attempted to suspend — ` +
+        `compensation must be non-suspending`,
+    );
+    this.name = 'SuspendInCompensationError';
+  }
 }

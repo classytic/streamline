@@ -4,17 +4,26 @@
  * Tests multi-tenant isolation, strict mode, and query injection.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import mongoose from 'mongoose';
 import { Repository } from '@classytic/mongokit';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { createWorkflowRepository } from '../../src/storage/run.repository.js';
+import { describe, expect, it } from 'vitest';
 import {
-  tenantFilterPlugin,
-  singleTenantPlugin,
   resolveTenantFilterOptions,
+  singleTenantPlugin,
   type TenantFilterOptions,
+  tenantFilterPlugin,
 } from '../../src/plugins/tenant-filter.plugin.js';
+import { createWorkflowRepository } from '../../src/storage/run.repository.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+// The plugin under test runs on a raw mongokit Repository over the env's run
+// model (its own connection + database), emptied after each test.
+const env = useStreamlineEnv();
+
+/** `getAll` returns a bare array or a pagination envelope — these calls must page. */
+function paged<T>(result: T[] | { data: T[] }): { data: T[] } {
+  if (Array.isArray(result)) throw new Error('expected a paginated getAll result, got an array');
+  return result;
+}
 
 describe('TenantFilterPlugin', () => {
   it('normalizes canonical boolean tenant configuration', () => {
@@ -25,23 +34,9 @@ describe('TenantFilterPlugin', () => {
     });
   });
 
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test');
-    }
-  });
-
-  afterAll(async () => {
-    await mongoose.connection.close();
-  });
-
-  beforeEach(async () => {
-    await WorkflowRunModel.deleteMany({});
-  });
-
   describe('Multi-Tenant Mode (Strict)', () => {
     it('should throw error if tenantId is missing in strict mode', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -50,12 +45,12 @@ describe('TenantFilterPlugin', () => {
 
       // Should throw when querying without tenantId
       await expect(repo.getAll({ filters: { status: 'running' } })).rejects.toThrow(
-        'Missing tenantId'
+        'Missing tenantId',
       );
     });
 
     it('should filter queries by tenantId in strict mode', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -63,7 +58,7 @@ describe('TenantFilterPlugin', () => {
       ]);
 
       // Create test data for two tenants
-      const tenantAWorkflow = await WorkflowRunModel.create({
+      const tenantAWorkflow = await env.runModel.create({
         _id: 'run-tenant-a-1',
         workflowId: 'test-workflow',
         status: 'running',
@@ -75,7 +70,7 @@ describe('TenantFilterPlugin', () => {
         updatedAt: new Date(),
       });
 
-      const tenantBWorkflow = await WorkflowRunModel.create({
+      const tenantBWorkflow = await env.runModel.create({
         _id: 'run-tenant-b-1',
         workflowId: 'test-workflow',
         status: 'running',
@@ -109,7 +104,7 @@ describe('TenantFilterPlugin', () => {
     });
 
     it('should prevent cross-tenant access in getByQuery for string IDs', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -117,7 +112,7 @@ describe('TenantFilterPlugin', () => {
       ]);
 
       // Create workflow for tenant A
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-cross-tenant-test',
         workflowId: 'test-workflow',
         status: 'running',
@@ -129,24 +124,18 @@ describe('TenantFilterPlugin', () => {
         updatedAt: new Date(),
       });
 
-      const result = await repo.getByQuery(
-        { _id: 'run-cross-tenant-test' },
-        {
+      const result = await repo.getByQuery({ _id: 'run-cross-tenant-test' }, {
         tenantId: 'tenant-b',
         throwOnNotFound: false,
-      } as any,
-      );
+      } as any);
 
       expect(result).toBeNull();
 
       // Tenant A should be able to access their own workflow
-      const resultA = await repo.getByQuery(
-        { _id: 'run-cross-tenant-test' },
-        {
+      const resultA = await repo.getByQuery({ _id: 'run-cross-tenant-test' }, {
         tenantId: 'tenant-a',
         throwOnNotFound: false,
-      } as any,
-      );
+      } as any);
 
       expect(resultA).toBeDefined();
       expect(resultA?._id).toBe('run-cross-tenant-test');
@@ -155,14 +144,14 @@ describe('TenantFilterPlugin', () => {
 
   describe('Multi-Tenant Mode (Non-Strict)', () => {
     it('should allow queries without tenantId in non-strict mode', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: false,
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-non-strict-1',
         workflowId: 'test-workflow',
         status: 'done',
@@ -175,19 +164,19 @@ describe('TenantFilterPlugin', () => {
       });
 
       // Should not throw, returns all workflows
-      const results = await repo.getAll({ filters: { status: 'done' } });
+      const results = paged(await repo.getAll({ filters: { status: 'done' } }));
       expect(results.data.length).toBeGreaterThanOrEqual(1);
     });
 
     it('should still filter by tenantId when provided in non-strict mode', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: false,
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-ns-tenant-a',
         workflowId: 'test-workflow',
         status: 'waiting',
@@ -199,7 +188,7 @@ describe('TenantFilterPlugin', () => {
         updatedAt: new Date(),
       });
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-ns-tenant-b',
         workflowId: 'test-workflow',
         status: 'waiting',
@@ -224,7 +213,7 @@ describe('TenantFilterPlugin', () => {
 
   describe('Bypass Mode', () => {
     it('should allow bypass when allowBypass is true', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -232,7 +221,7 @@ describe('TenantFilterPlugin', () => {
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-bypass-1',
         workflowId: 'test-workflow',
         status: 'failed',
@@ -254,7 +243,7 @@ describe('TenantFilterPlugin', () => {
     });
 
     it('should throw error when bypass attempted but allowBypass is false', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -266,14 +255,14 @@ describe('TenantFilterPlugin', () => {
         repo.getAll({
           filters: { status: 'running' },
           bypassTenant: true,
-        } as any)
+        } as any),
       ).rejects.toThrow('Tenant bypass not allowed');
     });
   });
 
   describe('Single-Tenant Mode (Static TenantId)', () => {
     it('should automatically filter by static tenantId', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           staticTenantId: 'static-org-123',
@@ -281,7 +270,7 @@ describe('TenantFilterPlugin', () => {
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-static-1',
         workflowId: 'test-workflow',
         status: 'done',
@@ -293,7 +282,7 @@ describe('TenantFilterPlugin', () => {
         updatedAt: new Date(),
       });
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-static-2',
         workflowId: 'test-workflow',
         status: 'done',
@@ -306,7 +295,7 @@ describe('TenantFilterPlugin', () => {
       });
 
       // No tenantId needed - uses static config
-      const results = await repo.getAll({ filters: { status: 'done' } });
+      const results = paged(await repo.getAll({ filters: { status: 'done' } }));
 
       expect(results.data).toHaveLength(1);
       expect(results.data[0]._id).toBe('run-static-1');
@@ -314,11 +303,9 @@ describe('TenantFilterPlugin', () => {
     });
 
     it('should use singleTenantPlugin helper correctly', async () => {
-      const repo = new Repository(WorkflowRunModel, [
-        singleTenantPlugin('single-tenant-org'),
-      ]);
+      const repo = new Repository(env.runModel, [singleTenantPlugin('single-tenant-org')]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-single-1',
         workflowId: 'test-workflow',
         status: 'running',
@@ -330,7 +317,7 @@ describe('TenantFilterPlugin', () => {
         updatedAt: new Date(),
       });
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-single-2',
         workflowId: 'test-workflow',
         status: 'running',
@@ -342,23 +329,23 @@ describe('TenantFilterPlugin', () => {
         updatedAt: new Date(),
       });
 
-      const results = await repo.getAll({ filters: { status: 'running' } });
+      const results = paged(await repo.getAll({ filters: { status: 'running' } }));
 
       expect(results.data).toHaveLength(1);
-      expect(results.data[0].context.tenantId).toBe('single-tenant-org');
+      expect(results.data[0]?.context.tenantId).toBe('single-tenant-org');
     });
   });
 
   describe('Custom Tenant Field', () => {
     it('should support nested tenant field (context.tenantId)', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-nested-1',
         workflowId: 'test-workflow',
         status: 'done',
@@ -379,14 +366,14 @@ describe('TenantFilterPlugin', () => {
     });
 
     it('should support meta field (meta.orgId)', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'meta.orgId',
           required: true,
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-meta-1',
         workflowId: 'test-workflow',
         status: 'done',
@@ -410,7 +397,7 @@ describe('TenantFilterPlugin', () => {
 
   describe('Create Operations', () => {
     it('should inject tenantId on create in multi-tenant mode', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -429,14 +416,14 @@ describe('TenantFilterPlugin', () => {
           createdAt: new Date(),
           updatedAt: new Date(),
         },
-        { tenantId: 'injected-tenant' } as any
+        { tenantId: 'injected-tenant' } as any,
       );
 
       expect(created.context.tenantId).toBe('injected-tenant');
     });
 
     it('should throw on create without tenantId in strict mode', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -454,12 +441,12 @@ describe('TenantFilterPlugin', () => {
           input: {},
           createdAt: new Date(),
           updatedAt: new Date(),
-        })
+        }),
       ).rejects.toThrow('Missing tenantId');
     });
 
     it('should auto-inject static tenantId on create', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           staticTenantId: 'auto-inject-org',
@@ -485,14 +472,14 @@ describe('TenantFilterPlugin', () => {
 
   describe('Update and Delete Operations', () => {
     it('should filter update by tenantId', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-update-1',
         workflowId: 'test-workflow',
         status: 'running',
@@ -509,24 +496,22 @@ describe('TenantFilterPlugin', () => {
       // For strict tenant isolation on updates, verify tenant at application level before update
 
       // Update as correct tenant - should succeed
-      const updated = await repo.update(
-        'run-update-1',
-        { status: 'done' },
-        { tenantId: 'update-tenant-a' } as any
-      );
+      const updated = await repo.update('run-update-1', { status: 'done' }, {
+        tenantId: 'update-tenant-a',
+      } as any);
 
-      expect(updated.status).toBe('done');
+      expect(updated?.status).toBe('done');
     });
 
     it('should filter delete by tenantId', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
         }),
       ]);
 
-      await WorkflowRunModel.create({
+      await env.runModel.create({
         _id: 'run-delete-1',
         workflowId: 'test-workflow',
         status: 'done',
@@ -542,14 +527,14 @@ describe('TenantFilterPlugin', () => {
       await repo.delete('run-delete-1', { tenantId: 'delete-tenant' } as any);
 
       // Verify deleted
-      const directCheck = await WorkflowRunModel.findById('run-delete-1');
+      const directCheck = await env.runModel.findById('run-delete-1');
       expect(directCheck).toBeNull();
     });
   });
 
   describe('Edge Cases', () => {
     it('should handle empty result sets correctly', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -565,7 +550,7 @@ describe('TenantFilterPlugin', () => {
     });
 
     it('should work with pagination', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -574,7 +559,7 @@ describe('TenantFilterPlugin', () => {
 
       // Create multiple workflows for one tenant
       for (let i = 0; i < 15; i++) {
-        await WorkflowRunModel.create({
+        await env.runModel.create({
           _id: `run-paginate-${i}`,
           workflowId: 'test-workflow',
           status: 'done',
@@ -610,7 +595,7 @@ describe('TenantFilterPlugin', () => {
     });
 
     it('should handle concurrent requests from different tenants', async () => {
-      const repo = new Repository(WorkflowRunModel, [
+      const repo = new Repository(env.runModel, [
         tenantFilterPlugin({
           tenantField: 'context.tenantId',
           required: true,
@@ -619,7 +604,7 @@ describe('TenantFilterPlugin', () => {
 
       // Create data for multiple tenants
       await Promise.all([
-        WorkflowRunModel.create({
+        env.runModel.create({
           _id: 'run-concurrent-a',
           workflowId: 'test-workflow',
           status: 'running',
@@ -630,7 +615,7 @@ describe('TenantFilterPlugin', () => {
           createdAt: new Date(),
           updatedAt: new Date(),
         }),
-        WorkflowRunModel.create({
+        env.runModel.create({
           _id: 'run-concurrent-b',
           workflowId: 'test-workflow',
           status: 'running',
@@ -664,7 +649,7 @@ describe('TenantFilterPlugin', () => {
     };
 
     const seedRun = (id: string, tenantId: string, extra: Record<string, unknown> = {}) =>
-      WorkflowRunModel.create({
+      env.runModel.create({
         _id: id,
         workflowId: 'test-workflow',
         status: 'running',
@@ -679,15 +664,15 @@ describe('TenantFilterPlugin', () => {
 
     describe('cursor', () => {
       it('should only yield the requesting tenant runs', async () => {
-        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        const repo = new Repository(env.runModel, [tenantFilterPlugin(strictOptions)]);
         await seedRun('run-cursor-a', 'cursor-tenant-a');
         await seedRun('run-cursor-b', 'cursor-tenant-b');
 
         const seen: string[] = [];
-        for await (const doc of repo.cursor(
-          { status: 'running' },
-          { lean: true, tenantId: 'cursor-tenant-a' } as any,
-        )) {
+        for await (const doc of repo.cursor({ status: 'running' }, {
+          lean: true,
+          tenantId: 'cursor-tenant-a',
+        } as any)) {
           seen.push((doc as any)._id);
         }
 
@@ -695,7 +680,7 @@ describe('TenantFilterPlugin', () => {
       });
 
       it('should throw in strict mode without tenantId', async () => {
-        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        const repo = new Repository(env.runModel, [tenantFilterPlugin(strictOptions)]);
         await seedRun('run-cursor-strict', 'cursor-tenant-strict');
 
         await expect(
@@ -709,7 +694,7 @@ describe('TenantFilterPlugin', () => {
       });
 
       it('cursorStaleRunning should be tenant-scoped and strict-throwing', async () => {
-        const repo = createWorkflowRepository({ tenant: strictOptions });
+        const repo = createWorkflowRepository({ tenant: strictOptions, model: env.runModel });
         const staleHeartbeat = new Date(Date.now() - 60 * 60 * 1000);
         await seedRun('run-stale-a', 'stale-tenant-a', { lastHeartbeat: staleHeartbeat });
         await seedRun('run-stale-b', 'stale-tenant-b', { lastHeartbeat: staleHeartbeat });
@@ -735,7 +720,7 @@ describe('TenantFilterPlugin', () => {
 
     describe('claimVersion', () => {
       it('should be tenant-scoped the same way claim is', async () => {
-        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        const repo = new Repository(env.runModel, [tenantFilterPlugin(strictOptions)]);
         await seedRun('run-cv-a', 'cv-tenant-a');
 
         // Cross-tenant CAS misses — the injected tenant predicate excludes the doc.
@@ -759,7 +744,7 @@ describe('TenantFilterPlugin', () => {
       });
 
       it('should throw in strict mode without tenantId', async () => {
-        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        const repo = new Repository(env.runModel, [tenantFilterPlugin(strictOptions)]);
         await seedRun('run-cv-strict', 'cv-tenant-strict');
 
         await expect(
@@ -770,7 +755,7 @@ describe('TenantFilterPlugin', () => {
 
     describe('getOrCreate', () => {
       it('should be tenant-scoped: owning tenant gets existing, other tenant creates fresh', async () => {
-        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        const repo = new Repository(env.runModel, [tenantFilterPlugin(strictOptions)]);
         await seedRun('run-goc-a', 'goc-tenant-a', { workflowId: 'goc-workflow' });
 
         const createData = {
@@ -803,7 +788,7 @@ describe('TenantFilterPlugin', () => {
       });
 
       it('should throw in strict mode without tenantId', async () => {
-        const repo = new Repository(WorkflowRunModel, [tenantFilterPlugin(strictOptions)]);
+        const repo = new Repository(env.runModel, [tenantFilterPlugin(strictOptions)]);
 
         await expect(
           repo.getOrCreate({ workflowId: 'goc-strict' }, { _id: 'run-goc-strict' }),

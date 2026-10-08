@@ -32,6 +32,21 @@ export const STEP_STATUS = {
   SKIPPED: 'skipped',
 } as const satisfies Record<string, StepStatus>;
 
+/**
+ * THE definition of "heartbeat stale" — every stale sweep and recovery claim
+ * uses it, so they cannot disagree. A heartbeat older than `staleTime` is stale.
+ * A MISSING heartbeat is stale only once the run itself is older than
+ * `staleTime`: a run just created has no heartbeat until its first step claim,
+ * and treating that as stale let recovery claim a brand-new run out from under
+ * the worker starting it (two drivers, the step reset mid-attempt).
+ */
+export function staleHeartbeatOr(staleTime: Date): Record<string, unknown>[] {
+  return [
+    { lastHeartbeat: { $lt: staleTime } },
+    { lastHeartbeat: { $exists: false }, updatedAt: { $lt: staleTime } },
+  ];
+}
+
 // ============================================================================
 // Query Builder
 // ============================================================================
@@ -182,8 +197,7 @@ export class WorkflowQueryBuilder {
 
   // Heartbeat/stale detection
   withStaleHeartbeat(thresholdMs: number) {
-    const staleTime = new Date(Date.now() - thresholdMs);
-    this.query.$or = [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }];
+    this.query.$or = staleHeartbeatOr(new Date(Date.now() - thresholdMs));
     return this;
   }
 
@@ -330,6 +344,20 @@ export const CommonQueries = {
         .withStaleHeartbeat(thresholdMs),
       workflowId,
     ).build(),
+
+  /**
+   * Runs that failed with `compensationDue` but never entered the saga — a
+   * crash between the `failed` write and `failed → compensating`. Staleness
+   * keys on `updatedAt` (the failure write stamps it; a failed run does not
+   * heartbeat), so a live inline entry, milliseconds later, is never raced.
+   */
+  failedAwaitingCompensation: (thresholdMs: number, workflowId?: string) => ({
+    status: RUN_STATUS.FAILED,
+    compensationDue: true,
+    paused: { $ne: true },
+    updatedAt: { $lt: new Date(Date.now() - thresholdMs) },
+    ...(workflowId !== undefined ? { workflowId } : {}),
+  }),
 
   scheduledReady: (now?: Date, workflowId?: string) =>
     withMaybeWorkflowId(

@@ -6,6 +6,155 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 2.10.0 - 2026-10-08
+
+### Changed — peer floors raised to current
+
+- `@classytic/mongokit` `>=3.33.0` → **`>=3.40.0`**, `@classytic/repo-core` `>=0.24.0` → **`>=0.30.0`**, `@classytic/primitives` `>=0.23.0` → **`>=0.29.0`**. Verified on a fresh install of the current releases.
+
+### Added — `@classytic/streamline/testkit`
+
+- **A real workflow-engine test harness, and streamline's own suite runs on it.**
+  `createStreamlineTestEnv()` boots an isolated world on an ephemeral MongoDB (own
+  connection + database, a container bound to it, real indexes), with
+  `env.workflow()`, run-shape fixtures (`env.runs.staleRunning` / `retryDue` /
+  `timerDue` / `waitingFor` / `scheduledDue` / `failedAwaitingCompensation` /
+  `staleCompensating` / `insert` / `update` / `makeDue`), `env.until()` /
+  `eventually()` / `untilCount()` outcome waits, `env.tick()` (one scheduler poll +
+  its work), `env.worker()` / `redefine()` (a second process / a new version),
+  `env.counter()` and `env.trace()` (MongoDB command cost, `updatesTo` / `readsOf`).
+  Built on `@classytic/mongokit/testkit`; `mongodb-memory-server` stays optional.
+
+### Fixed — found by moving the suite onto the harness
+
+- **Recovery could claim a brand-new run.** A missing `lastHeartbeat` counted as stale
+  with no age check, and a run has none until its first step claim — so a recovery
+  poll could take a just-started run from the worker starting it (two drivers, the
+  step reset mid-attempt). Now a missing heartbeat is stale only once the run itself
+  is older than the threshold; every sweep and claim shares one definition.
+- **Recovery waited a full poll interval.** Polling armed its first poll `interval`
+  out, so a crashed run found by idle discovery or at boot waited that long (60s at a
+  60s interval). The first poll now runs at once.
+- **Branch-join listeners leaked.** Each reconcile that missed quorum re-armed a
+  listener for every branch (finished ones included), so they accumulated per poll on
+  a long-lived worker. Registration is idempotent; a listener removes itself on its
+  child's terminal event; finished branches are never re-armed.
+- **`bindFailureTo` subscriptions outlived `shutdown()`.** They now go with it.
+- `approve` / `reject` / `answer` accept `{ container }`, like `resumeHook`.
+- `engine.pollScheduler()` / `engine.drainScheduler()` — run one poll now / await the
+  work in flight (tests, and an operator kick after a deploy).
+- `resumeHook` / `cancelHook` / `getHookByToken` / `listPendingHooks` take
+  `{ container }`. The DB-fallback resume released a strict-concurrency slot through
+  the DEFAULT-connection counter even when the run lived on another connection.
+- Fixed: `syncRetentionIndexes()` threw `NamespaceNotFound` on a fresh database (no
+  `workflow_runs` collection yet) — every first deploy against an empty DB.
+
+### Correctness — owned attempts
+
+- **Step attempts are owned.** The claim stamps `steps.<i>.attemptId`; every later write
+  (result, retry, goto, heartbeat, `ctx.set`/`checkpoint`/progress) requires it. After
+  stale recovery re-claims a step, the old worker's writes are refused with
+  `AttemptSupersededError` (an `InvalidStateError`) and its `ctx.signal` aborts.
+- **Compensation walks are owned** (`compensationAttemptId`): a recovery reclaim
+  supersedes a stalled walker, whose done-flips and settle no longer land.
+- **failed → compensating crash window closed.** A failure write sets `compensationDue`
+  in the same update when the engine has compensation handlers; the scheduler sweeps
+  stale marked runs into the saga. Historic `failed` runs without the marker are never
+  compensated retroactively.
+- **Cancel aborts `ctx.signal` across processes** — the step and compensation heartbeats
+  are cancel-guarded, so a handler on another worker learns within one heartbeat.
+- **Compensation retries follow the documented defaults** (3 attempts, 1000ms,
+  exponential — previously 1 attempt, no delay), are persisted per attempt (a crash
+  resumes the budget), and accept `compensateTimeout`.
+
+### Versioning
+
+- **`versionPolicy`** (`'compatible'` default · `'strict'` · `'any'`). A run pinned to a
+  version that is neither registered nor migrated used to run silently on the new code.
+  Now a different semver major (any difference under `'strict'`) PARKS the run: `paused`
+  with `pauseReason: 'version-unavailable: …'`, `workflow:paused` + `engine:error`.
+  `resume()` with a payload is refused (`InvalidStateError`) instead of consuming the
+  signal. `'any'` restores the old behaviour.
+- **Version resolution happens before any payload is consumed** — in `execute()`,
+  `resume()` and durable-signal delivery alike, `migrateRun` included. Previously a
+  `migrateRun` that declined (`null`) let `resume(runId, payload)` mark the waiting step
+  done with the payload before the run was parked.
+- `pause(runId, { reason })` persists `pauseReason`; `resume` clears it.
+
+### Strict concurrency
+
+- **Slot release is exactly-once per run, durably.** A CAS on the run
+  (`meta.concurrencySlotReleasedAt`) replaces the process-local dedupe, which let two
+  engine versions — or two processes — both decrement one run's slot. Only the pinned
+  version may release on `failed` (its compensation handlers decide whether it is final).
+- **`reconcile()` is safe on a live bucket**: counters carry `rev`, the write is a CAS on
+  it, and a counter is only lowered after `settleMs` (default 5000) of quiet, so a claim
+  whose run is not persisted yet is not mistaken for a leak.
+
+### Durable signals
+
+- **`workflow.signal(runId, name, data, { signalId? })`** — a signal for `ctx.waitFor(name)`
+  that is never lost to timing. Delivered at once if the run waits on `name`, otherwise
+  queued in the run's inbox (`signals[]`, cap 100) until the next `waitFor(name)` —
+  across restarts. The inbox entry is pulled in the same write that completes the wait
+  (no loss, no double delivery); a scheduler sweep covers a crash between push and
+  delivery. Returns `delivered | queued | duplicate`; terminal runs refuse.
+  `eventBus.emit` events stay fire-and-forget.
+- An operator `resume` of a paused event wait delivers its queued signal instead of
+  completing the wait with `undefined`.
+
+### Scheduler
+
+- **Bounded dispatch pool** (`scheduler.dispatchConcurrency`, default 10). A poll
+  dispatches and returns — it used to await each workflow serially, so one slow run
+  stalled discovery, recovery and every run behind it. In-flight runs count against the
+  poll budget and are never dispatched twice. Recovery is never blocked by a full pool.
+- **Idle discovery** arms one timer for the next scheduled deadline, so a future
+  scheduled run starts without waiting for the next stale-check cycle.
+- **Recovery runs before admission and is never capacity-gated**; admission categories
+  share one `maxWorkflowsPerPoll` budget.
+- **Fair admission.** Categories drew from that budget in a fixed order, so a continuous
+  timer-wait backlog could starve retries, scheduled starts and concurrency drafts. Each
+  category now gets an equal share first (rotating which goes first each poll); leftover
+  budget goes to the categories that filled theirs.
+- Fixed: reconfiguring the scheduler (`engine.configure({ scheduler })`) dropped the
+  wait-expiry callback, so expired human/webhook waits were never timed out.
+
+### Performance
+
+- **One write per step result**: a step's result and the run's advance (or completion)
+  are a single atomic write — closing the crash window where a run sat `running` at a
+  done step. The claim also drops its second write. (2 run writes per step, was 3.)
+- **No per-step run reads.** The operator-pause boundary was a full-run read after every
+  step; the next step's claim (and a conditional skip) now refuses a paused run instead,
+  so a plain run is its writes and nothing else. With the single result write: ~2× runs/s
+  on the bench, ~13× fewer bytes received per run.
+- **Guarded writes return `{ _id }`**, not the whole run (~64× smaller replies).
+- **Scatter checkpoints write per-task deltas** — O(N) bytes for N tasks instead of
+  O(N²) (36× less at 300 tasks). Task ids that are not field-path segments (`.`, `$`)
+  fall back to whole-map writes.
+- Lean queries use `findAll` (no count round-trip).
+- `npm run bench` — throughput, scatter, write-reply and head-of-line benchmarks against
+  the built package.
+
+### Indexes
+
+- The tenant-scoped idempotency unique index uses `idempotencyKey: { $gte: '' }` (same
+  rows as `$type: 'string'`, but implied by an equality, so the active-key lookup can use
+  it), renamed `…_idempotencyKey_1_str`. **Upgrade:** `container.syncRetentionIndexes()`
+  drops the previous `$type` index.
+- The sparse `{ idempotencyKey, status }` index is now PARTIAL (`idempotencyKey: { $gte: '' }`,
+  `idempotencyKey_1_status_1_str`). A sparse COMPOUND indexes every run (all have
+  `status`) — a key per run write — and the planner would not use it. It still serves the
+  lookups without a tenant prefix (single-tenant active-key, child adopt-by-key).
+  `syncRetentionIndexes()` drops the sparse one.
+- **`syncRetentionIndexes()` drops indexes older versions declared and later retired.**
+  2.8.2 removed `{ status, paused, workflowId, updatedAt, _id }` and the multikey
+  `{ status, paused, steps, updatedAt, _id }` from the schema, but nothing dropped them —
+  deployments that ran ≤2.8.1 still paid for them, the `steps` one a key per step on
+  every run write. Matched by exact key pattern; host indexes are never touched.
+
+
 ## 2.9.0 - 2026-07-29
 
 ### Security — multi-tenant isolation on the workflow control API

@@ -22,13 +22,16 @@
  * listeners.
  *
  * These tests don't touch the DB (they inspect listener counts at
- * construction time) but use `useTestDb()` so the engines' lazy scheduler
- * has a live connection and never logs a stray connection error.
+ * construction time) but bind each container to the env's connection so the
+ * engines' lazy scheduler has a live connection and never logs a stray
+ * connection error.
  */
 
 import { describe, expect, it } from 'vitest';
-import { createContainer, createWorkflow, WorkflowEventBus } from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import { WorkflowEventBus } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 const TERMINAL_EVENTS = [
   'workflow:completed',
@@ -38,29 +41,25 @@ const TERMINAL_EVENTS = [
   'workflow:compensation_failed',
 ] as const;
 
-let n = 0;
-const uid = (p: string) => `${p}-${Date.now()}-${++n}`;
-
 /** Snapshot the listener count for each terminal event name. */
 const snapshot = (bus: WorkflowEventBus): Record<string, number> =>
   Object.fromEntries(TERMINAL_EVENTS.map((e) => [e, bus.listenerCount(e)]));
 
+// Each test gets its own bus — `env.createContainer` gives it a container of
+// its own on the env's connection, disposed by the env after each test.
 describe('regression: engine slot-release listeners gated on strict concurrency', () => {
-  useTestDb();
-
   it('12 non-strict workflows add ZERO terminal listeners to a shared bus', () => {
     const bus = new WorkflowEventBus();
     // `createContainer` runs `bridgeBusToTransport`, which attaches exactly
     // one listener per event name. Capture that constant as the baseline so
     // the assertion isolates the ENGINE's contribution.
-    const container = createContainer({ eventBus: bus });
+    const container = env.createContainer({ eventBus: bus });
     const baseline = snapshot(bus);
 
     const wfs = Array.from({ length: 12 }, () =>
-      createWorkflow(uid('nonstrict'), {
+      env.workflow('nonstrict', {
         steps: { a: async () => 'ok' },
         container,
-        autoExecute: false,
       }),
     );
 
@@ -75,13 +74,12 @@ describe('regression: engine slot-release listeners gated on strict concurrency'
 
   it('a strict-concurrency workflow registers the 5 listeners; shutdown removes them', () => {
     const bus = new WorkflowEventBus();
-    const container = createContainer({ eventBus: bus });
+    const container = env.createContainer({ eventBus: bus });
     const baseline = snapshot(bus);
 
-    const wf = createWorkflow(uid('strict'), {
+    const wf = env.workflow('strict', {
       steps: { a: async () => 'ok' },
       container,
-      autoExecute: false,
       concurrency: { strict: true, limit: 1, key: () => 'g' },
     });
 
@@ -100,21 +98,19 @@ describe('regression: engine slot-release listeners gated on strict concurrency'
 
   it('mixed fleet: only the strict workflows contribute listeners', () => {
     const bus = new WorkflowEventBus();
-    const container = createContainer({ eventBus: bus });
+    const container = env.createContainer({ eventBus: bus });
     const baseline = snapshot(bus);
 
     const nonStrict = Array.from({ length: 8 }, () =>
-      createWorkflow(uid('mixed-loose'), {
+      env.workflow('mixed-loose', {
         steps: { a: async () => 'ok' },
         container,
-        autoExecute: false,
       }),
     );
     const strict = Array.from({ length: 2 }, () =>
-      createWorkflow(uid('mixed-strict'), {
+      env.workflow('mixed-strict', {
         steps: { a: async () => 'ok' },
         container,
-        autoExecute: false,
         concurrency: { strict: true, limit: 1, key: () => 'g' },
       }),
     );

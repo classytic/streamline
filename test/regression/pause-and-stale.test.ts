@@ -1,24 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { createWorkflow } from '../../src/index.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { setupTestDB, cleanupTestDB, teardownTestDB, waitFor, waitUntil } from '../utils/setup.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 describe('Pause and Stale Recovery Regression', () => {
-  beforeAll(async () => {
-    await setupTestDB();
-  });
-
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
-  afterAll(async () => {
-    await teardownTestDB();
-  });
-
   it('should not auto-resume a paused timer-based workflow', async () => {
-    const workflow = createWorkflow<Record<string, never>>('pause-timer-test', {
+    const workflow = env.workflow<Record<string, never>>('pause-timer-test', {
       steps: {
         sleep: async (ctx) => {
           await ctx.sleep(6000);
@@ -28,21 +15,20 @@ describe('Pause and Stale Recovery Regression', () => {
         },
       },
       context: () => ({}),
+      autoExecute: true,
     });
 
     const run = await workflow.start({});
 
-    const reachedWaiting = await waitUntil(async () => {
-      const latest = await workflow.get(run._id);
-      return latest?.status === 'waiting';
-    }, 2000);
-
-    expect(reachedWaiting).toBe(true);
+    await env.until(run._id, 'waiting', { timeout: 2000 });
 
     await workflow.pause(run._id);
 
-    // Wait past the timer resume point; it should still be paused and waiting
-    await waitFor(6500);
+    // Wait past the timer resume point (6s); it must stay paused and waiting
+    // the whole time — any auto-resume fails this immediately.
+    await expect(
+      env.until(run._id, (r) => r.paused !== true || r.status !== 'waiting', { timeout: 6500 }),
+    ).rejects.toThrow(/not reached within 6500ms/);
 
     const pausedRun = await workflow.get(run._id);
     expect(pausedRun?.paused).toBe(true);
@@ -51,63 +37,34 @@ describe('Pause and Stale Recovery Regression', () => {
     // Manual resume should continue the workflow
     await workflow.resume(run._id);
 
-    const resumed = await waitUntil(async () => {
-      const latest = await workflow.get(run._id);
-      return latest?.status === 'done';
-    }, 2000);
-
-    expect(resumed).toBe(true);
-
-    workflow.shutdown();
+    await env.until(run._id, 'done', { timeout: 2000 });
   });
 
   it('should ignore paused runs in stale recovery queries', async () => {
-    const now = new Date();
     const staleTime = new Date(Date.now() - 5000);
+    const staleStep = [
+      { stepId: 'step-1', status: 'running' as const, attempts: 1, startedAt: staleTime },
+    ];
 
-    await WorkflowRunModel.create({
+    await env.runs.insert('stale-test', {
       _id: 'stale-paused-run',
-      workflowId: 'stale-test',
       status: 'running',
-      steps: [
-        {
-          stepId: 'step-1',
-          status: 'running',
-          attempts: 1,
-          startedAt: staleTime,
-        },
-      ],
+      steps: staleStep,
       currentStepId: 'step-1',
-      context: {},
-      input: {},
-      createdAt: now,
-      updatedAt: now,
       lastHeartbeat: staleTime,
       paused: true,
     });
 
-    await WorkflowRunModel.create({
+    await env.runs.insert('stale-test', {
       _id: 'stale-active-run',
-      workflowId: 'stale-test',
       status: 'running',
-      steps: [
-        {
-          stepId: 'step-1',
-          status: 'running',
-          attempts: 1,
-          startedAt: staleTime,
-        },
-      ],
+      steps: staleStep,
       currentStepId: 'step-1',
-      context: {},
-      input: {},
-      createdAt: now,
-      updatedAt: now,
       lastHeartbeat: staleTime,
       paused: false,
     });
 
-    const stale = await workflowRunRepository.getStaleRunningWorkflows(1000, 10);
+    const stale = await env.container.repository.getStaleRunningWorkflows(1000, 10);
     const ids = stale.map((run) => run._id);
 
     expect(ids).toContain('stale-active-run');

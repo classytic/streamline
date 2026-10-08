@@ -1,6 +1,7 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { enableTelemetry, disableTelemetry } from '../../src/telemetry/index.js';
+import type { Tracer } from '@opentelemetry/api';
+import { afterEach, describe, expect, it } from 'vitest';
 import { globalEventBus } from '../../src/core/events.js';
+import { disableTelemetry, enableTelemetry } from '../../src/telemetry/index.js';
 
 class FakeSpan {
   name: string;
@@ -37,6 +38,11 @@ class FakeTracer {
     this.spans.push(span);
     return span;
   }
+
+  /** The `Tracer` streamline sees: it only ever calls `startSpan`. */
+  asTracer(): Tracer {
+    return this as unknown as Tracer;
+  }
 }
 
 describe('Telemetry error payloads', () => {
@@ -46,7 +52,7 @@ describe('Telemetry error payloads', () => {
 
   it('records error details for step:failed', () => {
     const tracer = new FakeTracer();
-    enableTelemetry({ tracer });
+    enableTelemetry({ tracer: tracer.asTracer() });
 
     globalEventBus.emit('step:started', { runId: 'run-1', stepId: 'step-1' });
 
@@ -61,7 +67,7 @@ describe('Telemetry error payloads', () => {
 
   it('records error details for workflow:failed', () => {
     const tracer = new FakeTracer();
-    enableTelemetry({ tracer });
+    enableTelemetry({ tracer: tracer.asTracer() });
 
     globalEventBus.emit('workflow:started', { runId: 'run-2' });
 

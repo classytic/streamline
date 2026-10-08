@@ -3,14 +3,14 @@
  * State machine validation — pure functions, no DB.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   deriveRunStatus,
-  isTerminalState,
-  isValidStepTransition,
-  isValidRunTransition,
-  isStepStatus,
   isRunStatus,
+  isStepStatus,
+  isTerminalState,
+  isValidRunTransition,
+  isValidStepTransition,
 } from '../../src/core/status.js';
 import type { WorkflowRun } from '../../src/core/types.js';
 
@@ -72,9 +72,7 @@ describe('deriveRunStatus', () => {
   });
 
   it('should preserve cancelled status', () => {
-    const run = makeRun('cancelled', [
-      { stepId: 'a', status: 'done', attempts: 1 },
-    ]);
+    const run = makeRun('cancelled', [{ stepId: 'a', status: 'done', attempts: 1 }]);
     expect(deriveRunStatus(run)).toBe('cancelled');
   });
 

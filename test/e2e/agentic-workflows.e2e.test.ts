@@ -10,31 +10,17 @@
  * - Checkpoint-based batch processing
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitFor } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createEventSink,
-  WorkflowRunModel,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { createEventSink } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // AI Content Pipeline — Quality Gate Pattern
 // ============================================================================
 
 describe('AI content pipeline with quality gates', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should auto-approve high-quality content', async () => {
     interface PipelineCtx {
       prompt: string;
@@ -43,7 +29,7 @@ describe('AI content pipeline with quality gates', () => {
       approved: boolean;
     }
 
-    const wf = createWorkflow<PipelineCtx>('ai-pipeline-auto', {
+    const wf = env.workflow<PipelineCtx, { prompt: string }>('ai-pipeline-auto', {
       steps: {
         generate: async (ctx) => {
           // Simulate LLM generation
@@ -76,13 +62,12 @@ describe('AI content pipeline with quality gates', () => {
           skipIf: (ctx) => !ctx.approved,
         },
       },
-      context: (input: { prompt: string }) => ({
+      context: (input) => ({
         prompt: input.prompt,
         content: '',
         qualityScore: 0,
         approved: false,
       }),
-      autoExecute: false,
     });
 
     const run = await wf.start({ prompt: 'Write a detailed article about TypeScript generics' });
@@ -92,12 +77,12 @@ describe('AI content pipeline with quality gates', () => {
     expect(result.context.qualityScore).toBeGreaterThanOrEqual(0.8);
     expect(result.context.approved).toBe(true);
 
-    // Check logs were persisted
-    await waitFor(200);
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.stepLogs!.some((l: any) => l.message.includes('Quality score'))).toBe(true);
-
-    wf.shutdown();
+    // Check logs were persisted (log writes are async — wait for them)
+    const doc = await env.until(
+      run._id,
+      (r) => r.stepLogs?.some((l) => l.message.includes('Quality score')) ?? false,
+    );
+    expect(doc.stepLogs?.some((l) => l.message.includes('Quality score'))).toBe(true);
   });
 
   it('should pause for human review on low-quality content', async () => {
@@ -106,7 +91,7 @@ describe('AI content pipeline with quality gates', () => {
       qualityScore: number;
     }
 
-    const wf = createWorkflow<PipelineCtx>('ai-pipeline-review', {
+    const wf = env.workflow<PipelineCtx, { prompt: string }>('ai-pipeline-review', {
       steps: {
         generate: async () => ({ generated: true }),
         score: async (ctx) => {
@@ -120,11 +105,10 @@ describe('AI content pipeline with quality gates', () => {
           return { autoApproved: true };
         },
       },
-      context: (input: { prompt: string }) => ({
+      context: (input) => ({
         prompt: input.prompt,
         qualityScore: 0,
       }),
-      autoExecute: false,
     });
 
     const run = await wf.start({ prompt: 'Hi' });
@@ -133,8 +117,6 @@ describe('AI content pipeline with quality gates', () => {
     expect(result.status).toBe('waiting');
     const waitStep = result.steps.find((s) => s.status === 'waiting');
     expect(waitStep?.waitingFor?.reason).toContain('human review');
-
-    wf.shutdown();
   });
 });
 
@@ -143,10 +125,6 @@ describe('AI content pipeline with quality gates', () => {
 // ============================================================================
 
 describe('Agentic tool orchestration (CLI-style)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should orchestrate multi-tool agent workflow with scatter', async () => {
     interface AgentCtx {
       query: string;
@@ -154,7 +132,7 @@ describe('Agentic tool orchestration (CLI-style)', () => {
       analysis: string;
     }
 
-    const wf = createWorkflow<AgentCtx>('agent-tools', {
+    const wf = env.workflow<AgentCtx, { query: string }>('agent-tools', {
       steps: {
         plan: async (ctx) => {
           ctx.log('Planning agent actions', { query: ctx.context.query });
@@ -187,12 +165,11 @@ describe('Agentic tool orchestration (CLI-style)', () => {
           };
         },
       },
-      context: (input: { query: string }) => ({
+      context: (input) => ({
         query: input.query,
         searchResults: [],
         analysis: '',
       }),
-      autoExecute: false,
     });
 
     const run = await wf.start({ query: 'How does streamline compare to Temporal?' });
@@ -201,23 +178,19 @@ describe('Agentic tool orchestration (CLI-style)', () => {
     expect(result.status).toBe('done');
     expect(result.context.searchResults).toHaveLength(3);
     expect(result.context.analysis).toContain('looks good');
-
-    wf.shutdown();
   });
 
   it('should handle agent step failure with retries and backoff config', async () => {
     let apiCalls = 0;
 
-    const wf = createWorkflow('agent-retry', {
+    const wf = env.workflow('agent-retry', {
       steps: {
         call_llm: {
           handler: async (ctx) => {
             apiCalls++;
             ctx.log(`LLM call attempt ${apiCalls}`);
             if (apiCalls < 3) {
-              const err = new Error('Rate limited');
-              (err as any).code = 'RATE_LIMITED';
-              throw err;
+              throw Object.assign(new Error('Rate limited'), { code: 'RATE_LIMITED' });
             }
             return { response: `Success on attempt ${apiCalls}` };
           },
@@ -226,7 +199,6 @@ describe('Agentic tool orchestration (CLI-style)', () => {
           retryBackoff: 'exponential',
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -237,9 +209,7 @@ describe('Agentic tool orchestration (CLI-style)', () => {
 
     // Verify step completed
     const step = result.steps.find((s) => s.stepId === 'call_llm');
-    expect(step!.status).toBe('done');
-
-    wf.shutdown();
+    expect(step?.status).toBe('done');
   });
 });
 
@@ -248,17 +218,13 @@ describe('Agentic tool orchestration (CLI-style)', () => {
 // ============================================================================
 
 describe('Human-in-the-loop approval workflows', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should support multi-stage approval with resume', async () => {
     interface ApprovalCtx {
       document: string;
       managerApproved: boolean;
     }
 
-    const wf = createWorkflow<ApprovalCtx>('multi-approval', {
+    const wf = env.workflow<ApprovalCtx, { document: string }>('multi-approval', {
       steps: {
         submit: async (ctx) => {
           ctx.log('Document submitted for review');
@@ -279,11 +245,10 @@ describe('Human-in-the-loop approval workflows', () => {
           return { managerApproved: ctx.context.managerApproved };
         },
       },
-      context: (input: { document: string }) => ({
+      context: (input) => ({
         document: input.document,
         managerApproved: false,
       }),
-      autoExecute: false,
     });
 
     // Start workflow
@@ -307,12 +272,10 @@ describe('Human-in-the-loop approval workflows', () => {
     // Should be done
     expect(result.status).toBe('done');
     expect(result.context.managerApproved).toBe(true);
-
-    wf.shutdown();
   });
 
   it('should handle rejection at any approval stage', async () => {
-    const wf = createWorkflow('rejection-flow', {
+    const wf = env.workflow('rejection-flow', {
       steps: {
         review: async (ctx) => {
           return ctx.wait('Awaiting review');
@@ -326,7 +289,6 @@ describe('Human-in-the-loop approval workflows', () => {
           return { processed: true };
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -336,11 +298,9 @@ describe('Human-in-the-loop approval workflows', () => {
     const result = await wf.resume(run._id, { approved: false });
 
     // Should continue to process step
-    expect(result.status).toBe('done') ;
+    expect(result.status).toBe('done');
     const processStep = result.steps.find((s) => s.stepId === 'process');
     expect(processStep?.output).toEqual({ rejected: true });
-
-    wf.shutdown();
   });
 });
 
@@ -349,21 +309,17 @@ describe('Human-in-the-loop approval workflows', () => {
 // ============================================================================
 
 describe('Checkpoint-based batch processing (crash-safe)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should process items in batches and checkpoint progress', async () => {
     const processedItems: string[] = [];
 
-    const wf = createWorkflow<{ items: string[] }>('batch-checkpoint', {
+    const wf = env.workflow<{ items: string[] }, { items: string[] }>('batch-checkpoint', {
       steps: {
         process: async (ctx) => {
           const checkpoint = ctx.getCheckpoint<{ lastIndex: number }>() ?? { lastIndex: -1 };
           const items = ctx.context.items;
 
           for (let i = checkpoint.lastIndex + 1; i < items.length; i++) {
-            processedItems.push(items[i]);
+            processedItems.push(items[i] as string);
             await ctx.checkpoint<{ lastIndex: number }>({ lastIndex: i });
             await ctx.heartbeat();
           }
@@ -371,8 +327,7 @@ describe('Checkpoint-based batch processing (crash-safe)', () => {
           return { total: items.length };
         },
       },
-      context: (input: { items: string[] }) => ({ items: input.items }),
-      autoExecute: false,
+      context: (input) => ({ items: input.items }),
     });
 
     const items = Array.from({ length: 20 }, (_, i) => `item-${i}`);
@@ -382,8 +337,6 @@ describe('Checkpoint-based batch processing (crash-safe)', () => {
     expect(result.status).toBe('done');
     expect(processedItems).toHaveLength(20);
     expect(result.output).toEqual({ total: 20 });
-
-    wf.shutdown();
   });
 });
 
@@ -392,15 +345,11 @@ describe('Checkpoint-based batch processing (crash-safe)', () => {
 // ============================================================================
 
 describe('Event-driven agent monitoring', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should emit events for each step transition — trackable externally', async () => {
-    const timeline: Array<{ event: string; stepId?: string; ts: number }> = [];
+    const timeline: Array<{ event: string; stepId: string | undefined; ts: number }> = [];
     const start = Date.now();
 
-    const wf = createWorkflow('monitored-agent', {
+    const wf = env.workflow('monitored-agent', {
       steps: {
         plan: async (ctx) => {
           ctx.log('Planning');
@@ -414,51 +363,46 @@ describe('Event-driven agent monitoring', () => {
           return { answer: 'Done' };
         },
       },
-      autoExecute: false,
     });
 
     const unsub = createEventSink(
       wf.container.eventBus,
       {
-        events: [
-          'step:started',
-          'step:completed',
-          'workflow:started',
-          'workflow:completed',
-        ],
+        events: ['step:started', 'step:completed', 'workflow:started', 'workflow:completed'],
       },
-      (event, payload: any) => {
+      (event, payload) => {
         timeline.push({
           event,
-          stepId: payload.stepId,
+          stepId: (payload as { stepId?: string }).stepId,
           ts: Date.now() - start,
         });
       },
     );
 
-    const run = await wf.start({});
-    await wf.execute(run._id);
+    try {
+      const run = await wf.start({});
+      await wf.execute(run._id);
 
-    // Verify complete timeline
-    const events = timeline.map((t) => t.event);
-    expect(events).toContain('workflow:started');
-    expect(events).toContain('step:started');
-    expect(events).toContain('step:completed');
-    expect(events).toContain('workflow:completed');
+      // Verify complete timeline
+      const events = timeline.map((t) => t.event);
+      expect(events).toContain('workflow:started');
+      expect(events).toContain('step:started');
+      expect(events).toContain('step:completed');
+      expect(events).toContain('workflow:completed');
 
-    // Step events should have stepIds
-    const stepEvents = timeline.filter((t) => t.stepId);
-    const stepIds = [...new Set(stepEvents.map((t) => t.stepId))];
-    expect(stepIds).toContain('plan');
-    expect(stepIds).toContain('search');
-    expect(stepIds).toContain('respond');
+      // Step events should have stepIds
+      const stepEvents = timeline.filter((t) => t.stepId);
+      const stepIds = [...new Set(stepEvents.map((t) => t.stepId))];
+      expect(stepIds).toContain('plan');
+      expect(stepIds).toContain('search');
+      expect(stepIds).toContain('respond');
 
-    // Timeline should be monotonically increasing
-    for (let i = 1; i < timeline.length; i++) {
-      expect(timeline[i].ts).toBeGreaterThanOrEqual(timeline[i - 1].ts);
+      // Timeline should be monotonically increasing
+      for (let i = 1; i < timeline.length; i++) {
+        expect(timeline[i]?.ts).toBeGreaterThanOrEqual(timeline[i - 1]?.ts ?? 0);
+      }
+    } finally {
+      unsub();
     }
-
-    unsub();
-    wf.shutdown();
   });
 });

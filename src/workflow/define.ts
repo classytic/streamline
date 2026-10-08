@@ -139,6 +139,11 @@ export interface StepConfig<
    * Compensation retry backoff strategy. @default 'exponential'
    */
   compensateRetryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+  /**
+   * Max ms for ONE compensation attempt. On expiry `ctx.signal` aborts and the
+   * attempt counts as failed (retried within `compensateRetries`). No default.
+   */
+  compensateTimeout?: number;
 
   /**
    * Opt-in per-step versioned output history (ring buffer).
@@ -527,6 +532,13 @@ export interface WorkflowConfig<TContext, TInput = unknown, TOutputs = Record<st
     | null
     | undefined
     | Promise<Partial<import('../core/types.js').WorkflowRun<unknown>> | null | undefined>;
+
+  /**
+   * Which pinned versions this engine may run when the original-version
+   * engine is not registered and `migrateRun` declined. See
+   * `WorkflowEngineOptions.versionPolicy`. Default `'compatible'`.
+   */
+  versionPolicy?: 'compatible' | 'strict' | 'any';
 }
 
 /** Options for `Workflow.start()` */
@@ -603,6 +615,19 @@ export interface Workflow<TContext, TInput = unknown> {
     runId: string,
     options?: { reason?: string } & ControlOptions,
   ) => Promise<WorkflowRun<TContext>>;
+  /**
+   * Durable signal for `ctx.waitFor(name)`. Never lost to timing: delivered now
+   * when the run waits on `name`, otherwise queued in the run's inbox until the
+   * next `waitFor(name)` — across restarts. At most once per signal; pass
+   * `signalId` to make retried sends idempotent while pending. Tenant-scoped.
+   * (Bus events via `eventBus.emit` stay fire-and-forget.)
+   */
+  signal: (
+    runId: string,
+    name: string,
+    data?: unknown,
+    options?: { signalId?: string } & ControlOptions,
+  ) => Promise<{ status: 'delivered' | 'queued' | 'duplicate'; run: WorkflowRun<TContext> }>;
   /** Operator-resume a paused run from the same step (v2.7). Symmetric with `pause`. Tenant-scoped. */
   resumeOperator: (
     runId: string,
@@ -844,6 +869,7 @@ export function createWorkflow<
       retries?: number;
       retryDelay?: number;
       retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+      timeout?: number;
     }
   > = {};
   const steps: Step[] = stepIds.map((stepId) => {
@@ -863,15 +889,23 @@ export function createWorkflow<
           entry.onCompensate as StepHandler<unknown, unknown>,
         );
         compensationHandlers[stepId] = entry.onCompensate;
+        validateRetryConfig(
+          entry.compensateRetries,
+          entry.compensateTimeout,
+          entry.compensateRetryDelay,
+          entry.compensateRetryBackoff,
+        );
         const cfg: {
           retries?: number;
           retryDelay?: number;
           retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+          timeout?: number;
         } = {};
         if (entry.compensateRetries !== undefined) cfg.retries = entry.compensateRetries;
         if (entry.compensateRetryDelay !== undefined) cfg.retryDelay = entry.compensateRetryDelay;
         if (entry.compensateRetryBackoff !== undefined)
           cfg.retryBackoff = entry.compensateRetryBackoff;
+        if (entry.compensateTimeout !== undefined) cfg.timeout = entry.compensateTimeout;
         if (Object.keys(cfg).length > 0) compensationConfigs[stepId] = cfg;
       }
       return toStepDef(stepId, entry);
@@ -903,6 +937,7 @@ export function createWorkflow<
         : undefined,
     ...(Object.keys(compensationConfigs).length > 0 && { compensationConfigs }),
     ...(config.migrateRun !== undefined && { migrateRun: config.migrateRun }),
+    ...(config.versionPolicy !== undefined && { versionPolicy: config.versionPolicy }),
     ...(config.scheduler !== undefined && { scheduler: config.scheduler }),
     ...(config.maxStepLogs !== undefined && { maxStepLogs: config.maxStepLogs }),
     ...(config.maxPayloadBytes !== undefined && { maxPayloadBytes: config.maxPayloadBytes }),
@@ -1231,10 +1266,15 @@ export function createWorkflow<
     };
 
     container.eventBus.on('workflow:failed', handler);
-    return () => {
+    const off = () => {
       container.eventBus.off('workflow:failed', handler);
+      failureBindings.delete(off);
     };
+    failureBindings.add(off);
+    return off;
   };
+  /** Live `bindFailureTo` subscriptions — `shutdown()` removes any still bound. */
+  const failureBindings = new Set<() => void>();
 
   return {
     start,
@@ -1266,6 +1306,15 @@ export function createWorkflow<
       await engine.assertOwnership(runId, options);
       return engine.resumeOperator(runId, options);
     },
+    signal: async (runId, name, data, options) => {
+      await engine.assertOwnership(runId, options);
+      return engine.signal(
+        runId,
+        name,
+        data,
+        options?.signalId !== undefined ? { signalId: options.signalId } : {},
+      );
+    },
     rewindTo: async (runId, stepId, control) => {
       await engine.assertOwnership(runId, control);
       return engine.rewindTo(runId, stepId);
@@ -1276,6 +1325,9 @@ export function createWorkflow<
       if (config.trigger?.event && triggerListener) {
         container.eventBus.off(config.trigger.event, triggerListener);
       }
+      // …and every `bindFailureTo` it made: they outlived the workflow before,
+      // accumulating on a shared bus across restarts/redefinitions.
+      for (const off of [...failureBindings]) off();
       engine.shutdown();
     },
     definition,

@@ -17,7 +17,8 @@
  *     persists the run, the counter is +1 with no corresponding run.
  *   - The `WorkflowConcurrencyCounterRepository.reconcile()` admin
  *     method re-counts active runs per bucket and resets the counter to
- *     the truth. Run from a daily cron or on-demand.
+ *     the truth, conditional on `rev` so live claims/releases are never
+ *     overwritten. Run from a cron or on-demand.
  *   - Bounded by parallelism × MTBF; in practice negligible.
  */
 
@@ -39,6 +40,12 @@ export interface WorkflowConcurrencyCounter {
   createdAt: Date;
   /** Last claim or release. */
   updatedAt: Date;
+  /**
+   * Bumped by every claim and release. `reconcile()` writes its recount only
+   * if `rev` is unchanged since it read the counter, so a concurrent claim or
+   * release is never overwritten. Absent on counters created before it existed.
+   */
+  rev?: number;
 }
 
 /**
@@ -55,6 +62,7 @@ export function buildWorkflowConcurrencyCounterSchema(): Schema<WorkflowConcurre
       limit: { type: Number, required: true },
       createdAt: { type: Date, required: true },
       updatedAt: { type: Date, required: true },
+      rev: { type: Number, required: false },
     },
     {
       collection: 'workflow_concurrency_counters',

@@ -7,92 +7,62 @@
  * 3. Scatter concurrency and limits documentation
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createContainer,
-  WorkflowRunModel,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // 1. Version Mismatch Detection
 // ============================================================================
 
 describe('Version mismatch detection', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should fail gracefully with VERSION_MISMATCH when step was deleted', async () => {
-    const container = createContainer();
-
     // v1: has 3 steps
-    const workflowV1 = createWorkflow('versioned-pipeline', {
+    const workflowV1 = env.workflow('versioned-pipeline', {
       steps: {
         step1: async () => 'done',
         stepOld: async () => 'old-step',
         step3: async () => 'final',
       },
-      container,
-      autoExecute: false,
     });
 
     // Start a workflow but DON'T execute — manually set currentStepId to stepOld
     const run = await workflowV1.start({});
 
-    // Simulate v1 run paused at stepOld
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      { $set: { currentStepId: 'stepOld', status: 'running' } }
-    );
+    // Simulate v1 run paused at stepOld (cache-safe: the engine re-reads from DB)
+    await env.runs.update(run._id, { currentStepId: 'stepOld', status: 'running' });
 
     workflowV1.shutdown();
 
-    // Simulate v2 deployment: recreate workflow WITHOUT stepOld
-    const workflowV2 = createWorkflow('versioned-pipeline', {
+    // Simulate v2 deployment: recreate workflow (same id) WITHOUT stepOld
+    const workflowV2 = env.redefine(workflowV1, {
       steps: {
         step1: async () => 'done',
         // stepOld DELETED
         step3: async () => 'final',
       },
       version: '2.0.0',
-      container,
-      autoExecute: false,
+      // A major bump parks by default; opt into running it here to exercise
+      // the step-not-found safety net underneath.
+      versionPolicy: 'any',
     });
-
-    // Invalidate cache so engine reads from DB
-    container.cache.delete(run._id);
 
     // Execute — should hit VERSION_MISMATCH because currentStepId='stepOld' doesn't exist in v2
     const result = await workflowV2.execute(run._id);
 
     expect(result.status).toBe('failed');
     expect(result.error?.code).toBe('VERSION_MISMATCH');
-
-    workflowV2.shutdown();
   });
 
   it('should succeed when step names match across versions', async () => {
-    const container = createContainer();
-
-    const workflowV1 = createWorkflow('compatible-pipeline', {
+    const workflowV1 = env.workflow('compatible-pipeline', {
       steps: {
         validate: async () => ({ valid: true }),
         process: async (ctx) => ctx.wait('approval'),
         complete: async () => 'done',
       },
       version: '1.0.0',
-      container,
-      autoExecute: false,
     });
 
     const run = await workflowV1.start({});
@@ -101,30 +71,23 @@ describe('Version mismatch detection', () => {
 
     workflowV1.shutdown();
 
-    // v2: same step names but different implementation
-    const workflowV2 = createWorkflow('compatible-pipeline', {
+    // v1.1: same step names, compatible (same-major) implementation change
+    const workflowV2 = env.redefine(workflowV1, {
       steps: {
         validate: async () => ({ valid: true, v2: true }),
         process: async (ctx) => ctx.wait('approval'),
         complete: async () => 'done-v2',
       },
-      version: '2.0.0',
-      container,
-      autoExecute: false,
+      version: '1.1.0',
     });
 
-    // Resume should work — step names are compatible
+    // Resume should work — same major under the default 'compatible' policy
     await workflowV2.resume(run._id, { approved: true });
 
-    await waitUntil(async () => {
-      const r = await workflowV2.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
+    await env.until(run._id, 'done');
 
     const final = await workflowV2.get(run._id);
     expect(final?.status).toBe('done');
-
-    workflowV2.shutdown();
   });
 });
 
@@ -133,14 +96,10 @@ describe('Version mismatch detection', () => {
 // ============================================================================
 
 describe('Saga compensation (rollback)', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should run compensation handlers in reverse when workflow fails', async () => {
     const compensated: string[] = [];
 
-    const workflow = createWorkflow('saga-rollback', {
+    const workflow = env.workflow('saga-rollback', {
       steps: {
         chargeCard: {
           handler: async () => ({ chargeId: 'ch_123' }),
@@ -163,7 +122,6 @@ describe('Saga compensation (rollback)', () => {
           retries: 1, // Fail immediately
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -176,38 +134,42 @@ describe('Saga compensation (rollback)', () => {
     expect(result.status).toBe('compensated');
 
     // Compensations should run in reverse: provisionServer first, then chargeCard
-    expect(compensated).toEqual([
-      'deprovision:srv_456',
-      'refund:ch_123',
-    ]);
-
-    workflow.shutdown();
+    expect(compensated).toEqual(['deprovision:srv_456', 'refund:ch_123']);
   });
 
   it('should only compensate completed steps, not pending or failed ones', async () => {
     const compensated: string[] = [];
 
-    const workflow = createWorkflow('saga-partial', {
+    const workflow = env.workflow('saga-partial', {
       steps: {
         step1: {
           handler: async () => 'ok',
-          onCompensate: async () => { compensated.push('step1'); },
+          onCompensate: async () => {
+            compensated.push('step1');
+          },
         },
         step2: {
           handler: async () => 'ok',
-          onCompensate: async () => { compensated.push('step2'); },
+          onCompensate: async () => {
+            compensated.push('step2');
+          },
         },
         step3: {
-          handler: async () => { throw new Error('fail'); },
+          handler: async () => {
+            throw new Error('fail');
+          },
           retries: 1,
-          onCompensate: async () => { compensated.push('step3-should-not-run'); },
+          onCompensate: async () => {
+            compensated.push('step3-should-not-run');
+          },
         },
         step4: {
           handler: async () => 'should-not-reach',
-          onCompensate: async () => { compensated.push('step4-should-not-run'); },
+          onCompensate: async () => {
+            compensated.push('step4-should-not-run');
+          },
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -215,67 +177,73 @@ describe('Saga compensation (rollback)', () => {
 
     // step3 failed, step4 never ran → only step1 and step2 compensated (reverse)
     expect(compensated).toEqual(['step2', 'step1']);
-
-    workflow.shutdown();
   });
 
   it('should continue compensating even if one compensation handler fails', async () => {
     const compensated: string[] = [];
     const errors: string[] = [];
-    const container = createContainer();
 
-    container.eventBus.on('engine:error', (payload) => {
+    // The env's container outlives this test — detach the listener after.
+    const onEngineError = (payload: { context: string }) => {
       if (payload.context.startsWith('compensation-')) {
         errors.push(payload.context);
       }
-    });
+    };
+    env.container.eventBus.on('engine:error', onEngineError);
 
-    const workflow = createWorkflow('saga-compensation-error', {
-      steps: {
-        step1: {
-          handler: async () => 'ok',
-          onCompensate: async () => { compensated.push('step1'); },
-        },
-        step2: {
-          handler: async () => 'ok',
-          onCompensate: async () => {
-            throw new Error('compensation failed');
+    try {
+      const workflow = env.workflow('saga-compensation-error', {
+        steps: {
+          step1: {
+            handler: async () => 'ok',
+            onCompensate: async () => {
+              compensated.push('step1');
+            },
+          },
+          step2: {
+            handler: async () => 'ok',
+            onCompensate: async () => {
+              throw new Error('compensation failed');
+            },
+          },
+          step3: {
+            handler: async () => {
+              throw new Error('fail');
+            },
+            retries: 1,
           },
         },
-        step3: {
-          handler: async () => { throw new Error('fail'); },
-          retries: 1,
-        },
-      },
-      container,
-      autoExecute: false,
-    });
+      });
 
-    const run = await workflow.start({});
-    await workflow.execute(run._id);
+      const run = await workflow.start({});
+      await workflow.execute(run._id);
 
-    // step2 compensation fails, but step1 compensation still runs
-    expect(compensated).toEqual(['step1']);
-    expect(errors).toContain('compensation-step2');
-
-    workflow.shutdown();
+      // step2 compensation fails, but step1 compensation still runs
+      expect(compensated).toEqual(['step1']);
+      expect(errors).toContain('compensation-step2');
+    } finally {
+      env.container.eventBus.off('engine:error', onEngineError);
+    }
   });
 
   it('should not run compensation when workflow succeeds', async () => {
     const compensated: string[] = [];
 
-    const workflow = createWorkflow('saga-success', {
+    const workflow = env.workflow('saga-success', {
       steps: {
         step1: {
           handler: async () => 'ok',
-          onCompensate: async () => { compensated.push('step1'); },
+          onCompensate: async () => {
+            compensated.push('step1');
+          },
         },
         step2: {
           handler: async () => 'ok',
-          onCompensate: async () => { compensated.push('step2'); },
+          onCompensate: async () => {
+            compensated.push('step2');
+          },
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -283,8 +251,6 @@ describe('Saga compensation (rollback)', () => {
 
     expect(result.status).toBe('done');
     expect(compensated).toEqual([]); // No compensation on success
-
-    workflow.shutdown();
   });
 });
 
@@ -293,15 +259,11 @@ describe('Saga compensation (rollback)', () => {
 // ============================================================================
 
 describe('Scatter concurrency safety', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should limit concurrent scatter tasks to prevent OOM', async () => {
     let peak = 0;
     let active = 0;
 
-    const workflow = createWorkflow('scatter-oom-guard', {
+    const workflow = env.workflow('scatter-oom-guard', {
       steps: {
         heavyWork: async (ctx) => {
           // 20 tasks but only 3 concurrent — prevents OOM
@@ -319,7 +281,6 @@ describe('Scatter concurrency safety', () => {
           return ctx.scatter(tasks, { concurrency: 3 });
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -328,12 +289,10 @@ describe('Scatter concurrency safety', () => {
     expect(result.status).toBe('done');
     expect(peak).toBeLessThanOrEqual(3);
     expect(Object.keys(result.output as Record<string, string>)).toHaveLength(20);
-
-    workflow.shutdown();
   });
 
   it('should handle scatter with single task', async () => {
-    const workflow = createWorkflow('scatter-single', {
+    const workflow = env.workflow('scatter-single', {
       steps: {
         single: async (ctx) => {
           return ctx.scatter({
@@ -341,7 +300,6 @@ describe('Scatter concurrency safety', () => {
           });
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -349,7 +307,5 @@ describe('Scatter concurrency safety', () => {
 
     expect(result.status).toBe('done');
     expect(result.output).toEqual({ only: 42 });
-
-    workflow.shutdown();
   });
 });

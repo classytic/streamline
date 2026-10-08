@@ -25,39 +25,20 @@ import { makeWaitTimeout } from '../../src/features/wait-resolution.js';
 import {
   cancelHook,
   createHook,
-  createWorkflow,
   getWaitResolution,
   InvalidStateError,
   resumeHook,
 } from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let n = 0;
-const uid = (p: string) => `${p}-${Date.now()}-${++n}`;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const env = useStreamlineEnv();
 
 /** Observable: how many times each run's post-wait `decide` step executed. */
 const decideRuns = new Map<string, number>();
 
-async function waitForStatus(
-  wf: { get: (id: string) => Promise<{ status: string } | null> },
-  runId: string,
-  statuses: string[],
-  timeoutMs = 5000,
-): Promise<{ status: string } & Record<string, unknown>> {
-  const want = new Set(statuses);
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const r = (await wf.get(runId)) as ({ status: string } & Record<string, unknown>) | null;
-    if (r && want.has(r.status)) return r;
-    await sleep(20);
-  }
-  throw new Error(`run ${runId} did not reach [${statuses}] within ${timeoutMs}ms`);
-}
-
 type DecideOut = { kind: string; reason?: string | null };
-const decideOutput = (run: { steps?: Array<{ stepId: string; output?: unknown }> }) =>
-  run.steps?.find((s) => s.stepId === 'decide')?.output as DecideOut;
+const decideOutput = (run: { steps?: Array<{ stepId: string; output?: unknown }> } | null) =>
+  run?.steps?.find((s) => s.stepId === 'decide')?.output as DecideOut;
 
 /**
  * Flow with a deterministic token and a high poll interval — these tests drive
@@ -65,8 +46,8 @@ const decideOutput = (run: { steps?: Array<{ stepId: string; output?: unknown }>
  * No `expiresAt` is set on the wait, so the scheduler's expiry sweep matches
  * nothing; we simulate expiry by calling `engine.resume(runId, makeWaitTimeout())`.
  */
-function flow(wfId: string) {
-  return createWorkflow(wfId, {
+function flow() {
+  return env.workflow('inv', {
     steps: {
       request: async (ctx) => {
         const hook = createHook(ctx, 'approval', { token: `${ctx.runId}:approve` });
@@ -81,6 +62,7 @@ function flow(wfId: string) {
         };
       },
     },
+    autoExecute: true,
     // Far higher than any test runtime — the manual resume drives completion,
     // not the poll loop, so nothing here races our explicit calls.
     scheduler: { basePollInterval: 60_000, minPollInterval: 60_000, maxPollInterval: 60_000 },
@@ -88,21 +70,19 @@ function flow(wfId: string) {
 }
 
 describe('wait-resolution invariants (race-safety / at-most-once)', () => {
-  useTestDb();
-
   it('INV-1: external resume racing the expiry resume advances exactly once, no corruption', async () => {
-    const wf = flow(uid('inv1'));
+    const wf = flow();
     const run = await wf.start({});
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
     const token = `${run._id}:approve`;
 
     // True race: external answer vs the scheduler's expiry operation.
     const results = await Promise.allSettled([
-      resumeHook(token, { approved: true }),
+      resumeHook(token, { approved: true }, { container: env.container }),
       wf.engine.resume(run._id, makeWaitTimeout()),
     ]);
 
-    const final = await waitForStatus(wf, run._id, ['done']);
+    const final = await env.until(run._id, 'done');
 
     // The CAS picks one winner — `decide` runs exactly once (no double-execute).
     expect(decideRuns.get(run._id)).toBe(1);
@@ -110,18 +90,16 @@ describe('wait-resolution invariants (race-safety / at-most-once)', () => {
     expect(['answered', 'timeout']).toContain(decideOutput(final).kind);
     // At least one operation observably succeeded.
     expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
-
-    wf.shutdown();
   });
 
   it('INV-2: external resume wins → a later expiry resume is a rejected no-op (payload preserved)', async () => {
-    const wf = flow(uid('inv2'));
+    const wf = flow();
     const run = await wf.start({});
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
     const token = `${run._id}:approve`;
 
-    await resumeHook(token, { approved: true });
-    const afterResume = await waitForStatus(wf, run._id, ['done']);
+    await resumeHook(token, { approved: true }, { container: env.container });
+    const afterResume = await env.until(run._id, 'done');
     expect(decideOutput(afterResume).kind).toBe('answered');
 
     // The expiry resume the scheduler would attempt is rejected on a settled run.
@@ -132,39 +110,37 @@ describe('wait-resolution invariants (race-safety / at-most-once)', () => {
     // No double-execute, payload not overwritten by the late timeout.
     expect(decideRuns.get(run._id)).toBe(1);
     const stable = await wf.get(run._id);
-    expect(decideOutput(stable as never).kind).toBe('answered');
-
-    wf.shutdown();
+    expect(decideOutput(stable).kind).toBe('answered');
   });
 
   it('INV-3: expiry wins → a later external resumeHook is rejected (timeout preserved)', async () => {
-    const wf = flow(uid('inv3'));
+    const wf = flow();
     const run = await wf.start({});
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
     const token = `${run._id}:approve`;
 
     await wf.engine.resume(run._id, makeWaitTimeout());
-    const afterExpiry = await waitForStatus(wf, run._id, ['done']);
+    const afterExpiry = await env.until(run._id, 'done');
     expect(decideOutput(afterExpiry).kind).toBe('timeout');
 
     // The wait is already resolved — an external answer is rejected.
-    await expect(resumeHook(token, { approved: true })).rejects.toBeTruthy();
+    await expect(
+      resumeHook(token, { approved: true }, { container: env.container }),
+    ).rejects.toBeTruthy();
 
     expect(decideRuns.get(run._id)).toBe(1);
     const stable = await wf.get(run._id);
-    expect(decideOutput(stable as never).kind).toBe('timeout');
-
-    wf.shutdown();
+    expect(decideOutput(stable).kind).toBe('timeout');
   });
 
   it('INV-4: cancelHook withdraws the wait (run → done, not cancelled); double cancel rejected', async () => {
-    const wf = flow(uid('inv4'));
+    const wf = flow();
     const run = await wf.start({});
-    await waitForStatus(wf, run._id, ['waiting']);
+    await env.until(run._id, 'waiting');
     const token = `${run._id}:approve`;
 
-    await cancelHook(token, { reason: 'withdrawn' });
-    const final = await waitForStatus(wf, run._id, ['done']);
+    await cancelHook(token, { reason: 'withdrawn', container: env.container });
+    const final = await env.until(run._id, 'done');
 
     // The RUN proceeds to completion — cancel withdraws the wait, not the run.
     expect(final.status).toBe('done');
@@ -172,9 +148,9 @@ describe('wait-resolution invariants (race-safety / at-most-once)', () => {
     expect(decideRuns.get(run._id)).toBe(1);
 
     // A second cancel finds nothing to withdraw.
-    await expect(cancelHook(token, { reason: 'again' })).rejects.toBeTruthy();
+    await expect(
+      cancelHook(token, { reason: 'again', container: env.container }),
+    ).rejects.toBeTruthy();
     expect(decideRuns.get(run._id)).toBe(1);
-
-    wf.shutdown();
   });
 });

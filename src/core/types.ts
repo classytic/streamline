@@ -341,6 +341,14 @@ export interface StepState<TOutput = unknown> {
   stepId: string;
   status: StepStatus;
   attempts: number;
+  /**
+   * Ownership token of the attempt currently executing this step — stamped by
+   * the atomic claim, required by every write that attempt makes (state,
+   * heartbeat, checkpoint, retry, transition). Recovery clears it, so a
+   * superseded worker's late writes match nothing and it stops
+   * (`AttemptSupersededError`). Kept after `done` as a record of the attempt.
+   */
+  attemptId?: string | undefined;
   // Lifecycle fields carry `| undefined` (exactOptionalPropertyTypes): the
   // executor's retry/rewind paths deliberately CLEAR them by assigning
   // `undefined` in `Partial<StepState>` patches (mongoose drops
@@ -452,6 +460,16 @@ export interface RecurrencePattern {
   occurrences?: number;
 }
 
+/** One pending entry in a run's durable signal inbox. */
+export interface SignalEntry {
+  /** Caller-supplied `signalId` (dedupes pending duplicates) or a generated UUID. */
+  id: string;
+  /** Matches `ctx.waitFor(name)`. */
+  name: string;
+  data?: unknown;
+  at: Date;
+}
+
 export interface WorkflowRun<TContext = Record<string, unknown>> {
   _id: string;
   workflowId: string;
@@ -471,6 +489,27 @@ export interface WorkflowRun<TContext = Record<string, unknown>> {
   endedAt?: Date | undefined;
   lastHeartbeat?: Date; // For detecting stale/stuck running workflows
   paused?: boolean; // User-initiated pause - scheduler skips paused workflows
+  /**
+   * Why the run is paused — the operator's `pause(runId, { reason })`, or the
+   * engine parking a run whose pinned definition version is not runnable
+   * (`version-unavailable: …`, see `versionPolicy`). Cleared on resume.
+   */
+  pauseReason?: string | undefined;
+  /**
+   * Saga bookkeeping. `compensationDue` is written WITH the `failed` status
+   * when the engine has compensation handlers, so a crash before
+   * `failed → compensating` leaves a durable marker the scheduler sweeps.
+   * `compensationAttemptId` owns the rollback walk, as `StepState.attemptId`
+   * owns a step: every compensation write requires it, and recovery replaces it.
+   */
+  compensationDue?: boolean | undefined;
+  compensationAttemptId?: string | undefined;
+  /**
+   * Durable signal inbox — `signal(runId, name, data)` entries not yet consumed
+   * by a matching `ctx.waitFor(name)`. Delivery pulls the entry in the same
+   * atomic write that completes the wait.
+   */
+  signals?: SignalEntry[] | undefined;
   /** Timezone-aware scheduling metadata (optional - only for scheduled workflows) */
   scheduling?: SchedulingInfo;
   /**

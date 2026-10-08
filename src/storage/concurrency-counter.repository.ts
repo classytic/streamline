@@ -41,6 +41,9 @@ import { WorkflowConcurrencyCounterModel, WorkflowRunModel } from './models.js';
  */
 const SLOT_HOLDING_STATUSES = ['running', 'waiting', 'compensating'] as const;
 
+/** CAS retries before `reconcile` leaves a persistently busy bucket alone. */
+const RECONCILE_ATTEMPTS = 5;
+
 /** Connection-aware models for the concurrency counter (default: the eager singletons). */
 export interface ConcurrencyCounterConfig {
   /** Counter model to persist through. Default {@link WorkflowConcurrencyCounterModel}. */
@@ -94,7 +97,7 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
       const result = await this.findOneAndUpdate(
         { _id: id, count: { $lt: limit } },
         {
-          $inc: { count: 1 },
+          $inc: { count: 1, rev: 1 },
           $set: { updatedAt: now },
           $setOnInsert: { workflowId, concurrencyKey, limit, createdAt: now },
         },
@@ -111,7 +114,7 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
       if (this.isDuplicateKeyError(err)) {
         const retried = await this.findOneAndUpdate(
           { _id: id, count: { $lt: limit } },
-          { $inc: { count: 1 }, $set: { updatedAt: now } },
+          { $inc: { count: 1, rev: 1 }, $set: { updatedAt: now } },
           { returnDocument: 'after' },
         );
         return retried !== null;
@@ -129,7 +132,7 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
   async releaseSlot(id: string): Promise<void> {
     await this.findOneAndUpdate(
       { _id: id, count: { $gt: 0 } },
-      { $inc: { count: -1 }, $set: { updatedAt: new Date() } },
+      { $inc: { count: -1, rev: 1 }, $set: { updatedAt: new Date() } },
       { returnDocument: 'after' },
     );
   }
@@ -154,18 +157,27 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
    *   - `reconcile(workflowId)` — repair EVERY existing counter doc for the
    *     workflow; returns the SUM of the corrected counts.
    *
-   * Idempotent: re-running with no concurrent activity yields the same result
-   * and a correct counter is left unchanged. Small window (documented): a
-   * concurrent `claimSlot`/`releaseSlot` racing the recount-then-set can be
-   * over/under-written by ±1 until the next reconcile; run from a low-traffic
-   * cron or after confirmed worker crashes, when the bucket is quiescent.
+   * Safe to run on a live bucket:
+   *   - The write is a CAS on the counter's `rev` (bumped by every claim and
+   *     release): a claim/release landing between the read and the recount
+   *     fails the CAS and the bucket is re-read and recounted.
+   *   - A claim whose run is not persisted YET looks exactly like a leak. So
+   *     the counter is only LOWERED when its last claim/release is older than
+   *     `settleMs` (default 5s — claim→create takes milliseconds); raising is
+   *     always safe. A busy bucket keeps its count until a quiet moment.
+   * Idempotent: a correct counter is left unchanged.
    *
-   * @returns the corrected count (single bucket) or the summed corrected count
-   *   (whole workflow).
+   * @returns the bucket's count after reconciliation (single bucket) or the
+   *   sum across buckets (whole workflow).
    */
-  async reconcile(workflowId: string, concurrencyKey?: string): Promise<number> {
+  async reconcile(
+    workflowId: string,
+    concurrencyKey?: string,
+    options: { settleMs?: number } = {},
+  ): Promise<number> {
+    const settleMs = options.settleMs ?? 5000;
     if (concurrencyKey !== undefined) {
-      return this.reconcileBucket(workflowId, concurrencyKey);
+      return this.reconcileBucket(workflowId, concurrencyKey, settleMs);
     }
 
     // Whole-workflow: repair every existing counter bucket for this workflow.
@@ -178,38 +190,74 @@ export class WorkflowConcurrencyCounterRepository extends Repository<WorkflowCon
 
     let total = 0;
     for (const counter of counters) {
-      total += await this.reconcileBucket(workflowId, counter.concurrencyKey);
+      total += await this.reconcileBucket(workflowId, counter.concurrencyKey, settleMs);
     }
     return total;
   }
 
-  /** Recount one `(workflowId, key)` bucket and reset its counter to truth. */
-  private async reconcileBucket(workflowId: string, concurrencyKey: string): Promise<number> {
-    // Count the runs that actually still hold a slot. Query the run model
-    // directly (cross-tenant — the strict counter is a global gate, same
-    // rationale as the repository's no-tenant-plugin design above).
-    const trueCount = await this.runModel.countDocuments({
-      workflowId,
-      concurrencyKey,
-      status: { $in: SLOT_HOLDING_STATUSES },
-    });
-
+  /** Recount one `(workflowId, key)` bucket and CAS its counter to truth. */
+  private async reconcileBucket(
+    workflowId: string,
+    concurrencyKey: string,
+    settleMs: number,
+  ): Promise<number> {
     const id = makeCounterId(workflowId, concurrencyKey);
-    const now = new Date();
 
-    // Atomically set the counter to truth. Upsert so a bucket whose counter
-    // doc was lost (but which has active runs) is recreated; `$setOnInsert`
-    // backfills the immutable bootstrap fields only on creation.
-    await this.findOneAndUpdate(
-      { _id: id },
-      {
-        $set: { count: trueCount, updatedAt: now },
-        $setOnInsert: { workflowId, concurrencyKey, limit: trueCount, createdAt: now },
-      },
-      { upsert: true, returnDocument: 'after' },
-    );
+    for (let attempt = 0; attempt < RECONCILE_ATTEMPTS; attempt++) {
+      // Read the counter BEFORE counting runs: any claim/release after this
+      // read bumps `rev`, and the CAS below then refuses the stale recount.
+      const before = await this.getCounter(id);
 
-    return trueCount;
+      // Runs that actually still hold a slot. Cross-tenant on purpose — the
+      // strict counter is a global gate (see the no-tenant-plugin note above).
+      const trueCount = await this.runModel.countDocuments({
+        workflowId,
+        concurrencyKey,
+        status: { $in: SLOT_HOLDING_STATUSES },
+      });
+      const now = new Date();
+
+      if (!before) {
+        // Counter doc lost while runs are active: recreate it. A concurrent
+        // first claim may insert first (E11000) — re-read and go again.
+        try {
+          await this.create({
+            _id: id,
+            workflowId,
+            concurrencyKey,
+            count: trueCount,
+            limit: trueCount,
+            rev: 0,
+            createdAt: now,
+            updatedAt: now,
+          });
+          return trueCount;
+        } catch (err) {
+          if (this.isDuplicateKeyError(err)) continue;
+          throw err;
+        }
+      }
+
+      if (before.count === trueCount) return trueCount;
+      // A claim whose run is not persisted yet looks like a leak — only lower
+      // a counter that has been quiet for `settleMs`.
+      if (trueCount < before.count && now.getTime() - before.updatedAt.getTime() < settleMs) {
+        return before.count;
+      }
+
+      const written = await this.findOneAndUpdate(
+        { _id: id, rev: before.rev ?? { $exists: false } },
+        { $set: { count: trueCount, updatedAt: now }, $inc: { rev: 1 } },
+        { returnDocument: 'after' },
+      );
+      if (written) return trueCount;
+      // Lost to a live claim/release — re-read and recount.
+    }
+
+    // Persistently busy bucket: leave it to the live claims/releases (correct
+    // by construction) and the next reconcile.
+    const current = (await this.getCounter(id))?.count;
+    return current ?? 0;
   }
 }
 

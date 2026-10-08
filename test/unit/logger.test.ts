@@ -3,7 +3,7 @@
  * Tests centralized logger: levels, enable/disable, custom transport.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { configureStreamlineLogger, logger } from '../../src/utils/logger.js';
 
 describe('Logger', () => {

@@ -29,7 +29,11 @@ export function mockResolved<T>(value: T) {
  * Async callable that rejects the first `failCount` invocations then succeeds.
  * Useful for retry/recovery tests.
  */
-export function mockFlaky<T>(failCount: number, successValue: T, error: Error = new Error('flaky')) {
+export function mockFlaky<T>(
+  failCount: number,
+  successValue: T,
+  error: Error = new Error('flaky'),
+) {
   let calls = 0;
   return vi.fn().mockImplementation(async () => {
     calls += 1;

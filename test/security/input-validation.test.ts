@@ -6,22 +6,11 @@
  * other common attack vectors.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB } from '../utils/setup.js';
-import {
-  createWorkflow,
-  WorkflowRunModel,
-  createHook,
-  resumeHook,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { createHook, createWorkflow, resumeHook, type StepContext } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // Workflow/Step ID Validation
@@ -29,23 +18,23 @@ afterAll(async () => {
 
 describe('ID validation — reject malicious identifiers', () => {
   it('should reject workflow IDs with NoSQL operators', () => {
-    expect(() =>
-      createWorkflow('$gt', { steps: { a: async () => 1 } }),
-    ).toThrow('invalid characters');
+    expect(() => createWorkflow('$gt', { steps: { a: async () => 1 } })).toThrow(
+      'invalid characters',
+    );
 
-    expect(() =>
-      createWorkflow('{"$ne":""}', { steps: { a: async () => 1 } }),
-    ).toThrow('invalid characters');
+    expect(() => createWorkflow('{"$ne":""}', { steps: { a: async () => 1 } })).toThrow(
+      'invalid characters',
+    );
   });
 
   it('should reject workflow IDs with path traversal', () => {
-    expect(() =>
-      createWorkflow('../etc/passwd', { steps: { a: async () => 1 } }),
-    ).toThrow('invalid characters');
+    expect(() => createWorkflow('../etc/passwd', { steps: { a: async () => 1 } })).toThrow(
+      'invalid characters',
+    );
 
-    expect(() =>
-      createWorkflow('..%2f..%2f', { steps: { a: async () => 1 } }),
-    ).toThrow('invalid characters');
+    expect(() => createWorkflow('..%2f..%2f', { steps: { a: async () => 1 } })).toThrow(
+      'invalid characters',
+    );
   });
 
   it('should reject workflow IDs with script injection', () => {
@@ -55,32 +44,30 @@ describe('ID validation — reject malicious identifiers', () => {
   });
 
   it('should reject empty or whitespace-only IDs', () => {
-    expect(() =>
-      createWorkflow('', { steps: { a: async () => 1 } }),
-    ).toThrow();
+    expect(() => createWorkflow('', { steps: { a: async () => 1 } })).toThrow();
 
-    expect(() =>
-      createWorkflow('   ', { steps: { a: async () => 1 } }),
-    ).toThrow('invalid characters');
+    expect(() => createWorkflow('   ', { steps: { a: async () => 1 } })).toThrow(
+      'invalid characters',
+    );
   });
 
   it('should reject extremely long IDs (DoS vector)', () => {
     const longId = 'a'.repeat(200);
-    expect(() =>
-      createWorkflow(longId, { steps: { a: async () => 1 } }),
-    ).toThrow('too long');
+    expect(() => createWorkflow(longId, { steps: { a: async () => 1 } })).toThrow('too long');
   });
 
   it('should reject IDs with null bytes', () => {
-    expect(() =>
-      createWorkflow('valid\x00evil', { steps: { a: async () => 1 } }),
-    ).toThrow('invalid characters');
+    expect(() => createWorkflow('valid\x00evil', { steps: { a: async () => 1 } })).toThrow(
+      'invalid characters',
+    );
   });
 
   it('should accept valid IDs with hyphens and underscores', () => {
+    // The exact id matters here, so createWorkflow — bound to the env's container.
     const wf = createWorkflow('my-valid_id-123', {
       steps: { a: async () => 1 },
       autoExecute: false,
+      container: env.container,
     });
     expect(wf.definition.id).toBe('my-valid_id-123');
     wf.shutdown();
@@ -157,40 +144,32 @@ describe('Step configuration validation', () => {
 // ============================================================================
 
 describe('Context safety — prevent prototype pollution', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should safely handle __proto__ in context keys', async () => {
-    const wf = createWorkflow<Record<string, unknown>>('proto-test', {
+    const wf = env.workflow<Record<string, unknown>>('proto-test', {
       steps: {
         check: async (ctx) => {
           // Attempt to set __proto__ via context — should not pollute Object prototype
-          await ctx.set('__proto__' as any, { polluted: true });
+          await ctx.set('__proto__', { polluted: true });
           return { safe: true };
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     await wf.execute(run._id);
 
     // Object prototype should NOT be polluted
-    expect(({} as any).polluted).toBeUndefined();
-
-    wf.shutdown();
+    expect(Reflect.get({}, 'polluted')).toBeUndefined();
   });
 
   it('should safely handle constructor/prototype in input', async () => {
-    const wf = createWorkflow('constructor-test', {
+    const wf = env.workflow('constructor-test', {
       steps: {
         echo: async (ctx) => {
           return { received: typeof ctx.input };
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({
@@ -200,9 +179,7 @@ describe('Context safety — prevent prototype pollution', () => {
 
     const result = await wf.execute(run._id);
     expect(result.status).toBe('done');
-    expect(({} as any).isAdmin).toBeUndefined();
-
-    wf.shutdown();
+    expect(Reflect.get({}, 'isAdmin')).toBeUndefined();
   });
 });
 
@@ -211,12 +188,9 @@ describe('Context safety — prevent prototype pollution', () => {
 // ============================================================================
 
 describe('Hook token security', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should generate cryptographically random tokens', () => {
-    const mockCtx = { runId: 'run-1', stepId: 'step-1' } as any;
+    // createHook reads only runId/stepId from the context
+    const mockCtx = { runId: 'run-1', stepId: 'step-1' } as unknown as StepContext;
     const hook1 = createHook(mockCtx, 'test');
     const hook2 = createHook(mockCtx, 'test');
 
@@ -227,24 +201,23 @@ describe('Hook token security', () => {
   });
 
   it('should reject resume with empty token', async () => {
-    await expect(resumeHook('', { data: 1 })).rejects.toThrow();
+    await expect(resumeHook('', { data: 1 }, { container: env.container })).rejects.toThrow();
   });
 
   it('should reject resume with fabricated token for non-existent run', async () => {
     await expect(
-      resumeHook('fake-run-id:fake-step:deadbeef', { data: 1 }),
+      resumeHook('fake-run-id:fake-step:deadbeef', { data: 1 }, { container: env.container }),
     ).rejects.toThrow();
   });
 
   it('should reject resume with mismatched hook token', async () => {
-    const wf = createWorkflow('hook-security-test', {
+    const wf = env.workflow('hook-security-test', {
       steps: {
         wait_step: async (ctx) => {
           const hook = createHook(ctx, 'approval');
           return ctx.wait(hook.token, { hookToken: hook.token });
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -260,10 +233,8 @@ describe('Hook token security', () => {
     // Fabricate a token with the correct runId but wrong random part
     const fakeToken = `${run._id}:wait_step:0000000000000000deadbeef00000000`;
     await expect(
-      resumeHook(fakeToken, { approved: true }),
+      resumeHook(fakeToken, { approved: true }, { container: env.container }),
     ).rejects.toThrow('Invalid hook token');
-
-    wf.shutdown();
   });
 });
 
@@ -272,25 +243,21 @@ describe('Hook token security', () => {
 // ============================================================================
 
 describe('State transition integrity', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should prevent updating a cancelled workflow', async () => {
-    const wf = createWorkflow('cancel-guard-test', {
+    const wf = env.workflow('cancel-guard-test', {
       steps: {
         slow: async () => {
           await new Promise((r) => setTimeout(r, 5000));
           return 'should-not-reach';
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     // Start execution in background
     const execPromise = wf.execute(run._id).catch(() => {});
-    await new Promise((r) => setTimeout(r, 50));
+    // Wait until the slow step is actually executing
+    await env.until(run._id, (r) => r.steps[0]?.status === 'running');
 
     // Cancel
     const cancelled = await wf.cancel(run._id);
@@ -299,18 +266,15 @@ describe('State transition integrity', () => {
     await execPromise;
 
     // Direct DB check: should still be cancelled
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.status).toBe('cancelled');
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(doc?.status).toBe('cancelled');
   });
 
   it('should prevent resuming a non-waiting workflow', async () => {
-    const wf = createWorkflow('resume-guard-test', {
+    const wf = env.workflow('resume-guard-test', {
       steps: {
         fast: async () => 'done',
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -318,8 +282,6 @@ describe('State transition integrity', () => {
 
     // Workflow is done, not waiting — resume should fail
     await expect(wf.resume(run._id)).rejects.toThrow();
-
-    wf.shutdown();
   });
 });
 
@@ -328,27 +290,22 @@ describe('State transition integrity', () => {
 // ============================================================================
 
 describe('Multi-tenant data isolation', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should scope workflows by tenant via context', async () => {
     interface TenantCtx {
       tenantId: string;
       data: string;
     }
 
-    const wf = createWorkflow<TenantCtx>('tenant-scope-test', {
+    const wf = env.workflow<TenantCtx, { tenantId: string; data: string }>('tenant-scope-test', {
       steps: {
         process: async (ctx) => {
           return { tenantId: ctx.context.tenantId, processed: true };
         },
       },
-      context: (input: { tenantId: string; data: string }) => ({
+      context: (input) => ({
         tenantId: input.tenantId,
         data: input.data,
       }),
-      autoExecute: false,
     });
 
     // Create runs for two tenants
@@ -359,17 +316,15 @@ describe('Multi-tenant data isolation', () => {
     await wf.execute(tenant2Run._id);
 
     // Read from DB to verify data isolation
-    const doc1 = await WorkflowRunModel.findById(tenant1Run._id).lean();
-    const doc2 = await WorkflowRunModel.findById(tenant2Run._id).lean();
+    const ctx1 = (await env.runs.get(tenant1Run._id))?.context as TenantCtx | undefined;
+    const ctx2 = (await env.runs.get(tenant2Run._id))?.context as TenantCtx | undefined;
 
-    expect(doc1!.context.tenantId).toBe('tenant-A');
-    expect((doc1!.context as any).data).toBe('secret-A');
-    expect(doc2!.context.tenantId).toBe('tenant-B');
-    expect((doc2!.context as any).data).toBe('secret-B');
+    expect(ctx1?.tenantId).toBe('tenant-A');
+    expect(ctx1?.data).toBe('secret-A');
+    expect(ctx2?.tenantId).toBe('tenant-B');
+    expect(ctx2?.data).toBe('secret-B');
 
     // Cross-check: tenant A can't see tenant B's data
-    expect((doc1!.context as any).data).not.toBe('secret-B');
-
-    wf.shutdown();
+    expect(ctx1?.data).not.toBe('secret-B');
   });
 });

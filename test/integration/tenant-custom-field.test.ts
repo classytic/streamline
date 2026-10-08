@@ -7,32 +7,24 @@
  * accepts a `model` bound with the matching field, and refuses a custom field
  * WITHOUT one (no silent wrong-index).
  *
- * Uses a dedicated connection so the custom-field model doesn't clash with the
- * default `context.tenantId` model eagerly bound on `mongoose.connection`.
+ * The manual-model test binds on a database of its own (`useDb`) so the
+ * custom-field model doesn't clash with the default `context.tenantId` model
+ * the env's container binds on its connection.
  */
 
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import mongoose from 'mongoose';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   createContainer,
   createWorkflow,
   createWorkflowRepository,
   defineStreamlineModels,
 } from '../../src/index.js';
+import { createStreamlineTestEnv } from '../../src/testkit/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let mongo: MongoMemoryServer;
-let conn: mongoose.Connection;
+const env = useStreamlineEnv();
 
-beforeAll(async () => {
-  mongo = await MongoMemoryServer.create();
-  conn = await mongoose.createConnection(mongo.getUri()).asPromise();
-});
-
-afterAll(async () => {
-  await conn?.close();
-  await mongo?.stop();
-});
+const orgTenant = { tenantField: 'context.organizationId', required: true } as const;
 
 describe('custom tenant.tenantField', () => {
   it('WARNS on a custom tenantField without a matching model (idempotency not isolated)', () => {
@@ -40,9 +32,7 @@ describe('custom tenant.tenantField', () => {
     try {
       // Constructs fine (filtering/stamping still work) but warns that
       // idempotency keys won't be tenant-isolated without a matching model.
-      createWorkflowRepository({
-        tenant: { tenantField: 'context.organizationId', required: true },
-      });
+      createWorkflowRepository({ tenant: orgTenant });
       expect(warn).toHaveBeenCalledWith(
         expect.stringMatching(/idempotency keys will not be tenant-isolated/i),
       );
@@ -52,15 +42,14 @@ describe('custom tenant.tenantField', () => {
   });
 
   it('per-tenant idempotency holds on a CUSTOM field (context.organizationId)', async () => {
+    // A fresh model registry on the env's server: nothing bound here yet.
+    const conn = env.connection.useDb(`${env.connection.name}-custom-field`, { useCache: false });
     // Build a model whose compound idempotency index tracks context.organizationId.
-    const models = defineStreamlineModels({ tenantField: 'context.organizationId' }).bind(conn);
+    const models = defineStreamlineModels({ tenantField: orgTenant.tenantField }).bind(conn);
     await models.WorkflowRun.syncIndexes();
 
     const container = createContainer({
-      repository: {
-        tenant: { tenantField: 'context.organizationId', required: true },
-        model: models.WorkflowRun,
-      },
+      repository: { tenant: orgTenant, model: models.WorkflowRun },
     });
     const wf = createWorkflow<{ organizationId: string }, { organizationId: string }>(
       'iso-custom-field',
@@ -72,52 +61,54 @@ describe('custom tenant.tenantField', () => {
       },
     );
 
-    const key = 'invoice-7';
-    const a = await wf.start(
-      { organizationId: 'org-A' },
-      { tenantId: 'org-A', idempotencyKey: key },
-    );
-    // Different org, SAME key → no cross-tenant E11000 (compound index on organizationId).
-    const b = await wf.start(
-      { organizationId: 'org-B' },
-      { tenantId: 'org-B', idempotencyKey: key },
-    );
-    expect(b._id).not.toBe(a._id);
+    try {
+      const key = 'invoice-7';
+      const a = await wf.start(
+        { organizationId: 'org-A' },
+        { tenantId: 'org-A', idempotencyKey: key },
+      );
+      // Different org, SAME key → no cross-tenant E11000 (compound index on organizationId).
+      const b = await wf.start(
+        { organizationId: 'org-B' },
+        { tenantId: 'org-B', idempotencyKey: key },
+      );
+      expect(b._id).not.toBe(a._id);
 
-    // Same org + same key → idempotent.
-    const aAgain = await wf.start(
-      { organizationId: 'org-A' },
-      { tenantId: 'org-A', idempotencyKey: key },
-    );
-    expect(aAgain._id).toBe(a._id);
+      // Same org + same key → idempotent.
+      const aAgain = await wf.start(
+        { organizationId: 'org-A' },
+        { tenantId: 'org-A', idempotencyKey: key },
+      );
+      expect(aAgain._id).toBe(a._id);
 
-    // Cross-tenant control is still denied under the custom field.
-    expect(await wf.get(a._id, { tenantId: 'org-B' })).toBeNull();
-    expect((await wf.get(a._id, { tenantId: 'org-A' }))?._id).toBe(a._id);
-
-    wf.shutdown();
+      // Cross-tenant control is still denied under the custom field.
+      expect(await wf.get(a._id, { tenantId: 'org-B' })).toBeNull();
+      expect((await wf.get(a._id, { tenantId: 'org-A' }))?._id).toBe(a._id);
+    } finally {
+      wf.shutdown();
+      container.dispose();
+      await conn.dropDatabase();
+    }
   });
 
   it('createContainer({ connection }) auto-binds the field — no manual model, no warning', async () => {
-    const conn2 = await mongoose.createConnection(mongo.getUri()).asPromise();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Just a connection + tenantField — the env builds its container as
+    // `createContainer({ connection, repository: { tenant } })` and the
+    // container binds the correctly indexed model set itself (run + counter),
+    // no `repository.model` needed. It also runs `syncRetentionIndexes()`.
+    const orgEnv = await createStreamlineTestEnv({
+      uri: env.uri,
+      container: { repository: { tenant: orgTenant } },
+    });
     try {
-      // Just a connection + tenantField — the container binds the correctly
-      // indexed model set itself (run + counter), no `repository.model` needed.
-      const container = createContainer({
-        connection: conn2,
-        repository: { tenant: { tenantField: 'context.organizationId', required: true } },
-      });
-      await container.syncRetentionIndexes(); // builds indexes on conn2's collection
-      await container.repository.runModel.syncIndexes();
+      await orgEnv.container.repository.runModel.syncIndexes();
 
-      const wf = createWorkflow<{ organizationId: string }, { organizationId: string }>(
+      const wf = orgEnv.workflow<{ organizationId: string }, { organizationId: string }>(
         'iso-auto-conn',
         {
           steps: { work: async () => 'done' },
           context: (input) => ({ organizationId: input.organizationId }),
-          autoExecute: false,
-          container,
         },
       );
 
@@ -136,11 +127,9 @@ describe('custom tenant.tenantField', () => {
       expect(warn).not.toHaveBeenCalledWith(
         expect.stringMatching(/idempotency keys will not be tenant-isolated/i),
       );
-
-      wf.shutdown();
     } finally {
       warn.mockRestore();
-      await conn2.close();
+      await orgEnv.close();
     }
   });
 });

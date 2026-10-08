@@ -15,35 +15,33 @@
  * (`engine.resume(runId)`, the same one the scheduler's sweep calls).
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { createContainer, createWorkflow, WorkflowRunModel } from '../../src/index.js';
-import type { JoinResult, StepState, WorkflowRun } from '../../src/core/types.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB, waitUntil } from '../utils/setup.js';
+import { randomUUID } from 'node:crypto';
+import { describe, expect, it } from 'vitest';
+import type { JoinResult, StepState } from '../../src/core/types.js';
+import type { WorkflowLike } from '../../src/testkit/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(setupTestDB);
-afterAll(teardownTestDB);
-afterEach(cleanupTestDB);
-
-let wfCounter = 0;
-const uniqueId = (prefix: string) => `${prefix}-${Date.now()}-${++wfCounter}`;
+const env = useStreamlineEnv();
 
 /**
  * Persist a parent run that is `waiting` on a branchJoin step. `branches` may
  * carry `childRunId` (already-started, post-crash shape) or omit it (never
  * started). `nextReconcileAt` is in the past so the sweep considers it due.
+ * Returns the run id.
  */
-async function persistOrphanedJoinParent(opts: {
-  parentRunId: string;
-  parentWorkflowId: string;
-  allStepIds: string[];
-  stepId: string;
-  branches: Array<{ key: string; workflowId: string; input: unknown; childRunId?: string }>;
-  policy?: 'all' | 'any' | 'race' | 'allSettled';
-  cancelLosers?: boolean;
-}): Promise<void> {
+async function persistOrphanedJoinParent(
+  parent: WorkflowLike,
+  opts: {
+    stepId: string;
+    branches: Array<{ key: string; workflowId: string; input: unknown; childRunId?: string }>;
+    policy?: 'all' | 'any' | 'race' | 'allSettled';
+    cancelLosers?: boolean;
+  },
+): Promise<string> {
   const now = new Date();
-  const steps: StepState[] = opts.allStepIds.map((id) => {
+  // The wait data names its own parent run, so the id is chosen up front.
+  const parentRunId = `pj-run-${randomUUID()}`;
+  const steps: StepState[] = parent.engine.definition.steps.map(({ id }) => {
     if (id === opts.stepId) {
       return {
         stepId: id,
@@ -58,54 +56,93 @@ async function persistOrphanedJoinParent(opts: {
             branches: opts.branches,
             policy: opts.policy ?? 'all',
             cancelLosers: opts.cancelLosers ?? true,
-            parentRunId: opts.parentRunId,
+            parentRunId,
             parentStepId: opts.stepId,
           },
         },
       } as StepState;
     }
-    return { stepId: id, status: 'pending', attempts: 0 } as StepState;
+    return { stepId: id, status: 'pending', attempts: 0 };
   });
 
-  await WorkflowRunModel.create({
-    _id: opts.parentRunId,
-    workflowId: opts.parentWorkflowId,
+  await env.runs.insert(parent, {
+    _id: parentRunId,
     status: 'waiting',
     steps,
     currentStepId: opts.stepId,
-    context: {},
-    input: {},
-    createdAt: now,
-    updatedAt: now,
     startedAt: now,
-  } as unknown as WorkflowRun);
+  });
+  return parentRunId;
 }
 
 describe('declarative parallel + durable join', () => {
-  it('runs branches CONCURRENTLY and joins all results in order (join:all happy path)', async () => {
-    const container = createContainer();
-    const branchWfId = uniqueId('pj-branch');
-    const parentWfId = uniqueId('pj-parent');
+  it('branch listeners never pile up on reconcile, and leave the bus when the join settles', async () => {
+    // Branches park on `go`, so the join stays unmet while we reconcile.
+    const branch = env.workflow('pj-gated', {
+      steps: { work: async (ctx) => ctx.waitFor('go') },
+      autoExecute: true,
+    });
+    const parent = env.workflow('pj-gated-parent', {
+      steps: {
+        fanout: async (ctx) =>
+          ctx.joinBranches(
+            [
+              { key: 'a', workflowId: branch.engine.definition.id, input: {} },
+              { key: 'b', workflowId: branch.engine.definition.id, input: {} },
+            ],
+            { policy: 'all' },
+          ),
+      },
+      autoExecute: true,
+    });
+    const bus = env.container.eventBus;
+    const baseline = bus.listenerCount('workflow:completed');
 
+    const run = await parent.start({});
+    const waiting = await env.until(run._id, (r) => {
+      const data = r.steps[0]?.waitingFor?.data as { branches?: Array<{ childRunId?: string }> };
+      return r.status === 'waiting' && (data?.branches ?? []).every((b) => b.childRunId);
+    });
+    const armed = bus.listenerCount('workflow:completed');
+    expect(armed - baseline).toBeGreaterThanOrEqual(2); // one per branch (+ the engine's own)
+
+    // Reconcile polls (the scheduler's branch-join sweep) while quorum is unmet:
+    // each used to re-arm a listener for EVERY branch.
+    for (let i = 0; i < 3; i++) await parent.engine.resume(run._id);
+    expect(bus.listenerCount('workflow:completed')).toBe(armed);
+
+    // Settle the join: every branch listener leaves the bus.
+    const joinData = waiting.steps[0]?.waitingFor?.data as {
+      branches: Array<{ childRunId: string }>;
+    };
+    const children = joinData.branches.map((b) => b.childRunId);
+    for (const id of children) await branch.signal(id, 'go', 'ok');
+    await env.until(run._id, 'done');
+    await env.eventually(() => expect(bus.listenerCount('workflow:completed')).toBe(baseline));
+  });
+
+  it('runs branches CONCURRENTLY and joins all results in order (join:all happy path)', async () => {
     const overlap = { firstStart: 0, lastStart: 0, firstEnd: Number.MAX_SAFE_INTEGER };
 
     // Branch child: records concurrency timing, sleeps, returns its input * 10.
-    const branch = createWorkflow(branchWfId, {
+    const branch = env.workflow('pj-branch', {
       steps: {
         work: async (ctx) => {
           const input = ctx.input as { n: number };
           const t = Date.now();
           if (!overlap.firstStart) overlap.firstStart = t;
           overlap.lastStart = t;
+          // Simulated work — the overlap measurement needs each branch to take time.
           await new Promise((r) => setTimeout(r, 300));
           overlap.firstEnd = Math.min(overlap.firstEnd, Date.now());
           return { value: input.n * 10 };
         },
       },
-      container,
+      autoExecute: true,
     });
+    const branchWfId = branch.engine.definition.id;
 
-    const parent = createWorkflow<{ joined?: JoinResult }>(parentWfId, {
+    const parent = env.workflow<{ joined?: JoinResult }>('pj-parent', {
       steps: {
         fanout: async (ctx) =>
           ctx.joinBranches(
@@ -122,15 +159,11 @@ describe('declarative parallel + durable join', () => {
         },
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await parent.start({});
-    const done = await waitUntil(async () => {
-      const r = await parent.get(run._id);
-      return r?.status === 'done';
-    }, 15_000);
-    expect(done).toBe(true);
+    await env.until(run._id, 'done', { timeout: 15_000 });
 
     // Concurrency: all three started before the first one finished.
     expect(overlap.lastStart).toBeLessThan(overlap.firstEnd);
@@ -143,29 +176,21 @@ describe('declarative parallel + durable join', () => {
     expect(join.branches.map((b) => b.key)).toEqual(['a', 'b', 'c']);
     expect(join.branches.every((b) => b.status === 'done')).toBe(true);
     expect(join.branches.map((b) => (b.output as { value: number }).value)).toEqual([10, 20, 30]);
-
-    parent.shutdown();
-    branch.shutdown();
   });
 
   it('join:all — one branch fails → step fails → prior completed step compensates (saga)', async () => {
-    const container = createContainer();
-    const goodWfId = uniqueId('pj-good');
-    const badWfId = uniqueId('pj-bad');
-    const parentWfId = uniqueId('pj-sagaparent');
-
-    const good = createWorkflow(goodWfId, {
+    const good = env.workflow('pj-good', {
       steps: { ok: async () => ({ ok: true }) },
-      container,
+      autoExecute: true,
     });
-    const bad = createWorkflow(badWfId, {
+    const bad = env.workflow('pj-bad', {
       steps: {
         boom: async () => {
           throw new Error('branch blew up');
         },
       },
       defaults: { retries: 0 },
-      container,
+      autoExecute: true,
     });
 
     let compensated = 0;
@@ -174,7 +199,7 @@ describe('declarative parallel + durable join', () => {
     // under policy:'all'. The run goes `failed` → saga walks the prior `done`
     // step and runs its onCompensate. (Standard saga: the failing step itself
     // is not compensated; prior completed work is rolled back.)
-    const parent = createWorkflow(parentWfId, {
+    const parent = env.workflow('pj-sagaparent', {
       steps: {
         prepare: {
           handler: async () => ({ reserved: true }),
@@ -185,51 +210,44 @@ describe('declarative parallel + durable join', () => {
         fanout: async (ctx) =>
           ctx.joinBranches(
             [
-              { key: 'good', workflowId: goodWfId, input: {} },
-              { key: 'bad', workflowId: badWfId, input: {} },
+              { key: 'good', workflowId: good.engine.definition.id, input: {} },
+              { key: 'bad', workflowId: bad.engine.definition.id, input: {} },
             ],
             { policy: 'all' },
           ),
         after: async () => 'unreached',
       },
-      container,
       defaults: { retries: 0 },
+      autoExecute: true,
     });
 
     const run = await parent.start({});
-    const settled = await waitUntil(async () => {
-      const r = await parent.get(run._id);
-      return r?.status === 'compensated' || r?.status === 'compensation_failed';
-    }, 15_000);
-    expect(settled).toBe(true);
+    const final = await env.until(
+      run._id,
+      (r) => r.status === 'compensated' || r.status === 'compensation_failed',
+      { timeout: 15_000 },
+    );
 
-    const final = await parent.get(run._id);
     // The join step failed; the prior `prepare` step was compensated.
-    expect(final?.steps.find((s) => s.stepId === 'fanout')?.status).toBe('failed');
+    expect(final.steps.find((s) => s.stepId === 'fanout')?.status).toBe('failed');
     expect(compensated).toBe(1);
-
-    parent.shutdown();
-    good.shutdown();
-    bad.shutdown();
   });
 
   it('join:any — first success resolves the join; result reflects a winner', async () => {
-    const container = createContainer();
-    const fastWfId = uniqueId('pj-fast');
-    const parentWfId = uniqueId('pj-anyparent');
-
-    const branch = createWorkflow(fastWfId, {
+    const branch = env.workflow('pj-fast', {
       steps: {
         work: async (ctx) => {
           const input = ctx.input as { delay: number; tag: string };
+          // Simulated work of differing length — decides which branch wins.
           await new Promise((r) => setTimeout(r, input.delay));
           return { tag: input.tag };
         },
       },
-      container,
+      autoExecute: true,
     });
+    const fastWfId = branch.engine.definition.id;
 
-    const parent = createWorkflow<{ join?: JoinResult }>(parentWfId, {
+    const parent = env.workflow<{ join?: JoinResult }>('pj-anyparent', {
       steps: {
         fanout: async (ctx) =>
           ctx.joinBranches(
@@ -245,15 +263,11 @@ describe('declarative parallel + durable join', () => {
         },
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await parent.start({});
-    const done = await waitUntil(async () => {
-      const r = await parent.get(run._id);
-      return r?.status === 'done';
-    }, 15_000);
-    expect(done).toBe(true);
+    await env.until(run._id, 'done', { timeout: 15_000 });
 
     const final = await parent.get(run._id);
     const join = final?.context.join as JoinResult;
@@ -263,38 +277,30 @@ describe('declarative parallel + durable join', () => {
     const winners = join.branches.filter((b) => b.status === 'done');
     expect(winners.length).toBeGreaterThanOrEqual(1);
     expect(winners.some((b) => (b.output as { tag: string }).tag === 'fast')).toBe(true);
-
-    parent.shutdown();
-    branch.shutdown();
   });
 
   it('join:allSettled — collects ALL outcomes; a branch failure does NOT fail the step', async () => {
-    const container = createContainer();
-    const okWfId = uniqueId('pj-ssok');
-    const failWfId = uniqueId('pj-ssfail');
-    const parentWfId = uniqueId('pj-ssparent');
-
-    const ok = createWorkflow(okWfId, {
+    const ok = env.workflow('pj-ssok', {
       steps: { run: async () => ({ ok: 1 }) },
-      container,
+      autoExecute: true,
     });
-    const fail = createWorkflow(failWfId, {
+    const fail = env.workflow('pj-ssfail', {
       steps: {
         run: async () => {
           throw new Error('settled failure');
         },
       },
       defaults: { retries: 0 },
-      container,
+      autoExecute: true,
     });
 
-    const parent = createWorkflow<{ join?: JoinResult }>(parentWfId, {
+    const parent = env.workflow<{ join?: JoinResult }>('pj-ssparent', {
       steps: {
         fanout: async (ctx) =>
           ctx.joinBranches(
             [
-              { key: 'ok', workflowId: okWfId, input: {} },
-              { key: 'fail', workflowId: failWfId, input: {} },
+              { key: 'ok', workflowId: ok.engine.definition.id, input: {} },
+              { key: 'fail', workflowId: fail.engine.definition.id, input: {} },
             ],
             { policy: 'allSettled' },
           ),
@@ -304,15 +310,11 @@ describe('declarative parallel + durable join', () => {
         },
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await parent.start({});
-    const done = await waitUntil(async () => {
-      const r = await parent.get(run._id);
-      return r?.status === 'done';
-    }, 15_000);
-    expect(done).toBe(true);
+    await env.until(run._id, 'done', { timeout: 15_000 });
 
     const final = await parent.get(run._id);
     const join = final?.context.join as JoinResult;
@@ -322,23 +324,16 @@ describe('declarative parallel + durable join', () => {
     expect(join.branches.map((b) => b.key).sort()).toEqual(['fail', 'ok']);
     expect(join.branches.find((b) => b.key === 'ok')?.status).toBe('done');
     expect(join.branches.find((b) => b.key === 'fail')?.status).toBe('failed');
-
-    parent.shutdown();
-    ok.shutdown();
-    fail.shutdown();
   });
 
   it('crash MID-PARALLEL: only incomplete branches re-run; completed ones are not; join completes', async () => {
-    const container = createContainer();
-    const branchWfId = uniqueId('pj-crashbranch');
-    const parentWfId = uniqueId('pj-crashparent');
     const stepId = 'fanout';
 
     let runCount = 0;
     // Branch workflow auto-executes (the engine's reconcile starts each branch
     // and relies on it running to completion). Only the PARENT is held back so
     // the test drives reconciliation explicitly.
-    const branch = createWorkflow(branchWfId, {
+    const branch = env.workflow('pj-crashbranch', {
       steps: {
         work: async (ctx) => {
           runCount++;
@@ -346,20 +341,17 @@ describe('declarative parallel + durable join', () => {
           return { value: input.n };
         },
       },
-      container,
+      autoExecute: true,
     });
+    const branchWfId = branch.engine.definition.id;
 
     // Branch 'a' was ALREADY completed before the crash. Branch 'b' never
     // started (no childRunId). On reconcile, ONLY 'b' should run.
     const childA = await branch.start({ n: 100 });
-    const doneA = await waitUntil(async () => {
-      const r = await branch.get(childA._id);
-      return r?.status === 'done';
-    }, 10_000);
-    expect(doneA).toBe(true);
+    await env.until(childA._id, 'done', { timeout: 10_000 });
     expect(runCount).toBe(1); // only 'a' has run so far
 
-    const parent = createWorkflow<{ join?: JoinResult }>(parentWfId, {
+    const parent = env.workflow<{ join?: JoinResult }>('pj-crashparent', {
       steps: {
         [stepId]: async (ctx) =>
           ctx.joinBranches(
@@ -375,15 +367,9 @@ describe('declarative parallel + durable join', () => {
         },
       },
       context: () => ({}),
-      container,
-      autoExecute: false,
     });
 
-    const parentRunId = uniqueId('pj-crash-run');
-    await persistOrphanedJoinParent({
-      parentRunId,
-      parentWorkflowId: parentWfId,
-      allStepIds: [stepId, 'collect'],
+    const parentRunId = await persistOrphanedJoinParent(parent, {
       stepId,
       branches: [
         { key: 'a', workflowId: branchWfId, input: { n: 100 }, childRunId: childA._id },
@@ -393,7 +379,7 @@ describe('declarative parallel + durable join', () => {
     });
 
     // Sweep selects exactly this orphaned parent.
-    const due = await workflowRunRepository.getBranchJoinWaitingRuns(new Date(), 100, {
+    const due = await env.container.repository.getBranchJoinWaitingRuns(new Date(), 100, {
       bypassTenant: true,
     });
     expect(due.map((r) => r._id)).toContain(parentRunId);
@@ -402,14 +388,15 @@ describe('declarative parallel + durable join', () => {
     // starts the missing 'b' child; subsequent passes resolve the quorum.
     await parent.engine.resume(parentRunId);
 
-    const completed = await waitUntil(async () => {
-      // re-drive reconciliation until the join resolves (mirrors the poller)
-      const r = await parent.get(parentRunId);
-      if (r?.status === 'waiting') await parent.engine.resume(parentRunId).catch(() => {});
-      const rr = await parent.get(parentRunId);
-      return rr?.status === 'done';
-    }, 15_000);
-    expect(completed).toBe(true);
+    // Re-drive reconciliation until the join resolves (mirrors the poller).
+    await env.eventually(
+      async () => {
+        const r = await parent.get(parentRunId);
+        if (r?.status === 'waiting') await parent.engine.resume(parentRunId).catch(() => {});
+        expect((await parent.get(parentRunId))?.status).toBe('done');
+      },
+      { timeout: 15_000, interval: 100 },
+    );
 
     // 'a' was NOT re-run (still 1 from before) + 'b' ran once = 2 total.
     expect(runCount).toBe(2);
@@ -419,37 +406,28 @@ describe('declarative parallel + durable join', () => {
     expect(join.satisfied).toBe(true);
     expect(join.branches.map((b) => b.key)).toEqual(['a', 'b']);
     expect(join.branches.map((b) => (b.output as { value: number }).value)).toEqual([100, 200]);
-
-    parent.shutdown();
-    branch.shutdown();
   });
 
   it('crash WHILE WAITING on the join: reconciliation reclaims and resumes (spine reuse)', async () => {
-    const container = createContainer();
-    const branchWfId = uniqueId('pj-waitbranch');
-    const parentWfId = uniqueId('pj-waitparent');
     const stepId = 'fanout';
 
     // Both branches already completed (on their own engines, no parent
     // listener attached) — the parent is parked on the join with stale
     // listeners, exactly the post-crash shape.
-    const branch = createWorkflow(branchWfId, {
+    const branch = env.workflow('pj-waitbranch', {
       steps: {
         work: async (ctx) => ({ value: (ctx.input as { n: number }).n }),
       },
-      container,
+      autoExecute: true,
     });
+    const branchWfId = branch.engine.definition.id;
 
     const childA = await branch.start({ n: 7 });
     const childB = await branch.start({ n: 8 });
-    const bothDone = await waitUntil(async () => {
-      const a = await branch.get(childA._id);
-      const b = await branch.get(childB._id);
-      return a?.status === 'done' && b?.status === 'done';
-    }, 10_000);
-    expect(bothDone).toBe(true);
+    await env.until(childA._id, 'done', { timeout: 10_000 });
+    await env.until(childB._id, 'done', { timeout: 10_000 });
 
-    const parent = createWorkflow<{ join?: JoinResult }>(parentWfId, {
+    const parent = env.workflow<{ join?: JoinResult }>('pj-waitparent', {
       steps: {
         [stepId]: async (ctx) =>
           ctx.joinBranches(
@@ -465,15 +443,9 @@ describe('declarative parallel + durable join', () => {
         },
       },
       context: () => ({}),
-      container,
-      autoExecute: false,
     });
 
-    const parentRunId = uniqueId('pj-wait-run');
-    await persistOrphanedJoinParent({
-      parentRunId,
-      parentWorkflowId: parentWfId,
-      allStepIds: [stepId, 'collect'],
+    const parentRunId = await persistOrphanedJoinParent(parent, {
       stepId,
       branches: [
         { key: 'a', workflowId: branchWfId, input: { n: 7 }, childRunId: childA._id },
@@ -491,9 +463,6 @@ describe('declarative parallel + durable join', () => {
     const join = final?.context.join as JoinResult;
     expect(join.satisfied).toBe(true);
     expect(join.branches.map((b) => (b.output as { value: number }).value)).toEqual([7, 8]);
-
-    parent.shutdown();
-    branch.shutdown();
   });
 
   it('rejects a CROSS-CONTAINER branch target LOUDLY at fan-out (no silent forever-park)', async () => {
@@ -502,13 +471,9 @@ describe('declarative parallel + durable join', () => {
     // never subscribed to AND writes to a repository the parent's reconcile
     // can't read — so the join would park forever with no error/log. The guard
     // must fail the join at fan-out instead, and never start the branch child.
-    const parentContainer = createContainer();
-    const otherContainer = createContainer();
-    const branchWfId = uniqueId('pj-xcontainer-branch');
-    const parentWfId = uniqueId('pj-xcontainer-parent');
-
+    const otherContainer = env.createContainer();
     let branchRan = 0;
-    const branch = createWorkflow(branchWfId, {
+    const branch = env.workflow('pj-xcontainer-branch', {
       steps: {
         work: async () => {
           branchRan++;
@@ -516,24 +481,25 @@ describe('declarative parallel + durable join', () => {
         },
       },
       container: otherContainer, // <-- different container than the parent
+      autoExecute: true,
     });
 
-    const parent = createWorkflow(parentWfId, {
+    const parent = env.workflow('pj-xcontainer-parent', {
       steps: {
         fanout: async (ctx) =>
-          ctx.joinBranches([{ key: 'a', workflowId: branchWfId, input: {} }], { policy: 'all' }),
+          ctx.joinBranches([{ key: 'a', workflowId: branch.engine.definition.id, input: {} }], {
+            policy: 'all',
+          }),
         after: async () => 'unreached',
       },
-      container: parentContainer,
       defaults: { retries: 0 },
+      autoExecute: true,
     });
 
     const run = await parent.start({});
-    const failed = await waitUntil(async () => {
-      const r = await parent.get(run._id);
-      return r?.status === 'failed' || r?.status === 'compensated';
-    }, 10_000);
-    expect(failed).toBe(true);
+    await env.until(run._id, (r) => r.status === 'failed' || r.status === 'compensated', {
+      timeout: 10_000,
+    });
 
     const final = await parent.get(run._id);
     const fanout = final?.steps.find((s) => s.stepId === 'fanout');
@@ -543,8 +509,5 @@ describe('declarative parallel + durable join', () => {
     );
     // The guard runs BEFORE the start loop — the branch child is never spawned.
     expect(branchRan).toBe(0);
-
-    parent.shutdown();
-    branch.shutdown();
   });
 });

@@ -1,8 +1,13 @@
-import { describe, it, expect, beforeAll } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
-import { createWorkflow } from '../../../src/index.js';
+/**
+ * LEGACY SETUP (global connection) on purpose: the subject is the exported
+ * `aiPipelineWorkflow` docs example, a module-level singleton created without
+ * a container — bound to the default mongoose connection by construction.
+ */
+
+import { beforeAll, describe, expect, it } from 'vitest';
 import { aiPipelineWorkflow } from '../../../docs/examples/ai-pipeline.js';
+import { createWorkflow } from '../../../src/index.js';
+import { setupTestDB } from '../../utils/setup.js';
 
 describe('AI Pipeline', () => {
   beforeAll(setupTestDB);
@@ -25,7 +30,8 @@ describe('AI Pipeline', () => {
 
   it('should execute AI pipeline with quality check', async () => {
     const run = await aiPipelineWorkflow.start({
-      prompt: 'Write a comprehensive guide about TypeScript generics and their practical applications',
+      prompt:
+        'Write a comprehensive guide about TypeScript generics and their practical applications',
       model: 'gpt-4',
       maxTokens: 1000,
     });
@@ -135,7 +141,10 @@ describe('AI Pipeline', () => {
     const waitingRun = await aiPipelineWorkflow.execute(run._id);
 
     if (waitingRun.status === 'waiting') {
-      const finalRun = await aiPipelineWorkflow.resume(run._id, { approved: true, reviewer: 'editor' });
+      const finalRun = await aiPipelineWorkflow.resume(run._id, {
+        approved: true,
+        reviewer: 'editor',
+      });
 
       expect(finalRun.status).toBe('done');
 

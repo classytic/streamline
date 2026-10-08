@@ -17,9 +17,9 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  type WorkflowDefinitionDoc,
   WorkflowDefinitionModel,
   WorkflowDefinitionRepository,
-  type WorkflowDefinitionDoc,
   workflowDefinitionRepository,
 } from '../../src/index.js';
 import { useTestDb } from '../helpers/lifecycle.js';
@@ -167,11 +167,15 @@ describe('persistence after dropping the dead `condition` field', () => {
 
     const reloaded = await WorkflowDefinitionModel.findById(created._id).lean();
     expect(reloaded?.steps).toHaveLength(2);
-    expect(reloaded?.steps[0]).toMatchObject({ id: 'a', name: 'Step A', retries: 2, timeout: 1000 });
+    expect(reloaded?.steps[0]).toMatchObject({
+      id: 'a',
+      name: 'Step A',
+      retries: 2,
+      timeout: 1000,
+    });
     // The dead `condition` field must not be persisted/returned.
-    expect(
-      (reloaded?.steps[0] as Record<string, unknown>).condition,
-    ).toBeUndefined();
+    const firstStep = reloaded?.steps[0] as Record<string, unknown>;
+    expect(firstStep.condition).toBeUndefined();
   });
 
   it('the retained pre(save) hook re-parses semver when a raw doc bumps its version', async () => {

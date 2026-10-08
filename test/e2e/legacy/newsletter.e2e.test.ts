@@ -1,8 +1,12 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+/**
+ * LEGACY SETUP (global connection) on purpose: the subject is the exported
+ * `newsletterWorkflow` docs example, a module-level singleton created without
+ * a container (autoExecute) — bound to the default mongoose connection.
+ */
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { newsletterWorkflow } from '../../../docs/examples/newsletter-automation.js';
-import { waitUntil } from '../../utils/setup.js';
+import { setupTestDB, waitUntil } from '../../utils/setup.js';
 
 describe('Newsletter Automation', () => {
   beforeAll(setupTestDB);
@@ -48,7 +52,10 @@ describe('Newsletter Automation', () => {
       return latest?.status === 'waiting';
     }, 5000);
 
-    const resumedRun = await newsletterWorkflow.resume(run._id, { approved: true, reviewer: 'admin' });
+    const resumedRun = await newsletterWorkflow.resume(run._id, {
+      approved: true,
+      reviewer: 'admin',
+    });
 
     expect(resumedRun.status).toBe('done');
     expect(resumedRun.context.sent).toBeDefined();

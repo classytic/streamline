@@ -11,46 +11,25 @@
  * - After claim (status → 'running'), workflows automatically drop from next poll
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import { WorkflowEngine } from '../../src/execution/engine.js';
-import { SmartScheduler } from '../../src/execution/smart-scheduler.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { createContainer } from '../../src/core/container.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { WorkflowDefinition, WorkflowHandlers } from '../../src/core/types.js';
+import { WorkflowEngine } from '../../src/execution/engine.js';
+import { DEFAULT_SCHEDULER_CONFIG, SmartScheduler } from '../../src/execution/smart-scheduler.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let mongoServer: MongoMemoryServer;
-
-beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
-  await mongoose.connect(mongoServer.getUri());
-}, 60000);
-
-afterAll(async () => {
-  await mongoose.disconnect();
-  await mongoServer.stop();
-});
-
-// Track engines for cleanup
-const createdEngines: { shutdown: () => void }[] = [];
+const env = useStreamlineEnv();
 
 describe('Scheduler Pagination - Large Scale', () => {
-  let scheduler: SmartScheduler<any>;
-
-  beforeEach(async () => {
-    await WorkflowRunModel.deleteMany({});
-    createdEngines.length = 0;
-  });
+  let scheduler: SmartScheduler | undefined;
+  // Raw engines aren't tracked by the env — shut them down here
+  const createdEngines: { shutdown: () => void }[] = [];
 
   afterEach(async () => {
-    if (scheduler) {
-      await scheduler.stop();
-    }
-    // Shutdown all engines
-    createdEngines.forEach((e) => e.shutdown());
-    await WorkflowRunModel.deleteMany({});
+    scheduler?.stop();
+    await scheduler?.drain();
+    scheduler = undefined;
+    for (const engine of createdEngines.splice(0)) engine.shutdown();
   });
 
   it('should efficiently handle 500 waiting workflows with pagination', async () => {
@@ -71,17 +50,15 @@ describe('Scheduler Pagination - Large Scale', () => {
         await ctx.sleep(10); // Short sleep to create waiting state
         return 'done';
       },
-      step2: async (ctx) => 'final',
+      step2: async () => 'final',
     };
 
-    const engine = new WorkflowEngine(workflow, handlers, createContainer(), { autoExecute: false });
+    const engine = new WorkflowEngine(workflow, handlers, env.container, { autoExecute: false });
     createdEngines.push(engine);
 
     // Create 500 workflows
     const runs = await Promise.all(
-      Array.from({ length: 500 }, (_, i) =>
-        engine.start({ index: i }, { userId: 'test', tags: ['bulk'] })
-      )
+      Array.from({ length: 500 }, (_, i) => engine.start({ index: i })),
     );
 
     // Execute all workflows - they'll each hit sleep and become waiting
@@ -93,13 +70,10 @@ describe('Scheduler Pagination - Large Scale', () => {
     }
 
     // Due to inline timer handling (10ms < 5s), workflows complete immediately
-    // Let's verify they completed
-    const doneCount = await WorkflowRunModel.countDocuments({ status: 'done' });
+    const doneCount = await env.runModel.countDocuments({ status: 'done' });
 
     // With inline handling, all should be done
     expect(doneCount).toBeGreaterThanOrEqual(400); // At least 80% complete
-
-    console.log(`✓ Processed ${doneCount}/500 workflows with inline timer handling`);
   });
 
   it('should not skip workflows when using limit-based pagination', async () => {
@@ -123,14 +97,12 @@ describe('Scheduler Pagination - Large Scale', () => {
       step2: async () => 'step2-done',
     };
 
-    const engine = new WorkflowEngine(workflow, handlers, createContainer(), { autoExecute: false });
+    const engine = new WorkflowEngine(workflow, handlers, env.container, { autoExecute: false });
     createdEngines.push(engine);
 
     // Create 100 workflows (smaller for reliability)
     const runs = await Promise.all(
-      Array.from({ length: 100 }, (_, i) =>
-        engine.start({ index: i }, { userId: 'test', tags: [`workflow-${i}`] })
-      )
+      Array.from({ length: 100 }, (_, i) => engine.start({ index: i })),
     );
 
     // Execute in batches (pagination pattern)
@@ -141,10 +113,8 @@ describe('Scheduler Pagination - Large Scale', () => {
     }
 
     // Verify all workflows completed
-    const completedCount = await WorkflowRunModel.countDocuments({ status: 'done' });
+    const completedCount = await env.runModel.countDocuments({ status: 'done' });
     expect(completedCount).toBe(100);
-
-    console.log(`✓ ${completedCount}/100 workflows processed in batches of ${batchSize}`);
   });
 
   it('should handle concurrent workflow execution', async () => {
@@ -173,25 +143,23 @@ describe('Scheduler Pagination - Large Scale', () => {
       },
     };
 
-    const engine = new WorkflowEngine(workflow, handlers, createContainer(), { autoExecute: false });
+    const engine = new WorkflowEngine(workflow, handlers, env.container, { autoExecute: false });
     createdEngines.push(engine);
 
     // Create 50 workflows
     const runs = await Promise.all(
-      Array.from({ length: 50 }, (_, i) => engine.start({ index: i }))
+      Array.from({ length: 50 }, (_, i) => engine.start({ index: i })),
     );
 
     // Execute all concurrently
     await Promise.all(runs.map((run) => engine.execute(run._id)));
 
     // Verify all workflows completed
-    const completedCount = await WorkflowRunModel.countDocuments({ status: 'done' });
+    const completedCount = await env.runModel.countDocuments({ status: 'done' });
     expect(completedCount).toBe(50);
 
     // Verify all steps executed (2 steps per workflow = 100 total)
     expect(executionOrder.length).toBe(100);
-
-    console.log(`✓ ${completedCount}/50 concurrent workflows completed successfully`);
   });
 
   it('should respect maxWorkflowsPerPoll limit to avoid memory issues', async () => {
@@ -204,49 +172,44 @@ describe('Scheduler Pagination - Large Scale', () => {
     };
 
     const handlers: WorkflowHandlers = {
-      step1: async (ctx) => {
+      step1: async () => {
         // Simulate slow processing to let workflows accumulate
-        await new Promise((resolve) => setTimeout(resolve, 200));
+        await delay(200);
         return 'done';
       },
     };
 
-    const engine = new WorkflowEngine(workflow, handlers, createContainer(), { autoExecute: false });
+    const engine = new WorkflowEngine(workflow, handlers, env.container, { autoExecute: false });
     createdEngines.push(engine);
 
     // Create 500 workflows ready to resume
     await Promise.all(
       Array.from({ length: 500 }, async (_, i) => {
         const run = await engine.start({ index: i });
-        await WorkflowRunModel.updateOne(
-          { _id: run._id },
-          {
-            $set: {
-              status: 'waiting',
-              'steps.0.status': 'waiting',
-              'steps.0.waitingFor': {
-                type: 'timer',
-                reason: 'test',
-                resumeAt: new Date(Date.now() - 1000),
-              },
-            },
-          }
-        );
-      })
+        await env.runs.update(run._id, {
+          status: 'waiting',
+          'steps.0.status': 'waiting',
+          'steps.0.waitingFor': {
+            type: 'timer',
+            reason: 'test',
+            resumeAt: new Date(Date.now() - 1000),
+          },
+        });
+      }),
     );
 
-    // Track poll count and batch size
-    let pollCount = 0;
-    let maxBatchSize = 0;
+    // Count how many runs each poll dispatches
+    let dispatchedThisPoll = 0;
 
-    // Start scheduler with strict limit
+    // Scheduler with a strict per-poll limit, over the env's repository
     scheduler = new SmartScheduler(
-      workflowRunRepository,
+      env.container.repository,
       async (runId) => {
-        maxBatchSize++;
+        dispatchedThisPoll++;
         await engine.resume(runId, {});
       },
       {
+        ...DEFAULT_SCHEDULER_CONFIG,
         basePollInterval: 500,
         minPollInterval: 500,
         maxPollInterval: 500,
@@ -255,30 +218,24 @@ describe('Scheduler Pagination - Large Scale', () => {
         maxConsecutiveFailures: 5,
         adaptivePolling: false,
         staleCheckInterval: 5 * 60 * 1000,
-      }
+      },
     );
 
-    // Track poll cycles
-    const originalPoll = scheduler['poll'].bind(scheduler);
-    scheduler['poll'] = async function (...args: any[]) {
-      pollCount++;
-      maxBatchSize = 0; // Reset for new poll
-      return originalPoll(...args);
-    };
+    // Drive a few poll cycles deterministically: one poll, then its dispatched work
+    for (let poll = 0; poll < 3; poll++) {
+      dispatchedThisPoll = 0;
+      await scheduler.pollOnce();
+      await scheduler.drain();
+      // Each poll should process max 25 workflows
+      expect(dispatchedThisPoll).toBeGreaterThan(0);
+      expect(dispatchedThisPoll).toBeLessThanOrEqual(25);
+    }
 
-    scheduler.start();
+    const processedCount = await env.runModel.countDocuments({
+      status: { $in: ['done', 'running'] },
+    });
 
-    // Wait for a few poll cycles
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    // Verify batch size never exceeded limit
-    const processedCount = await WorkflowRunModel.countDocuments({ status: { $in: ['done', 'running'] } });
-
-    console.log(`Polls: ${pollCount}, Processed: ${processedCount}/500`);
-
-    // Each poll should process max 25 workflows
-    // With 500ms interval and slow processing, should see controlled batching
-    expect(pollCount).toBeGreaterThanOrEqual(3);
+    expect(scheduler.getStats().totalPolls).toBeGreaterThanOrEqual(3);
     expect(processedCount).toBeLessThanOrEqual(500);
   }, 10000);
 });

@@ -9,33 +9,17 @@
  * 5. Stale state refresh when step already running
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import mongoose from 'mongoose';
-import { createWorkflow } from '../../src/index.js';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { workflowCache } from '../../src/storage/cache.js';
+import { describe, expect, it } from 'vitest';
+import type { WorkflowConfig, WorkflowRun } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test';
+const env = useStreamlineEnv();
 
-// Track workflows for cleanup
-const createdWorkflows: { shutdown: () => void }[] = [];
+/** The stored step `stepId` has been claimed (`running`). */
+const stepRunning = (stepId: string) => (r: WorkflowRun) =>
+  r.steps.find((s) => s.stepId === stepId)?.status === 'running';
 
 describe('Multi-Worker Fixes', () => {
-  beforeEach(async () => {
-    await mongoose.connect(MONGODB_URI);
-    await WorkflowRunModel.deleteMany({});
-    workflowCache.clear();
-    createdWorkflows.length = 0; // Reset
-  });
-
-  afterEach(async () => {
-    // Shutdown all workflows first to stop background processes
-    createdWorkflows.forEach((w) => w.shutdown());
-    await WorkflowRunModel.deleteMany({});
-    workflowCache.clear();
-    await mongoose.disconnect();
-  });
-
   describe('Atomic Claim & No-Progress Detection', () => {
     it('should prevent duplicate execution when two workers execute same workflow', async () => {
       interface TestContext {
@@ -45,7 +29,8 @@ describe('Multi-Worker Fixes', () => {
 
       let executionCount = 0;
 
-      const workflow1 = createWorkflow<TestContext>('atomic-test', {
+      // Both workers run the same handler code (same deployment).
+      const config: WorkflowConfig<TestContext> = {
         steps: {
           increment: async (ctx) => {
             executionCount++;
@@ -57,26 +42,11 @@ describe('Multi-Worker Fixes', () => {
             return newValue;
           },
         },
-        context: (input: any) => ({ value: 0, executionCount: 0 }),
-        autoExecute: false,
-      });
-
+        context: () => ({ value: 0, executionCount: 0 }),
+      };
+      const workflow1 = env.workflow('atomic-test', config);
       // Second worker with same workflow ID (shares database)
-      const workflow2 = createWorkflow<TestContext>('atomic-test', {
-        steps: {
-          increment: async (ctx) => {
-            executionCount++;
-            await ctx.set('executionCount', executionCount);
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            const newValue = ctx.context.value + 1;
-            await ctx.set('value', newValue);
-            return newValue;
-          },
-        },
-        context: (input: any) => ({ value: 0, executionCount: 0 }),
-        autoExecute: false,
-      });
-      createdWorkflows.push(workflow1, workflow2);
+      const workflow2 = env.worker(workflow1, config);
 
       // Start workflow
       const run = await workflow1.start({ source: 'test' });
@@ -85,8 +55,8 @@ describe('Multi-Worker Fixes', () => {
       // Worker 1 starts executing first
       const promise1 = workflow1.execute(run._id);
 
-      // Wait a bit to ensure worker 1 has claimed the step
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Wait until worker 1 has claimed the step
+      await env.until(run._id, stepRunning('increment'));
 
       // Worker 2 tries to execute - should detect worker 1 is handling it
       const result2 = await workflow2.execute(run._id);
@@ -102,17 +72,15 @@ describe('Multi-Worker Fixes', () => {
       expect(executionCount).toBe(1);
       expect(result1.context.executionCount).toBe(1);
       expect(result1.context.value).toBe(1);
-
-      console.log(`✓ Atomic claim prevented duplicate execution. Count: ${executionCount}`);
     });
 
     it('should detect no progress and exit loop when another worker is handling step', async () => {
       let started = false;
       let completed = false;
 
-      const workflow1 = createWorkflow('no-progress-test', {
+      const config: WorkflowConfig<Record<string, unknown>> = {
         steps: {
-          slow: async (ctx) => {
+          slow: async () => {
             started = true;
             // Simulate very slow operation
             await new Promise((resolve) => setTimeout(resolve, 500));
@@ -121,22 +89,9 @@ describe('Multi-Worker Fixes', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
-      });
-
-      const workflow2 = createWorkflow('no-progress-test', {
-        steps: {
-          slow: async (ctx) => {
-            started = true;
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            completed = true;
-            return 'done';
-          },
-        },
-        context: () => ({}),
-        autoExecute: false,
-      });
-      createdWorkflows.push(workflow1, workflow2);
+      };
+      const workflow1 = env.workflow('no-progress-test', config);
+      const workflow2 = env.worker(workflow1, config);
 
       // Start workflow
       const run = await workflow1.start({});
@@ -145,8 +100,8 @@ describe('Multi-Worker Fixes', () => {
       // Worker 1 starts executing (will take 500ms)
       const promise1 = workflow1.execute(run._id);
 
-      // Wait a bit to ensure worker 1 claimed the step
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Wait until worker 1 claimed the step and entered the handler
+      await env.until(run._id, (r) => started && stepRunning('slow')(r));
       expect(started).toBe(true);
       expect(completed).toBe(false);
 
@@ -165,12 +120,10 @@ describe('Multi-Worker Fixes', () => {
       const result1 = await promise1;
       expect(result1.status).toBe('done');
       expect(completed).toBe(true);
-
-      console.log(`✓ Worker 2 exited in ${elapsedTime}ms (no-progress detected)`);
     });
 
     it('should refresh state when step is already running', async () => {
-      const workflow1 = createWorkflow('stale-state-test', {
+      const config: WorkflowConfig<Record<string, unknown>> = {
         steps: {
           fast: async () => 'fast-done',
           slow: async () => {
@@ -179,29 +132,21 @@ describe('Multi-Worker Fixes', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false, // Manually control execution
-      });
-
-      const workflow2 = createWorkflow('stale-state-test', {
-        steps: {
-          fast: async () => 'fast-done',
-          slow: async () => {
-            await new Promise((resolve) => setTimeout(resolve, 200));
-            return 'slow-done';
-          },
-        },
-        context: () => ({}),
-        autoExecute: false, // Manually control execution
-      });
-      createdWorkflows.push(workflow1, workflow2);
+      };
+      const workflow1 = env.workflow('stale-state-test', config);
+      const workflow2 = env.worker(workflow1, config);
 
       const run = await workflow1.start({});
 
       // Worker 1 executes (fast step completes, slow step starts)
       const promise1 = workflow1.execute(run._id);
 
-      // Wait for fast step to complete and slow step to start
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Wait for fast step to complete and slow step to be claimed
+      await env.until(
+        run._id,
+        (r) =>
+          r.steps.find((s) => s.stepId === 'fast')?.status === 'done' && stepRunning('slow')(r),
+      );
 
       // Worker 2 tries to execute - should see slow step is running and refresh state
       const result2 = await workflow2.execute(run._id);
@@ -213,21 +158,17 @@ describe('Multi-Worker Fixes', () => {
 
       // Wait for worker 1 to finish
       await promise1;
-
-      console.log('✓ Stale state refreshed from DB when step already running');
     });
   });
 
   describe('pause() with Different Step States', () => {
     it('should pause pending step (not started yet)', async () => {
-      const workflow = createWorkflow('pause-pending-test', {
+      const workflow = env.workflow('pause-pending-test', {
         steps: {
           step1: async () => 'done',
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -240,8 +181,6 @@ describe('Multi-Worker Fixes', () => {
 
       const step1 = paused.steps.find((s) => s.stepId === 'step1');
       expect(step1?.status).toBe('pending'); // Step status unchanged
-
-      console.log('✓ Paused pending step correctly (paused flag set, status unchanged)');
     });
 
     it('should pause during retry backoff (keep retryAfter, scheduler skips)', async () => {
@@ -249,7 +188,7 @@ describe('Multi-Worker Fixes', () => {
 
       // With inline retry handling (delays < 5s), execute() now handles all retries itself.
       // This test verifies that the workflow properly fails after exhausting retries.
-      const workflow = createWorkflow('pause-retry-test', {
+      const workflow = env.workflow('pause-retry-test', {
         steps: {
           failing: async () => {
             attempts++;
@@ -258,9 +197,7 @@ describe('Multi-Worker Fixes', () => {
         },
         context: () => ({}),
         defaults: { retries: 3 },
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -272,12 +209,10 @@ describe('Multi-Worker Fixes', () => {
       const step = executed.steps.find((s) => s.stepId === 'failing');
       expect(step?.status).toBe('failed');
       expect(step?.error).toBeDefined();
-
-      console.log('✓ Inline retry handling exhausts all retries before returning');
     });
 
     it('should set paused flag when pausing mid-execution', async () => {
-      const workflow = createWorkflow('pause-running-test', {
+      const workflow = env.workflow('pause-running-test', {
         steps: {
           long: async () => {
             await new Promise((resolve) => setTimeout(resolve, 500));
@@ -285,9 +220,7 @@ describe('Multi-Worker Fixes', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -295,7 +228,7 @@ describe('Multi-Worker Fixes', () => {
       const executePromise = workflow.execute(run._id);
 
       // Pause while step is running
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await env.until(run._id, stepRunning('long'));
       const paused = await workflow.pause(run._id);
 
       // NEW BEHAVIOR: pause() sets paused flag, status unchanged
@@ -307,19 +240,15 @@ describe('Multi-Worker Fixes', () => {
 
       // Wait for execution to complete
       await executePromise;
-
-      console.log('✓ Pause sets paused flag even during execution (status unchanged)');
     });
 
     it('should be no-op when pausing terminal states', async () => {
-      const workflow = createWorkflow('pause-terminal-test', {
+      const workflow = env.workflow('pause-terminal-test', {
         steps: {
           step1: async () => 'done',
         },
         context: () => ({}),
-        autoExecute: false, // Manually control execution
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -332,8 +261,6 @@ describe('Multi-Worker Fixes', () => {
       // Should be no-op
       expect(paused.status).toBe('done');
       expect(paused._id).toBe(completed._id);
-
-      console.log('✓ Pause is no-op for terminal states');
     });
   });
 
@@ -341,7 +268,7 @@ describe('Multi-Worker Fixes', () => {
     it('should continue execution when resuming paused pending step', async () => {
       let executed = false;
 
-      const workflow = createWorkflow('resume-pending-test', {
+      const workflow = env.workflow('resume-pending-test', {
         steps: {
           step1: async () => {
             executed = true;
@@ -349,9 +276,7 @@ describe('Multi-Worker Fixes', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -362,8 +287,6 @@ describe('Multi-Worker Fixes', () => {
       const resumed = await workflow.resume(run._id);
       expect(resumed.status).toBe('done');
       expect(executed).toBe(true);
-
-      console.log('✓ Resume continued execution of paused pending step');
     });
 
     it('should continue retry when resuming paused retry-pending step', async () => {
@@ -371,7 +294,7 @@ describe('Multi-Worker Fixes', () => {
       // This test verifies that the step succeeds after retry via inline handling.
       let attempts = 0;
 
-      const workflow = createWorkflow('resume-retry-test', {
+      const workflow = env.workflow('resume-retry-test', {
         steps: {
           failing: async () => {
             attempts++;
@@ -381,9 +304,7 @@ describe('Multi-Worker Fixes', () => {
         },
         context: () => ({}),
         defaults: { retries: 3 },
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -397,14 +318,12 @@ describe('Multi-Worker Fixes', () => {
       const step = result.steps.find((s) => s.stepId === 'failing');
       expect(step?.status).toBe('done');
       expect(step?.error).toBeUndefined(); // Error cleared after success
-
-      console.log('✓ Inline retry handling succeeds after transient failure');
     }, 10000);
 
     it('should continue execution when resuming paused running step', async () => {
       let executed = false;
 
-      const workflow = createWorkflow('resume-running-test', {
+      const workflow = env.workflow('resume-running-test', {
         steps: {
           long: async () => {
             await new Promise((resolve) => setTimeout(resolve, 100));
@@ -413,9 +332,7 @@ describe('Multi-Worker Fixes', () => {
           },
         },
         context: () => ({}),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -423,7 +340,7 @@ describe('Multi-Worker Fixes', () => {
       const executePromise = workflow.execute(run._id);
 
       // Pause mid-execution
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await env.until(run._id, stepRunning('long'));
       const paused = await workflow.pause(run._id);
 
       // NEW BEHAVIOR: pause() sets paused flag, status unchanged
@@ -436,8 +353,6 @@ describe('Multi-Worker Fixes', () => {
       // Workflow should complete normally (execution wasn't interrupted)
       expect(completed.status).toBe('done');
       expect(executed).toBe(true);
-
-      console.log('✓ Pause sets flag but execution continues (no interruption)');
     });
 
     it('should use payload when resuming explicit wait', async () => {
@@ -445,7 +360,7 @@ describe('Multi-Worker Fixes', () => {
         result: string;
       }
 
-      const workflow = createWorkflow<WaitContext>('resume-wait-test', {
+      const workflow = env.workflow<WaitContext>('resume-wait-test', {
         steps: {
           wait: async (ctx) => {
             await ctx.wait('Waiting for input');
@@ -456,9 +371,7 @@ describe('Multi-Worker Fixes', () => {
           },
         },
         context: () => ({ result: '' }),
-        autoExecute: false,
       });
-      createdWorkflows.push(workflow);
 
       const run = await workflow.start({});
 
@@ -478,8 +391,6 @@ describe('Multi-Worker Fixes', () => {
 
       const processOutput = resumed.steps.find((s) => s.stepId === 'process')?.output;
       expect(processOutput).toBe('Processed: user input');
-
-      console.log('✓ Resume used payload for explicit wait');
     });
   });
 });

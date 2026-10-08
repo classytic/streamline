@@ -22,51 +22,39 @@ import { hookRegistry } from '../../src/execution/engine.js';
 import {
   cancelHook,
   createHook,
-  createWorkflow,
   getWaitResolution,
   resumeHook,
+  type WorkflowConfig,
 } from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let n = 0;
-const uid = (p: string) => `${p}-${Date.now()}-${++n}`;
+const env = useStreamlineEnv();
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function waitForStatus(
-  wf: { get: (id: string) => Promise<{ status: string } | null> },
-  runId: string,
-  statuses: string[],
-  timeoutMs = 8000,
-): Promise<{ status: string } & Record<string, unknown>> {
-  const want = new Set(statuses);
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const r = (await wf.get(runId)) as ({ status: string } & Record<string, unknown>) | null;
-    if (r && want.has(r.status)) return r;
-    await sleep(30);
-  }
-  throw new Error(`run ${runId} did not reach [${statuses}] within ${timeoutMs}ms`);
-}
+const FAST_SCHED = { basePollInterval: 100, minPollInterval: 50, maxPollInterval: 500 } as const;
+const WAIT = { timeout: 8000 } as const;
 
 type StepsShape = Array<{ stepId: string; output?: unknown }>;
-const stepOutput = (run: Record<string, unknown>, stepId: string): unknown =>
+const stepOutput = (run: { steps?: unknown }, stepId: string): unknown =>
   (run.steps as StepsShape | undefined)?.find((s) => s.stepId === stepId)?.output;
 
 describe('generalized APIs (2.7.0)', () => {
-  useTestDb();
-
   // ==========================================================================
   // 1. wf.cancel(runId)
   // ==========================================================================
 
   describe('wf.cancel', () => {
     it('cancels mid-step: aborts the in-flight handler and marks the run cancelled', async () => {
-      const wfId = uid('cancel-midstep');
       let sawAbort = false;
+      let markInFlight: () => void = () => {};
+      const inFlight = new Promise<void>((resolve) => {
+        markInFlight = resolve;
+      });
 
-      const wf = createWorkflow(wfId, {
+      const wf = env.workflow('cancel-midstep', {
         steps: {
           slow: async (ctx) => {
+            markInFlight();
             // Long handler that observes the abort signal (ctx.signal contract).
             for (let i = 0; i < 100; i++) {
               if (ctx.signal.aborted) {
@@ -78,7 +66,6 @@ describe('generalized APIs (2.7.0)', () => {
             return 'never';
           },
         },
-        autoExecute: false,
       });
 
       const cancelledEvents: string[] = [];
@@ -88,7 +75,7 @@ describe('generalized APIs (2.7.0)', () => {
 
       const run = await wf.start({});
       const exec = wf.execute(run._id).catch(() => undefined); // settles after abort
-      await sleep(120); // let the step get in-flight
+      await inFlight; // the step is in-flight
 
       const cancelled = await wf.cancel(run._id);
       expect(cancelled.status).toBe('cancelled');
@@ -99,13 +86,10 @@ describe('generalized APIs (2.7.0)', () => {
 
       const persisted = await wf.get(run._id);
       expect(persisted?.status).toBe('cancelled');
-
-      wf.shutdown();
     });
 
     it('cancels during a wait: the parked run is cancelled and a late resumeHook fails', async () => {
-      const wfId = uid('cancel-waiting');
-      const wf = createWorkflow(wfId, {
+      const wf = env.workflow('cancel-waiting', {
         steps: {
           request: async (ctx) => {
             const hook = createHook(ctx, 'approval', { token: `${ctx.runId}:approve` });
@@ -113,31 +97,28 @@ describe('generalized APIs (2.7.0)', () => {
           },
           decide: async () => 'unreached',
         },
-        scheduler: { basePollInterval: 100, minPollInterval: 50, maxPollInterval: 500 },
+        scheduler: FAST_SCHED,
+        autoExecute: true,
       });
 
       const run = await wf.start({});
-      await waitForStatus(wf, run._id, ['waiting']);
+      await env.until(run._id, 'waiting', WAIT);
 
       const cancelled = await wf.cancel(run._id);
       expect(cancelled.status).toBe('cancelled');
 
       // The withdrawn run can never be resumed by its token afterwards.
-      await expect(resumeHook(`${run._id}:approve`, { approved: true })).rejects.toThrow(
-        /not waiting/,
-      );
+      await expect(
+        resumeHook(`${run._id}:approve`, { approved: true }, { container: env.container }),
+      ).rejects.toThrow(/not waiting/);
 
       const persisted = await wf.get(run._id);
       expect(persisted?.status).toBe('cancelled');
-
-      wf.shutdown();
     });
 
     it('is an idempotent no-op on already-terminal runs (done stays done, no event)', async () => {
-      const wfId = uid('cancel-terminal');
-      const wf = createWorkflow(wfId, {
+      const wf = env.workflow('cancel-terminal', {
         steps: { quick: async () => 'ok' },
-        autoExecute: false,
       });
 
       const cancelledEvents: string[] = [];
@@ -160,8 +141,6 @@ describe('generalized APIs (2.7.0)', () => {
       const again = await wf.cancel(run2._id);
       expect(again.status).toBe('cancelled');
       expect(cancelledEvents).toEqual([run2._id]);
-
-      wf.shutdown();
     });
   });
 
@@ -171,8 +150,7 @@ describe('generalized APIs (2.7.0)', () => {
 
   describe('cancelHook reason flow', () => {
     it('persists the reason on the run record and surfaces it in the workflow:resumed payload', async () => {
-      const wfId = uid('chook-reason');
-      const wf = createWorkflow(wfId, {
+      const wf = env.workflow('chook-reason', {
         steps: {
           request: async (ctx) => {
             const hook = createHook(ctx, 'approval', { token: `${ctx.runId}:approve` });
@@ -183,7 +161,8 @@ describe('generalized APIs (2.7.0)', () => {
             return { kind: resolution?.__waitResolved ?? 'answered', reason: resolution?.reason };
           },
         },
-        scheduler: { basePollInterval: 100, minPollInterval: 50, maxPollInterval: 500 },
+        scheduler: FAST_SCHED,
+        autoExecute: true,
       });
 
       const resumedPayloads: Array<{ runId?: string; data?: unknown }> = [];
@@ -192,11 +171,14 @@ describe('generalized APIs (2.7.0)', () => {
       });
 
       const run = await wf.start({});
-      await waitForStatus(wf, run._id, ['waiting']);
+      await env.until(run._id, 'waiting', WAIT);
 
-      await cancelHook(`${run._id}:approve`, { reason: 'superseded by v2 request' });
+      await cancelHook(`${run._id}:approve`, {
+        reason: 'superseded by v2 request',
+        container: env.container,
+      });
 
-      const final = await waitForStatus(wf, run._id, ['done']);
+      const final = await env.until(run._id, 'done', WAIT);
 
       // Reason persisted on the run record: the waiting step's output IS the
       // cancellation sentinel carrying the free-form reason.
@@ -217,13 +199,10 @@ describe('generalized APIs (2.7.0)', () => {
         __waitResolved: 'cancelled',
         reason: 'superseded by v2 request',
       });
-
-      wf.shutdown();
     });
 
     it('a cancelled hook wait cannot be resumed by a late resume with the old token', async () => {
-      const wfId = uid('chook-late');
-      const wf = createWorkflow(wfId, {
+      const wf = env.workflow('chook-late', {
         steps: {
           first: async (ctx) => {
             const hook = createHook(ctx, 'first gate', { token: `${ctx.runId}:first` });
@@ -235,37 +214,34 @@ describe('generalized APIs (2.7.0)', () => {
           },
           finish: async () => 'done',
         },
-        scheduler: { basePollInterval: 100, minPollInterval: 50, maxPollInterval: 500 },
+        scheduler: FAST_SCHED,
+        autoExecute: true,
       });
 
       const run = await wf.start({});
-      await waitForStatus(wf, run._id, ['waiting']);
+      await env.until(run._id, 'waiting', WAIT);
 
       // Withdraw the FIRST wait — the run advances and parks on the second.
-      await cancelHook(`${run._id}:first`, { reason: 'withdrawn' });
-      await sleep(200);
-      await waitForStatus(wf, run._id, ['waiting']);
+      await cancelHook(`${run._id}:first`, { reason: 'withdrawn', container: env.container });
+      await env.until(run._id, (r) => r.status === 'waiting' && r.currentStepId === 'second', WAIT);
 
       // A late resume with the OLD (cancelled) token is rejected fail-closed —
       // it cannot resume the cancelled wait NOR the currently-waiting step.
-      await expect(resumeHook(`${run._id}:first`, { approved: true })).rejects.toThrow(
-        /Invalid hook token/,
-      );
+      await expect(
+        resumeHook(`${run._id}:first`, { approved: true }, { container: env.container }),
+      ).rejects.toThrow(/Invalid hook token/);
 
       // The current wait still resumes normally with ITS token.
-      await resumeHook(`${run._id}:second`, { ok: true });
-      const final = await waitForStatus(wf, run._id, ['done']);
+      await resumeHook(`${run._id}:second`, { ok: true }, { container: env.container });
+      const final = await env.until(run._id, 'done', WAIT);
       expect(stepOutput(final, 'first')).toMatchObject({ __waitResolved: 'cancelled' });
       expect(stepOutput(final, 'second')).toEqual({ ok: true });
-
-      wf.shutdown();
     });
 
     it('composes with saga compensation: compensable steps roll back after a cancelled wait', async () => {
-      const wfId = uid('chook-saga');
       const compensated: string[] = [];
 
-      const wf = createWorkflow(wfId, {
+      const wf = env.workflow('chook-saga', {
         steps: {
           reserve: {
             handler: async () => 'reserved',
@@ -289,16 +265,20 @@ describe('generalized APIs (2.7.0)', () => {
             retries: 0,
           },
         },
-        scheduler: { basePollInterval: 100, minPollInterval: 50, maxPollInterval: 500 },
+        scheduler: FAST_SCHED,
+        autoExecute: true,
       });
 
       const run = await wf.start({});
-      await waitForStatus(wf, run._id, ['waiting']);
+      await env.until(run._id, 'waiting', WAIT);
 
       // Withdraw the gate; the run proceeds, `charge` fails, saga rolls back.
-      await cancelHook(`${run._id}:gate`, { reason: 'operator withdrew' });
+      await cancelHook(`${run._id}:gate`, {
+        reason: 'operator withdrew',
+        container: env.container,
+      });
 
-      const final = await waitForStatus(wf, run._id, ['compensated'], 12_000);
+      const final = await env.until(run._id, 'compensated', { timeout: 12_000 });
       expect(final.status).toBe('compensated');
       // Reverse-order rollback INCLUDING the cancelled-wait step (it is
       // `done` with the sentinel output, so it participates like any step).
@@ -308,8 +288,6 @@ describe('generalized APIs (2.7.0)', () => {
         __waitResolved: 'cancelled',
         reason: 'operator withdrew',
       });
-
-      wf.shutdown();
     });
   });
 
@@ -319,41 +297,38 @@ describe('generalized APIs (2.7.0)', () => {
 
   describe('step outputs across engine restart', () => {
     it('outputs persist and a FRESH engine rehydrates them for later steps', async () => {
-      const wfId = uid('outputs-restart');
-
-      const build = () =>
-        createWorkflow(wfId, {
-          steps: {
-            fetch: async () => ({ html: '<p>hi</p>' }),
-            gate: async (ctx) => {
-              const hook = createHook(ctx, 'gate', { token: `${ctx.runId}:go` });
-              return ctx.wait(hook.reason, { hookToken: hook.token });
-            },
-            use: async (ctx) => {
-              // Rehydrated from the DB by the NEW engine — the original
-              // engine (and its cache) is gone.
-              const fetched = ctx.outputs.fetch as { html: string } | undefined;
-              return { len: fetched?.html.length ?? -1 };
-            },
+      const config: WorkflowConfig<Record<string, unknown>> = {
+        steps: {
+          fetch: async () => ({ html: '<p>hi</p>' }),
+          gate: async (ctx) => {
+            const hook = createHook(ctx, 'gate', { token: `${ctx.runId}:go` });
+            return ctx.wait(hook.reason, { hookToken: hook.token });
           },
-          scheduler: { basePollInterval: 100, minPollInterval: 50, maxPollInterval: 500 },
-        });
+          use: async (ctx) => {
+            // Rehydrated from the DB by the NEW engine — the original
+            // engine (and its cache) is gone.
+            const fetched = ctx.outputs.fetch as { html: string } | undefined;
+            return { len: fetched?.html.length ?? -1 };
+          },
+        },
+        scheduler: FAST_SCHED,
+        autoExecute: true,
+      };
 
-      const wf1 = build();
+      const wf1 = env.workflow('outputs-restart', config);
       const run = await wf1.start({});
-      await waitForStatus(wf1, run._id, ['waiting']);
+      await env.until(run._id, 'waiting', WAIT);
 
       // Simulate worker restart: tear the first engine down entirely.
       wf1.shutdown();
       hookRegistry.unregister(run._id);
 
-      const wf2 = build();
-      await resumeHook(`${run._id}:go`, { approved: true });
+      // Same workflow id, fresh engine.
+      env.redefine(wf1, config);
+      await resumeHook(`${run._id}:go`, { approved: true }, { container: env.container });
 
-      const final = await waitForStatus(wf2, run._id, ['done']);
+      const final = await env.until(run._id, 'done', WAIT);
       expect(stepOutput(final, 'use')).toEqual({ len: '<p>hi</p>'.length });
-
-      wf2.shutdown();
     });
   });
 
@@ -363,7 +338,6 @@ describe('generalized APIs (2.7.0)', () => {
 
   describe('ctx.loop across worker restart', () => {
     it('resumes at the committed iteration (with accumulator state) on a NEW engine, not iteration 0', async () => {
-      const wfId = uid('loop-restart');
       const executedBy: Array<[string, number]> = [];
 
       // `crashAt` is a PERMANENT per-worker crash point (no shared latch): the
@@ -372,42 +346,44 @@ describe('generalized APIs (2.7.0)', () => {
       // re-enter its execute(). Worker 2 is built with crashAt=null and never
       // crashes. Separate latches mean worker 2's build can't be polluted by
       // worker 1's state, and worker 1's crash is deterministic.
-      const build = (label: string, crashAt: number | null) =>
-        createWorkflow(wfId, {
-          steps: {
-            work: {
-              handler: async (ctx) => {
-                const final = await ctx.loop(
-                  { log: [] as number[] },
-                  async (state, i) => {
-                    if (crashAt !== null && i >= crashAt) {
-                      throw new Error('worker crash');
-                    }
-                    executedBy.push([label, i]);
-                    return { state: { log: [...state.log, i] }, done: i >= 3 };
-                  },
-                  { maxIterations: 10 },
-                );
-                return { log: final.log };
-              },
-              retries: 2,
-              // 10s is well above TIMING.SHORT_DELAY_THRESHOLD_MS (5s): even at
-              // the maximum negative backoff jitter (−30% ⇒ 7s), the effective
-              // retry delay stays above the inline-retry threshold, so worker
-              // 1's failed attempt is ALWAYS scheduled as a DURABLE retry and
-              // never slept-and-retried inside its own execute(). This is what
-              // makes the restart simulation deterministic — the previous 5500
-              // could dip below 5s under jitter (−30% ⇒ 3850ms) and trigger an
-              // inline retry, defeating the crash-and-hand-off.
-              retryDelay: 10_000,
+      const config = (
+        label: string,
+        crashAt: number | null,
+      ): WorkflowConfig<Record<string, unknown>> => ({
+        steps: {
+          work: {
+            handler: async (ctx) => {
+              const final = await ctx.loop(
+                { log: [] as number[] },
+                async (state, i) => {
+                  if (crashAt !== null && i >= crashAt) {
+                    throw new Error('worker crash');
+                  }
+                  executedBy.push([label, i]);
+                  return { state: { log: [...state.log, i] }, done: i >= 3 };
+                },
+                { maxIterations: 10 },
+              );
+              return { log: final.log };
             },
+            retries: 2,
+            // 10s is well above TIMING.SHORT_DELAY_THRESHOLD_MS (5s): even at
+            // the maximum negative backoff jitter (−30% ⇒ 7s), the effective
+            // retry delay stays above the inline-retry threshold, so worker
+            // 1's failed attempt is ALWAYS scheduled as a DURABLE retry and
+            // never slept-and-retried inside its own execute(). This is what
+            // makes the restart simulation deterministic — the previous 5500
+            // could dip below 5s under jitter (−30% ⇒ 3850ms) and trigger an
+            // inline retry, defeating the crash-and-hand-off.
+            retryDelay: 10_000,
           },
-          autoExecute: false,
-        });
+        },
+        autoExecute: false,
+      });
 
       // Worker 1 executes iterations 0,1 then "crashes" (permanently) at
       // iteration 2, scheduling a durable retry.
-      const wf1 = build('w1', 2);
+      const wf1 = env.workflow('loop-restart', config('w1', 2));
       const run = await wf1.start({});
       const r1 = await wf1.execute(run._id);
       // The failed attempt is scheduled for a durable retry, NOT completed.
@@ -418,30 +394,32 @@ describe('generalized APIs (2.7.0)', () => {
       // at iteration 2 with the accumulator [0,1] — this is exactly what a
       // fresh worker must resume from. Asserting the persisted checkpoint (not
       // just run.status) removes any dependence on inline-vs-durable timing.
-      const afterCrash = (await wf1.get(run._id)) as Record<string, unknown> | null;
+      const afterCrash = await env.runs.get(run._id);
       expect(afterCrash).not.toBeNull();
-      expect(stepOutput(afterCrash as Record<string, unknown>, 'work')).toEqual({
+      expect(stepOutput(afterCrash ?? {}, 'work')).toEqual({
         __checkpoint: { __loopIteration: 2, state: { log: [0, 1] } },
       });
       expect(executedBy).toEqual([
         ['w1', 0],
         ['w1', 1],
       ]);
+      // The durable retry is scheduled in the future (the ~10s backoff).
+      const retryAfter = afterCrash?.steps[0]?.retryAfter;
+      expect(retryAfter).toBeInstanceOf(Date);
+      expect((retryAfter as Date).getTime()).toBeGreaterThan(Date.now());
 
       wf1.shutdown();
 
-      // Worker 2 (fresh engine, fresh process semantics) drives the retry —
-      // polling executeRetry the way a real worker's scheduler does (the
-      // exact retryAfter carries backoff jitter, so a single timed shot
-      // would race the clock).
-      const wf2 = build('w2', null);
-      const deadline = Date.now() + 15_000;
-      let claimed: unknown = null;
-      while (!claimed && Date.now() < deadline) {
-        claimed = await wf2.engine.executeRetry(run._id);
-        if (!claimed) await sleep(250);
-      }
-      const final = await waitForStatus(wf2, run._id, ['done']);
+      // Advance the clock past the backoff instead of sleeping through it:
+      // the retry is now due, exactly as a worker's scheduler would find it.
+      await env.runs.makeDue(run._id);
+
+      // Worker 2 (fresh engine, fresh process semantics — same workflow id)
+      // drives the retry the way a real worker's scheduler does.
+      const wf2 = env.redefine(wf1, config('w2', null));
+      const claimed = await wf2.engine.executeRetry(run._id);
+      expect(claimed).toBeTruthy();
+      const final = await env.until(run._id, 'done', WAIT);
 
       // Iterations 0,1 ran ONLY on worker 1; worker 2 resumed AT iteration 2
       // — not from 0 — with the committed accumulator intact.
@@ -452,8 +430,6 @@ describe('generalized APIs (2.7.0)', () => {
         ['w2', 3],
       ]);
       expect(stepOutput(final, 'work')).toEqual({ log: [0, 1, 2, 3] });
-
-      wf2.shutdown();
     });
   });
 });

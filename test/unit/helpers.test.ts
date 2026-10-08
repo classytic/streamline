@@ -3,7 +3,7 @@
  * Pure functions — no DB required.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { calculateRetryDelay, resolveBackoffMultiplier } from '../../src/utils/helpers.js';
 
 describe('calculateRetryDelay', () => {

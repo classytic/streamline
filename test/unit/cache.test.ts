@@ -3,11 +3,14 @@
  * LRU cache behavior — no DB required.
  */
 
-import { describe, it, expect } from 'vitest';
-import { WorkflowCache } from '../../src/storage/cache.js';
+import { describe, expect, it } from 'vitest';
 import type { WorkflowRun } from '../../src/core/types.js';
+import { WorkflowCache } from '../../src/storage/cache.js';
 
-function makeRun(id: string, status: 'running' | 'waiting' | 'done' | 'failed' = 'running'): WorkflowRun {
+function makeRun(
+  id: string,
+  status: 'running' | 'waiting' | 'done' | 'failed' = 'running',
+): WorkflowRun {
   return {
     _id: id,
     workflowId: 'test',

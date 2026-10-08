@@ -9,44 +9,58 @@
  * 5. Step interface includes parallel/conditional properties
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
-import mongoose from 'mongoose';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type {
+  Step,
+  StepContext,
+  WorkflowDefinition,
+  WorkflowHandlers,
+} from '../../src/core/types.js';
+import { WorkflowEngine } from '../../src/index.js';
 import { SchedulingService } from '../../src/scheduling/scheduling.service.js';
-import { createWorkflow, WorkflowEngine, createContainer } from '../../src/index.js';
-import type { Step, StepContext } from '../../src/core/types.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-// Track workflows for cleanup
-const createdWorkflows: { shutdown: () => void }[] = [];
+const env = useStreamlineEnv();
 
-describe('Critical Engine Fixes', () => {
-  // Test workflow definition using createWorkflow
-  const workflow = createWorkflow<{ result?: string; signalReceived?: boolean }>('test-critical-fixes', {
-    steps: {
-      step1: async (ctx) => {
-        await ctx.set('result', 'step1-done');
-        return 'step1-output';
-      },
-      step2: async (ctx) => {
-        // Verify AbortSignal is available
-        await ctx.set('signalReceived', ctx.signal instanceof AbortSignal);
-        return 'step2-output';
-      },
-      step3: async () => 'step3-output',
-    },
-    context: () => ({}),
-    version: '1.0.0',
+type Ctx = { result?: string; signalReceived?: boolean };
+
+// Engines built directly (outside env.workflow — env.worker only wraps
+// createWorkflow) — each on its own env container, like a separate process, on
+// the env's database. The env disposes the containers; the engines are shut
+// down here after each test.
+const engines: Array<{ shutdown(): void }> = [];
+afterEach(() => {
+  for (const engine of engines.splice(0)) engine.shutdown();
+});
+function engineOnOwnContainer<TContext>(
+  definition: WorkflowDefinition<TContext>,
+  handlers: WorkflowHandlers<TContext>,
+): WorkflowEngine<TContext> {
+  const engine = new WorkflowEngine(definition, handlers, env.createContainer(), {
     autoExecute: false,
   });
+  engines.push(engine);
+  return engine;
+}
 
+/** Scheduled draft fields for a run due at `at`. */
+const scheduledAt = (at: Date, extra: Record<string, unknown> = {}) => ({
+  scheduledFor: at.toISOString(),
+  timezone: 'UTC',
+  localTimeDisplay: 'test',
+  executionTime: at,
+  isDSTTransition: false,
+  ...extra,
+});
+
+describe('Critical Engine Fixes', () => {
   // Handlers for SchedulingService tests (separate from workflow)
-  const handlers = {
-    step1: async (ctx: StepContext<any>) => {
+  const handlers: WorkflowHandlers<Ctx> = {
+    step1: async (ctx: StepContext<Ctx>) => {
       await ctx.set('result', 'step1-done');
       return 'step1-output';
     },
-    step2: async (ctx: StepContext<any>) => {
+    step2: async (ctx: StepContext<Ctx>) => {
       // Verify AbortSignal is available
       await ctx.set('signalReceived', ctx.signal instanceof AbortSignal);
       return 'step2-output';
@@ -54,29 +68,30 @@ describe('Critical Engine Fixes', () => {
     step3: async () => 'step3-output',
   };
 
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(
-        process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test'
-      );
-    }
-  });
-
-  afterAll(async () => {
-    // Shutdown all workflows first to stop background processes
-    createdWorkflows.forEach((w) => w.shutdown());
-    workflow.shutdown();
-    await mongoose.connection.close();
-  });
-
-  beforeEach(async () => {
-    await WorkflowRunModel.deleteMany({});
-    createdWorkflows.length = 0;
-  });
+  // Test workflow definition using createWorkflow (per test — the env shuts it down)
+  const criticalWorkflow = () =>
+    env.workflow<Ctx>('test-critical-fixes', {
+      steps: {
+        step1: async (ctx) => {
+          await ctx.set('result', 'step1-done');
+          return 'step1-output';
+        },
+        step2: async (ctx) => {
+          // Verify AbortSignal is available
+          await ctx.set('signalReceived', ctx.signal instanceof AbortSignal);
+          return 'step2-output';
+        },
+        step3: async () => 'step3-output',
+      },
+      context: () => ({}),
+      version: '1.0.0',
+    });
 
   describe('Fix 1: Scheduled Workflows Step Initialization', () => {
     it('should create scheduled workflow with properly initialized steps', async () => {
-      const service = new SchedulingService(workflow.definition, handlers);
+      const service = new SchedulingService(criticalWorkflow().definition, handlers, {
+        container: env.container,
+      });
       const futureTime = new Date(Date.now() + 60000);
 
       const run = await service.schedule({
@@ -87,11 +102,11 @@ describe('Critical Engine Fixes', () => {
 
       // Steps should be initialized from workflow definition
       expect(run.steps).toHaveLength(3);
-      expect(run.steps[0].stepId).toBe('step1');
-      expect(run.steps[0].status).toBe('pending');
-      expect(run.steps[0].attempts).toBe(0);
-      expect(run.steps[1].stepId).toBe('step2');
-      expect(run.steps[2].stepId).toBe('step3');
+      expect(run.steps[0]?.stepId).toBe('step1');
+      expect(run.steps[0]?.status).toBe('pending');
+      expect(run.steps[0]?.attempts).toBe(0);
+      expect(run.steps[1]?.stepId).toBe('step2');
+      expect(run.steps[2]?.stepId).toBe('step3');
 
       // currentStepId should be set to first step
       expect(run.currentStepId).toBe('step1');
@@ -101,19 +116,20 @@ describe('Critical Engine Fixes', () => {
     });
 
     it('should initialize context using workflow createContext function', async () => {
-      const workflowWithContext = createWorkflow<{ initialized: boolean; input: any }>('test-context-init', {
+      type InitCtx = { initialized: boolean; input: unknown };
+      const workflowWithContext = env.workflow<InitCtx>('test-context-init', {
         steps: {
           step1: async () => 'done',
         },
         context: (input) => ({ initialized: true, input }),
         version: '1.0.0',
-        autoExecute: false,
       });
-      createdWorkflows.push(workflowWithContext);
 
-      const service = new SchedulingService(workflowWithContext.definition, {
-        step1: async () => 'done',
-      });
+      const service = new SchedulingService(
+        workflowWithContext.definition,
+        { step1: async () => 'done' },
+        { container: env.container },
+      );
 
       const run = await service.schedule({
         scheduledFor: new Date(Date.now() + 60000),
@@ -131,30 +147,20 @@ describe('Critical Engine Fixes', () => {
       const pastTime = new Date(Date.now() - 1000);
 
       // Create a scheduled workflow ready to execute
-      await WorkflowRunModel.create({
+      await env.runs.insert('test-workflow', {
         _id: 'atomic-claim-test',
-        workflowId: 'test-workflow',
         status: 'draft',
         steps: [{ stepId: 'step1', status: 'pending', attempts: 0 }],
         currentStepId: 'step1',
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        scheduling: {
-          scheduledFor: pastTime,
-          timezone: 'UTC',
-          localTimeDisplay: 'test',
-          executionTime: pastTime,
-          isDSTTransition: false,
-        },
+        scheduling: scheduledAt(pastTime),
       });
 
       // Simulate two schedulers trying to claim the same workflow
       const now = new Date();
+      const repository = env.container.repository;
 
       // First claim should succeed
-      const claim1 = await workflowRunRepository.updateOne(
+      const claim1 = await repository.updateOne(
         {
           _id: 'atomic-claim-test',
           status: 'draft',
@@ -164,11 +170,11 @@ describe('Critical Engine Fixes', () => {
           status: 'running',
           startedAt: now,
           updatedAt: now,
-        }
+        },
       );
 
       // Second claim should fail (workflow already claimed)
-      const claim2 = await workflowRunRepository.updateOne(
+      const claim2 = await repository.updateOne(
         {
           _id: 'atomic-claim-test',
           status: 'draft', // This condition will fail - already 'running'
@@ -178,14 +184,14 @@ describe('Critical Engine Fixes', () => {
           status: 'running',
           startedAt: now,
           updatedAt: now,
-        }
+        },
       );
 
       expect(claim1.modifiedCount).toBe(1);
       expect(claim2.modifiedCount).toBe(0);
 
       // Verify workflow is now running
-      const workflowRun = await WorkflowRunModel.findById('atomic-claim-test');
+      const workflowRun = await env.runs.get('atomic-claim-test');
       expect(workflowRun?.status).toBe('running');
     });
   });
@@ -193,87 +199,27 @@ describe('Critical Engine Fixes', () => {
   describe('Fix 3: getScheduled() Filter Support', () => {
     beforeEach(async () => {
       // Create test workflows with different execution times
-      const baseDate = new Date('2024-06-15T12:00:00Z');
+      const draft = (id: string, at: string, extra: Record<string, unknown> = {}) =>
+        env.runs.insert('test', {
+          _id: id,
+          status: 'draft',
+          steps: [],
+          currentStepId: null,
+          scheduling: scheduledAt(new Date(at), extra),
+        });
 
-      await WorkflowRunModel.create([
-        {
-          _id: 'scheduled-early',
-          workflowId: 'test',
-          status: 'draft',
-          steps: [],
-          currentStepId: null,
-          context: {},
-          input: {},
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          scheduling: {
-            scheduledFor: new Date('2024-06-10T10:00:00Z'),
-            timezone: 'UTC',
-            localTimeDisplay: 'test',
-            executionTime: new Date('2024-06-10T10:00:00Z'),
-            isDSTTransition: false,
-          },
-        },
-        {
-          _id: 'scheduled-mid',
-          workflowId: 'test',
-          status: 'draft',
-          steps: [],
-          currentStepId: null,
-          context: {},
-          input: {},
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          scheduling: {
-            scheduledFor: new Date('2024-06-15T10:00:00Z'),
-            timezone: 'UTC',
-            localTimeDisplay: 'test',
-            executionTime: new Date('2024-06-15T10:00:00Z'),
-            isDSTTransition: false,
-          },
-        },
-        {
-          _id: 'scheduled-late',
-          workflowId: 'test',
-          status: 'draft',
-          steps: [],
-          currentStepId: null,
-          context: {},
-          input: {},
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          scheduling: {
-            scheduledFor: new Date('2024-06-20T10:00:00Z'),
-            timezone: 'UTC',
-            localTimeDisplay: 'test',
-            executionTime: new Date('2024-06-20T10:00:00Z'),
-            isDSTTransition: false,
-          },
-        },
-        {
-          _id: 'scheduled-recurring',
-          workflowId: 'test',
-          status: 'draft',
-          steps: [],
-          currentStepId: null,
-          context: {},
-          input: {},
-          createdAt: new Date(),
-          updatedAt: new Date(),
-          scheduling: {
-            scheduledFor: new Date('2024-06-15T10:00:00Z'),
-            timezone: 'UTC',
-            localTimeDisplay: 'test',
-            executionTime: new Date('2024-06-15T10:00:00Z'),
-            isDSTTransition: false,
-            recurrence: { pattern: 'daily' },
-          },
-        },
-      ]);
+      await draft('scheduled-early', '2024-06-10T10:00:00Z');
+      await draft('scheduled-mid', '2024-06-15T10:00:00Z');
+      await draft('scheduled-late', '2024-06-20T10:00:00Z');
+      await draft('scheduled-recurring', '2024-06-15T10:00:00Z', {
+        recurrence: { pattern: 'daily' },
+      });
     });
 
     it('should filter by executionTimeRange', async () => {
-      const service = new SchedulingService(workflow.definition, handlers);
+      const service = new SchedulingService(criticalWorkflow().definition, handlers, {
+        container: env.container,
+      });
 
       const result = await service.getScheduled({
         executionTimeRange: {
@@ -284,7 +230,7 @@ describe('Critical Engine Fixes', () => {
 
       // Should only return workflows in the range (mid and recurring)
       expect(result.data).toHaveLength(2);
-      const ids = result.data.map((d: any) => d._id);
+      const ids = result.data.map((d) => d._id);
       expect(ids).toContain('scheduled-mid');
       expect(ids).toContain('scheduled-recurring');
       expect(ids).not.toContain('scheduled-early');
@@ -292,7 +238,9 @@ describe('Critical Engine Fixes', () => {
     });
 
     it('should filter by recurring=true', async () => {
-      const service = new SchedulingService(workflow.definition, handlers);
+      const service = new SchedulingService(criticalWorkflow().definition, handlers, {
+        container: env.container,
+      });
 
       const result = await service.getScheduled({
         recurring: true,
@@ -300,11 +248,13 @@ describe('Critical Engine Fixes', () => {
 
       // Should only return recurring workflows
       expect(result.data).toHaveLength(1);
-      expect(result.data[0]._id).toBe('scheduled-recurring');
+      expect(result.data[0]?._id).toBe('scheduled-recurring');
     });
 
     it('should filter by recurring=false', async () => {
-      const service = new SchedulingService(workflow.definition, handlers);
+      const service = new SchedulingService(criticalWorkflow().definition, handlers, {
+        container: env.container,
+      });
 
       const result = await service.getScheduled({
         recurring: false,
@@ -312,13 +262,14 @@ describe('Critical Engine Fixes', () => {
 
       // Should only return non-recurring workflows
       expect(result.data).toHaveLength(3);
-      const ids = result.data.map((d: any) => d._id);
+      const ids = result.data.map((d) => d._id);
       expect(ids).not.toContain('scheduled-recurring');
     });
   });
 
   describe('Fix 4: AbortSignal in StepContext', () => {
     it('should provide AbortSignal to step handlers', async () => {
+      const workflow = criticalWorkflow();
       const run = await workflow.start({ test: true });
       await workflow.execute(run._id);
 
@@ -330,9 +281,9 @@ describe('Critical Engine Fixes', () => {
 
     it('should abort signal on timeout', async () => {
       let signalAborted = false;
-      let abortReason: any = null;
+      let abortReason: unknown = null;
 
-      const timeoutWorkflow = createWorkflow<{}>('timeout-test', {
+      const timeoutWorkflow = env.workflow<Record<string, never>>('timeout-test', {
         steps: {
           slow: async (ctx) => {
             ctx.signal.addEventListener('abort', () => {
@@ -347,9 +298,7 @@ describe('Critical Engine Fixes', () => {
         },
         context: () => ({}),
         version: '1.0.0',
-        autoExecute: false,
       });
-      createdWorkflows.push(timeoutWorkflow);
 
       // Access the engine to set step timeout (since createWorkflow doesn't support per-step timeout in steps object)
       // We need to use the engine directly with a modified definition
@@ -358,8 +307,8 @@ describe('Critical Engine Fixes', () => {
         steps: [{ id: 'slow', name: 'Slow Step', timeout: 100 }], // 100ms timeout
       };
 
-      const engine = new WorkflowEngine(timeoutDefinition, {
-        slow: async (ctx: StepContext<unknown>) => {
+      const engine = engineOnOwnContainer(timeoutDefinition, {
+        slow: async (ctx: StepContext<Record<string, never>>) => {
           ctx.signal.addEventListener('abort', () => {
             signalAborted = true;
             abortReason = ctx.signal.reason;
@@ -369,10 +318,7 @@ describe('Critical Engine Fixes', () => {
           await new Promise((resolve) => setTimeout(resolve, 500));
           return 'should not reach';
         },
-      }, createContainer(), {
-        autoExecute: false,
       });
-      createdWorkflows.push({ shutdown: () => engine.shutdown() });
 
       const run = await engine.start({});
 
@@ -383,11 +329,11 @@ describe('Critical Engine Fixes', () => {
         // Expected to throw
       }
 
-      // Give time for abort event to fire
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // The abort event fires on the timeout — wait for it, not a guessed delay.
+      await env.eventually(() => expect(signalAborted).toBe(true), { timeout: 1000 });
 
       expect(signalAborted).toBe(true);
-      expect(abortReason?.message).toContain('timeout');
+      expect((abortReason as Error | null)?.message).toContain('timeout');
     });
   });
 
@@ -396,7 +342,7 @@ describe('Critical Engine Fixes', () => {
       const conditionalStep: Step = {
         id: 'conditional-test',
         name: 'Conditional Test',
-        condition: (ctx, run) => ctx.shouldRun === true,
+        condition: (ctx) => (ctx as { shouldRun?: boolean }).shouldRun === true,
       };
 
       expect(typeof conditionalStep.condition).toBe('function');
@@ -406,7 +352,7 @@ describe('Critical Engine Fixes', () => {
       const skipStep: Step = {
         id: 'skip-test',
         name: 'Skip Test',
-        skipIf: (ctx) => ctx.skip === true,
+        skipIf: (ctx) => (ctx as { skip?: boolean }).skip === true,
       };
 
       expect(typeof skipStep.skipIf).toBe('function');
@@ -416,16 +362,18 @@ describe('Critical Engine Fixes', () => {
       const runIfStep: Step = {
         id: 'runif-test',
         name: 'RunIf Test',
-        runIf: (ctx) => ctx.enabled === true,
+        runIf: (ctx) => (ctx as { enabled?: boolean }).enabled === true,
       };
 
       expect(typeof runIfStep.runIf).toBe('function');
     });
 
     it('should work with createWorkflow using conditional step', async () => {
+      type CondCtx = { shouldRun: boolean; executed?: boolean };
+
       // For conditional steps with runIf, we need to use WorkflowEngine directly
       // since createWorkflow's simple step object doesn't support runIf
-      const conditionalDefinition = {
+      const conditionalDefinition: WorkflowDefinition<CondCtx> = {
         id: 'conditional-workflow',
         name: 'Conditional Workflow',
         version: '1.0.0',
@@ -433,15 +381,15 @@ describe('Critical Engine Fixes', () => {
           {
             id: 'conditional',
             name: 'Conditional Step',
-            runIf: (ctx: any) => ctx.shouldRun === true,
+            runIf: (ctx) => (ctx as CondCtx).shouldRun === true,
           },
           { id: 'always', name: 'Always Runs' },
         ],
-        createContext: (input: any) => ({ shouldRun: input.shouldRun }),
+        createContext: (input) => ({ shouldRun: (input as { shouldRun: boolean }).shouldRun }),
       };
 
-      const conditionalHandlers = {
-        conditional: async (ctx: StepContext<any>) => {
+      const conditionalHandlers: WorkflowHandlers<CondCtx> = {
+        conditional: async (ctx) => {
           await ctx.set('executed', true);
           return 'conditional-done';
         },
@@ -449,20 +397,14 @@ describe('Critical Engine Fixes', () => {
       };
 
       // Test with shouldRun = true
-      const engine1 = new WorkflowEngine(conditionalDefinition, conditionalHandlers, createContainer(), {
-        autoExecute: false,
-      });
-      createdWorkflows.push({ shutdown: () => engine1.shutdown() });
+      const engine1 = engineOnOwnContainer(conditionalDefinition, conditionalHandlers);
       const run1 = await engine1.start({ shouldRun: true });
       await engine1.execute(run1._id);
       const result1 = await engine1.get(run1._id);
       expect(result1?.context.executed).toBe(true);
 
       // Test with shouldRun = false
-      const engine2 = new WorkflowEngine(conditionalDefinition, conditionalHandlers, createContainer(), {
-        autoExecute: false,
-      });
-      createdWorkflows.push({ shutdown: () => engine2.shutdown() });
+      const engine2 = engineOnOwnContainer(conditionalDefinition, conditionalHandlers);
       const run2 = await engine2.start({ shouldRun: false });
       await engine2.execute(run2._id);
       const result2 = await engine2.get(run2._id);
@@ -472,59 +414,49 @@ describe('Critical Engine Fixes', () => {
 
   describe('Fix 6: Repository updateOne with MongoDB Operators', () => {
     it('should support simple object updates (wrapped in $set)', async () => {
-      await WorkflowRunModel.create({
+      await env.runs.insert('test', {
         _id: 'update-test-simple',
-        workflowId: 'test',
         status: 'draft',
         steps: [],
         currentStepId: null,
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
       });
 
       // Simple object update (should be wrapped in $set)
-      const result = await workflowRunRepository.updateOne(
+      const result = await env.container.repository.updateOne(
         { _id: 'update-test-simple' },
-        { status: 'running', startedAt: new Date() }
+        { status: 'running', startedAt: new Date() },
       );
 
       expect(result.modifiedCount).toBe(1);
 
-      const updated = await WorkflowRunModel.findById('update-test-simple');
+      const updated = await env.runs.get('update-test-simple');
       expect(updated?.status).toBe('running');
       expect(updated?.startedAt).toBeDefined();
     });
 
     it('should support MongoDB operators ($set, $unset)', async () => {
-      await WorkflowRunModel.create({
+      await env.runs.insert('test', {
         _id: 'update-test-operators',
-        workflowId: 'test',
         status: 'draft',
         steps: [{ stepId: 'step1', status: 'pending', attempts: 0, error: { message: 'old' } }],
         currentStepId: 'step1',
-        context: {},
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
       });
 
       // Update with MongoDB operators
-      const result = await workflowRunRepository.updateOne(
+      const result = await env.container.repository.updateOne(
         { _id: 'update-test-operators' },
         {
           $set: { 'steps.0.status': 'running', 'steps.0.attempts': 1 },
           $unset: { 'steps.0.error': '' },
-        }
+        },
       );
 
       expect(result.modifiedCount).toBe(1);
 
-      const updated = await WorkflowRunModel.findById('update-test-operators');
-      expect(updated?.steps[0].status).toBe('running');
-      expect(updated?.steps[0].attempts).toBe(1);
-      expect(updated?.steps[0].error).toBeUndefined();
+      const updated = await env.runs.get('update-test-operators');
+      expect(updated?.steps[0]?.status).toBe('running');
+      expect(updated?.steps[0]?.attempts).toBe(1);
+      expect(updated?.steps[0]?.error).toBeUndefined();
     });
   });
 });

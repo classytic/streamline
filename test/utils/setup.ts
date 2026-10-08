@@ -5,9 +5,9 @@
  * Ensures isolated, reproducible test environment
  */
 
+import { configureLogger } from '@classytic/mongokit';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
-import { configureLogger } from '@classytic/mongokit';
 
 let mongoServer: MongoMemoryServer | null = null;
 
@@ -95,7 +95,7 @@ export async function waitFor(ms: number): Promise<void> {
 export async function waitUntil(
   condition: () => boolean | Promise<boolean>,
   timeout: number = 5000,
-  interval: number = 100
+  interval: number = 100,
 ): Promise<boolean> {
   const startTime = Date.now();
 
@@ -115,7 +115,7 @@ export async function waitUntil(
 export async function assertWorkflowStatus(
   getWorkflow: () => Promise<any>,
   expectedStatus: string,
-  timeout: number = 5000
+  timeout: number = 5000,
 ): Promise<boolean> {
   return waitUntil(async () => {
     const workflow = await getWorkflow();

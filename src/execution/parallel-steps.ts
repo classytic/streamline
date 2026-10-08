@@ -10,6 +10,7 @@ import type {
   StepState,
   WorkflowRun,
 } from '../core/types.js';
+import type { WorkflowEngineOptions } from './engine.js';
 import { workflowRegistry } from './registries.js';
 
 /**
@@ -32,6 +33,7 @@ import { workflowRegistry } from './registries.js';
 /** Minimal engine view the branch-join helpers need (mirrors ChildWorkflowEngine). */
 export interface BranchJoinEngine<TContext> {
   readonly container: StreamlineContainer;
+  readonly options: Pick<WorkflowEngineOptions, 'compensationHandlers'>;
   get(runId: string): Promise<WorkflowRun<TContext> | null>;
   resume(runId: string, payload?: unknown): Promise<WorkflowRun<TContext>>;
   /**
@@ -359,10 +361,14 @@ export async function handleBranchJoinWait<TContext>(
   }
 
   // ---- Quorum not met: re-arm listeners + push the reconcile cadence ----
+  // Only branches still running: a finished child never emits again, so a
+  // listener for it would sit on the bus forever.
   if (!startedAny) {
-    for (const b of data.branches) {
-      if (b.childRunId) registerBranchCompletionListeners(engine, runId, b.childRunId);
-    }
+    data.branches.forEach((b, i) => {
+      const status = results[i]?.status;
+      const finished = status === 'done' || status === 'failed' || status === 'cancelled';
+      if (b.childRunId && !finished) registerBranchCompletionListeners(engine, runId, b.childRunId);
+    });
   }
 
   if (stepIndex !== -1) {
@@ -442,6 +448,8 @@ export async function writeBranchJoinFailure<TContext>(
     endedAt: now,
     updatedAt: now,
     error: { message: error.message, code: error.code },
+    // Crash marker: the saga is entered after this write (see compensationDue).
+    ...(engine.options.compensationHandlers ? { compensationDue: true } : {}),
   };
   const unset: Record<string, unknown> = {};
   if (stepIndex !== -1) {
@@ -499,16 +507,29 @@ function registerBranchCompletionListeners<TContext>(
   runId: string,
   childRunId: string,
 ): void {
+  // Idempotent per (parent, child) on this bus: every reconcile that misses
+  // quorum re-arms listeners for every branch, so without this they piled up
+  // per poll — on a long-lived worker, without bound.
+  const bus = engine.container.eventBus;
+  let armed = armedBranchListeners.get(bus);
+  if (!armed) {
+    armed = new Set();
+    armedBranchListeners.set(bus, armed);
+  }
+  const key = `${runId}:${childRunId}`;
+  if (armed.has(key)) return;
+  armed.add(key);
+
   const reDrive = async (payload: { runId?: string }) => {
     if (!payload.runId || payload.runId !== childRunId) return;
+    // A child emits exactly ONE terminal event: this listener's job ends now,
+    // whatever the re-drive below decides.
+    cleanup();
     try {
       const current = await engine.get(runId);
       if (!current) return;
       const step = current.steps.find((s) => s.stepId === current.currentStepId);
-      if (current.status !== 'waiting' || step?.waitingFor?.type !== 'branchJoin') {
-        cleanup();
-        return;
-      }
+      if (current.status !== 'waiting' || step?.waitingFor?.type !== 'branchJoin') return;
       await handleBranchJoinWait(engine, runId, current);
     } catch {
       // Parent may have resumed/cancelled — listener no-ops.
@@ -516,12 +537,16 @@ function registerBranchCompletionListeners<TContext>(
   };
 
   const cleanup = () => {
-    engine.container.eventBus.off('workflow:completed', reDrive);
-    engine.container.eventBus.off('workflow:failed', reDrive);
-    engine.container.eventBus.off('workflow:cancelled', reDrive);
+    armed.delete(key);
+    bus.off('workflow:completed', reDrive);
+    bus.off('workflow:failed', reDrive);
+    bus.off('workflow:cancelled', reDrive);
   };
 
-  engine.container.eventBus.on('workflow:completed', reDrive);
-  engine.container.eventBus.on('workflow:failed', reDrive);
-  engine.container.eventBus.on('workflow:cancelled', reDrive);
+  bus.on('workflow:completed', reDrive);
+  bus.on('workflow:failed', reDrive);
+  bus.on('workflow:cancelled', reDrive);
 }
+
+/** `${parentRunId}:${childRunId}` keys with live branch listeners, per bus. */
+const armedBranchListeners = new WeakMap<object, Set<string>>();

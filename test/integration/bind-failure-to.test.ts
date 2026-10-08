@@ -17,23 +17,31 @@
  *   - Best-effort: model.findByIdAndUpdate throwing doesn't crash the bus
  */
 
+import { type Model, Schema } from 'mongoose';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import mongoose, { Schema, type Model } from 'mongoose';
-import { createWorkflow, configureStreamlineLogger } from '../../src/index.js';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
+import { configureStreamlineLogger } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
+const env = useStreamlineEnv();
+
+// Every workflow here shares the env container's bus. `shutdown()` (run by
+// `env.clear()`) drops each workflow's own `bindFailureTo` subscriptions; this
+// list also covers listeners a test adds to the bus directly.
+const subscriptions: Array<() => void> = [];
+const track = (off: () => void) => {
+  subscriptions.push(off);
+  return off;
+};
+afterEach(() => {
+  for (const off of subscriptions.splice(0)) off();
+});
+
+beforeAll(() => {
   configureStreamlineLogger({ enabled: false });
 });
 
-afterAll(async () => {
+afterAll(() => {
   configureStreamlineLogger({ enabled: true });
-  await teardownTestDB();
-});
-
-afterEach(async () => {
-  await cleanupTestDB();
 });
 
 // ── Parent-doc model (one fresh model per test to avoid mongoose name clash) ─
@@ -51,7 +59,13 @@ function makeParentModel(): Model<ParentDoc> {
     errorMessage: String,
     errorDetails: { code: String, message: String },
   });
-  return mongoose.model<ParentDoc>(name, schema);
+  return env.connection.model<ParentDoc>(name, schema);
+}
+
+async function expectParentFailed(model: Model<ParentDoc>, id: unknown): Promise<void> {
+  await env.eventually(async () => {
+    expect((await model.findById(id))?.status).toBe('failed');
+  });
 }
 
 // ── Workflow that always fails (one fresh id per test) ──────────────────────
@@ -59,23 +73,23 @@ function makeParentModel(): Model<ParentDoc> {
 function makeFailingWorkflow<TInput = Record<string, unknown>>(
   contextBuilder?: (input: TInput) => Record<string, unknown>,
 ) {
-  const id = `failing_${Math.random().toString(36).slice(2, 9)}`;
-  return createWorkflow<Record<string, unknown>, TInput>(id, {
+  return env.workflow<Record<string, unknown>, TInput>('failing', {
     steps: {
       explode: async () => {
         throw new Error('intentional failure for test');
       },
     },
     ...(contextBuilder && { context: contextBuilder }),
+    autoExecute: true,
   });
 }
 
 function makeSucceedingWorkflow() {
-  const id = `succeeding_${Math.random().toString(36).slice(2, 9)}`;
-  return createWorkflow<Record<string, unknown>, Record<string, unknown>>(id, {
+  return env.workflow<Record<string, unknown>, Record<string, unknown>>('succeeding', {
     steps: {
       ok: async () => ({ done: true }),
     },
+    autoExecute: true,
   });
 }
 
@@ -87,23 +101,17 @@ describe('workflow.bindFailureTo — default source: input', () => {
     const parent = await ParentModel.create({ status: 'running' });
 
     const workflow = makeFailingWorkflow();
-    workflow.bindFailureTo({
-      model: ParentModel,
-      key: 'parentId',
-      field: 'status',
-      value: 'failed',
-    });
+    track(
+      workflow.bindFailureTo({
+        model: ParentModel,
+        key: 'parentId',
+        field: 'status',
+        value: 'failed',
+      }),
+    );
 
     await workflow.start({ parentId: String(parent._id) });
-    await waitUntil(async () => {
-      const fresh = await ParentModel.findById(parent._id);
-      return fresh?.status === 'failed';
-    });
-
-    const fresh = await ParentModel.findById(parent._id);
-    expect(fresh?.status).toBe('failed');
-
-    workflow.shutdown();
+    await expectParentFailed(ParentModel, parent._id);
   });
 
   it("defaults value to 'failed' when not specified", async () => {
@@ -111,22 +119,16 @@ describe('workflow.bindFailureTo — default source: input', () => {
     const parent = await ParentModel.create({ status: 'running' });
 
     const workflow = makeFailingWorkflow();
-    workflow.bindFailureTo({
-      model: ParentModel,
-      key: 'parentId',
-      field: 'status',
-    });
+    track(
+      workflow.bindFailureTo({
+        model: ParentModel,
+        key: 'parentId',
+        field: 'status',
+      }),
+    );
 
     await workflow.start({ parentId: String(parent._id) });
-    await waitUntil(async () => {
-      const fresh = await ParentModel.findById(parent._id);
-      return fresh?.status === 'failed';
-    });
-
-    const fresh = await ParentModel.findById(parent._id);
-    expect(fresh?.status).toBe('failed');
-
-    workflow.shutdown();
+    await expectParentFailed(ParentModel, parent._id);
   });
 });
 
@@ -138,23 +140,17 @@ describe('workflow.bindFailureTo — source: context', () => {
     const workflow = makeFailingWorkflow<{ orderId: string }>((input) => ({
       derivedParentId: input.orderId,
     }));
-    workflow.bindFailureTo({
-      model: ParentModel,
-      source: 'context',
-      key: 'derivedParentId',
-      field: 'status',
-    });
+    track(
+      workflow.bindFailureTo({
+        model: ParentModel,
+        source: 'context',
+        key: 'derivedParentId',
+        field: 'status',
+      }),
+    );
 
     await workflow.start({ orderId: String(parent._id) });
-    await waitUntil(async () => {
-      const fresh = await ParentModel.findById(parent._id);
-      return fresh?.status === 'failed';
-    });
-
-    const fresh = await ParentModel.findById(parent._id);
-    expect(fresh?.status).toBe('failed');
-
-    workflow.shutdown();
+    await expectParentFailed(ParentModel, parent._id);
   });
 });
 
@@ -164,22 +160,16 @@ describe('workflow.bindFailureTo — function key resolver', () => {
     const parent = await ParentModel.create({ status: 'running' });
 
     const workflow = makeFailingWorkflow<{ envelope: { parentId: string } }>();
-    workflow.bindFailureTo({
-      model: ParentModel,
-      key: (run) => (run.input as { envelope: { parentId: string } }).envelope.parentId,
-      field: 'status',
-    });
+    track(
+      workflow.bindFailureTo({
+        model: ParentModel,
+        key: (run) => (run.input as { envelope: { parentId: string } }).envelope.parentId,
+        field: 'status',
+      }),
+    );
 
     await workflow.start({ envelope: { parentId: String(parent._id) } });
-    await waitUntil(async () => {
-      const fresh = await ParentModel.findById(parent._id);
-      return fresh?.status === 'failed';
-    });
-
-    const fresh = await ParentModel.findById(parent._id);
-    expect(fresh?.status).toBe('failed');
-
-    workflow.shutdown();
+    await expectParentFailed(ParentModel, parent._id);
   });
 });
 
@@ -189,23 +179,20 @@ describe('workflow.bindFailureTo — errorField + errorTransform', () => {
     const parent = await ParentModel.create({ status: 'running' });
 
     const workflow = makeFailingWorkflow();
-    workflow.bindFailureTo({
-      model: ParentModel,
-      key: 'parentId',
-      field: 'status',
-      errorField: 'errorMessage',
-    });
+    track(
+      workflow.bindFailureTo({
+        model: ParentModel,
+        key: 'parentId',
+        field: 'status',
+        errorField: 'errorMessage',
+      }),
+    );
 
     await workflow.start({ parentId: String(parent._id) });
-    await waitUntil(async () => {
-      const fresh = await ParentModel.findById(parent._id);
-      return fresh?.status === 'failed';
-    });
+    await expectParentFailed(ParentModel, parent._id);
 
     const fresh = await ParentModel.findById(parent._id);
     expect(fresh?.errorMessage).toMatch(/intentional failure/);
-
-    workflow.shutdown();
   });
 
   it('shapes the error via errorTransform before writing', async () => {
@@ -213,28 +200,25 @@ describe('workflow.bindFailureTo — errorField + errorTransform', () => {
     const parent = await ParentModel.create({ status: 'running' });
 
     const workflow = makeFailingWorkflow();
-    workflow.bindFailureTo({
-      model: ParentModel,
-      key: 'parentId',
-      field: 'status',
-      errorField: 'errorDetails',
-      errorTransform: (err) => ({
-        code: 'WORKFLOW_FAILED',
-        message: (err as Error).message,
+    track(
+      workflow.bindFailureTo({
+        model: ParentModel,
+        key: 'parentId',
+        field: 'status',
+        errorField: 'errorDetails',
+        errorTransform: (err) => ({
+          code: 'WORKFLOW_FAILED',
+          message: (err as Error).message,
+        }),
       }),
-    });
+    );
 
     await workflow.start({ parentId: String(parent._id) });
-    await waitUntil(async () => {
-      const fresh = await ParentModel.findById(parent._id);
-      return fresh?.status === 'failed';
-    });
+    await expectParentFailed(ParentModel, parent._id);
 
     const fresh = await ParentModel.findById(parent._id);
     expect(fresh?.errorDetails?.code).toBe('WORKFLOW_FAILED');
     expect(fresh?.errorDetails?.message).toMatch(/intentional failure/);
-
-    workflow.shutdown();
   });
 });
 
@@ -244,17 +228,16 @@ describe('workflow.bindFailureTo — does NOT patch when', () => {
     const parent = await ParentModel.create({ status: 'running' });
 
     const workflow = makeSucceedingWorkflow();
-    workflow.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' });
+    track(workflow.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' }));
 
     const run = await workflow.start({ parentId: String(parent._id) });
-    await workflow.waitFor(run._id, { timeout: 5000 });
+    await env.until(run._id, 'done');
 
-    // Give the event bus a tick to deliver any spurious failed event
+    // Negative window (kept deliberately): give the event bus a tick to
+    // deliver any spurious failed event.
     await new Promise((r) => setTimeout(r, 50));
     const fresh = await ParentModel.findById(parent._id);
     expect(fresh?.status).toBe('running');
-
-    workflow.shutdown();
   });
 
   it('a DIFFERENT workflow on the same bus fails (workflow-id filter)', async () => {
@@ -263,31 +246,27 @@ describe('workflow.bindFailureTo — does NOT patch when', () => {
 
     // Bound workflow — never started, never fails
     const bound = makeFailingWorkflow();
-    bound.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' });
+    track(bound.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' }));
 
     // Different workflow on the SAME container — fails
-    const other = createWorkflow<Record<string, unknown>>(
-      `other_${Math.random().toString(36).slice(2, 9)}`,
-      {
-        steps: {
-          explode: async () => {
-            throw new Error('other workflow failure');
-          },
+    const other = env.workflow<Record<string, unknown>>('other', {
+      steps: {
+        explode: async () => {
+          throw new Error('other workflow failure');
         },
-        container: bound.container,
       },
-    );
+      autoExecute: true,
+    });
+    expect(other.container).toBe(bound.container);
     const otherRun = await other.start({ parentId: String(parent._id) });
-    await other.waitFor(otherRun._id, { timeout: 5000 }).catch(() => {});
+    await env.until(otherRun._id, 'failed');
 
     // Even though SOME workflow:failed event fired, the bound parent must
     // still be in 'running' state — bindFailureTo filtered it out.
+    // Negative window (kept deliberately).
     await new Promise((r) => setTimeout(r, 100));
     const fresh = await ParentModel.findById(parent._id);
     expect(fresh?.status).toBe('running');
-
-    other.shutdown();
-    bound.shutdown();
   });
 
   it('the parent id reference is missing from input', async () => {
@@ -295,16 +274,32 @@ describe('workflow.bindFailureTo — does NOT patch when', () => {
     const parent = await ParentModel.create({ status: 'running' });
 
     const workflow = makeFailingWorkflow();
-    workflow.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' });
+    track(workflow.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' }));
 
     // No parentId in input — bind should no-op
-    await workflow.start({ somethingElse: 'irrelevant' });
+    const run = await workflow.start({ somethingElse: 'irrelevant' });
+    await env.until(run._id, 'failed');
+    // Negative window (kept deliberately): the failed event has been emitted.
     await new Promise((r) => setTimeout(r, 100));
 
     const fresh = await ParentModel.findById(parent._id);
     expect(fresh?.status).toBe('running');
+  });
+});
+
+describe('workflow.bindFailureTo — lifecycle', () => {
+  it('shutdown() removes the workflow’s bindings from the shared bus', async () => {
+    const ParentModel = makeParentModel();
+    const bus = env.container.eventBus;
+    const before = bus.listenerCount('workflow:failed');
+
+    const workflow = makeFailingWorkflow();
+    workflow.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' });
+    workflow.bindFailureTo({ model: ParentModel, key: 'parentId', field: 'status' });
+    expect(bus.listenerCount('workflow:failed')).toBe(before + 2);
 
     workflow.shutdown();
+    expect(bus.listenerCount('workflow:failed')).toBe(before);
   });
 });
 
@@ -322,14 +317,14 @@ describe('workflow.bindFailureTo — unsubscribe', () => {
 
     off(); // Immediate unsubscribe
 
-    await workflow.start({ parentId: String(parent._id) });
+    const run = await workflow.start({ parentId: String(parent._id) });
+    await env.until(run._id, 'failed');
+    // Negative window (kept deliberately): nothing may patch the parent.
     await new Promise((r) => setTimeout(r, 150));
 
     const fresh = await ParentModel.findById(parent._id);
     // Bind was off before the failure event fired — parent untouched.
     expect(fresh?.status).toBe('running');
-
-    workflow.shutdown();
   });
 });
 
@@ -343,27 +338,30 @@ describe('workflow.bindFailureTo — best-effort failure isolation', () => {
 
     const engineErrors: unknown[] = [];
     const workflow = makeFailingWorkflow();
-    workflow.container.eventBus.on('engine:error', (payload: unknown) => {
+    const onEngineError = (payload: unknown) => {
       engineErrors.push(payload);
-    });
+    };
+    workflow.container.eventBus.on('engine:error', onEngineError);
+    track(() => workflow.container.eventBus.off('engine:error', onEngineError));
 
-    workflow.bindFailureTo({
-      model: failingModel as unknown as Model<ParentDoc>,
-      key: 'parentId',
-      field: 'status',
-    });
+    track(
+      workflow.bindFailureTo({
+        model: failingModel as unknown as Model<ParentDoc>,
+        key: 'parentId',
+        field: 'status',
+      }),
+    );
 
     // Workflow must still complete (in failed status) without the throw
     // bubbling up and tearing down the engine.
     const run = await workflow.start({ parentId: 'anything' });
-    await workflow.waitFor(run._id, { timeout: 5000 });
+    await env.until(run._id, 'failed');
 
     // The bindFailureTo handler ran and threw — must have surfaced via
     // engine:error rather than crashing.
-    await new Promise((r) => setTimeout(r, 100));
-    expect(failingModel.findByIdAndUpdate).toHaveBeenCalled();
-    expect(engineErrors.some((e) => /bindFailureTo/.test(JSON.stringify(e)))).toBe(true);
-
-    workflow.shutdown();
+    await env.eventually(async () => {
+      expect(failingModel.findByIdAndUpdate).toHaveBeenCalled();
+      expect(engineErrors.some((e) => /bindFailureTo/.test(JSON.stringify(e)))).toBe(true);
+    });
   });
 });

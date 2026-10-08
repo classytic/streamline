@@ -4,37 +4,17 @@
  * Focused tests for the critical fixes without race conditions
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import mongoose from 'mongoose';
-import { createWorkflow } from '../../src/index.js';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { workflowCache } from '../../src/storage/cache.js';
+import { describe, expect, it } from 'vitest';
+import type { WorkflowConfig } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test';
-
-// Track workflows for cleanup
-const createdWorkflows: { shutdown: () => void }[] = [];
+const env = useStreamlineEnv();
 
 describe('Multi-Worker Basic Tests', () => {
-  beforeEach(async () => {
-    await mongoose.connect(MONGODB_URI);
-    await WorkflowRunModel.deleteMany({});
-    workflowCache.clear();
-    createdWorkflows.length = 0; // Reset
-  });
-
-  afterEach(async () => {
-    // Shutdown all workflows first to stop background processes
-    createdWorkflows.forEach((w) => w.shutdown());
-    await WorkflowRunModel.deleteMany({});
-    workflowCache.clear();
-    await mongoose.disconnect();
-  });
-
   it('should handle pause/resume for pending step', async () => {
     let executed = false;
 
-    const workflow = createWorkflow<{ executed: boolean }>('pause-pending', {
+    const workflow = env.workflow<{ executed: boolean }>('pause-pending', {
       steps: {
         step1: async (ctx) => {
           executed = true;
@@ -43,9 +23,7 @@ describe('Multi-Worker Basic Tests', () => {
         },
       },
       context: () => ({ executed: false }),
-      autoExecute: false,
     });
-    createdWorkflows.push(workflow);
 
     const run = await workflow.start({});
 
@@ -59,8 +37,6 @@ describe('Multi-Worker Basic Tests', () => {
     const resumed = await workflow.resume(run._id);
     expect(resumed.status).toBe('done');
     expect(executed).toBe(true);
-
-    console.log('✓ Pause/resume for pending step works');
   });
 
   it('should pause retry-pending step (keep retryAfter)', async () => {
@@ -71,7 +47,7 @@ describe('Multi-Worker Basic Tests', () => {
 
     let attempts = 0;
 
-    const workflow = createWorkflow<Record<string, never>>('pause-retry', {
+    const workflow = env.workflow<Record<string, never>>('pause-retry', {
       steps: {
         failing: async () => {
           attempts++;
@@ -80,9 +56,7 @@ describe('Multi-Worker Basic Tests', () => {
       },
       context: () => ({}),
       defaults: { retries: 3 },
-      autoExecute: false,
     });
-    createdWorkflows.push(workflow);
 
     const run = await workflow.start({});
 
@@ -96,12 +70,10 @@ describe('Multi-Worker Basic Tests', () => {
     const step = result.steps.find((s) => s.stepId === 'failing');
     expect(step?.status).toBe('failed');
     expect(step?.error).toBeDefined();
-
-    console.log('✓ Inline retry handling exhausts all retries');
   }, 15000);
 
   it('should handle explicit wait/resume correctly', async () => {
-    const workflow = createWorkflow<Record<string, never>>('explicit-wait', {
+    const workflow = env.workflow<Record<string, never>>('explicit-wait', {
       steps: {
         wait: async (ctx) => {
           await ctx.wait('Waiting for input');
@@ -112,9 +84,7 @@ describe('Multi-Worker Basic Tests', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
-    createdWorkflows.push(workflow);
 
     const run = await workflow.start({});
 
@@ -131,14 +101,12 @@ describe('Multi-Worker Basic Tests', () => {
 
     const waitOutput = resumed.steps.find((s) => s.stepId === 'wait')?.output;
     expect(waitOutput).toBe('user input');
-
-    console.log('✓ Explicit wait/resume works correctly');
   });
 
   it('should detect no progress when step already running', async () => {
     let started = false;
 
-    const workflow1 = createWorkflow<Record<string, never>>('no-progress', {
+    const config: WorkflowConfig<Record<string, never>> = {
       steps: {
         slow: async () => {
           started = true;
@@ -147,29 +115,17 @@ describe('Multi-Worker Basic Tests', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false, // Manually control execution
-    });
-
-    const workflow2 = createWorkflow<Record<string, never>>('no-progress', {
-      steps: {
-        slow: async () => {
-          started = true;
-          await new Promise((resolve) => setTimeout(resolve, 300));
-          return 'done';
-        },
-      },
-      context: () => ({}),
-      autoExecute: false, // Manually control execution
-    });
-    createdWorkflows.push(workflow1, workflow2);
+    };
+    const workflow1 = env.workflow('no-progress', config);
+    const workflow2 = env.worker(workflow1, config);
 
     const run = await workflow1.start({});
 
     // Worker 1 starts (will take 300ms)
     const promise1 = workflow1.execute(run._id);
 
-    // Wait for worker 1 to claim step
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Wait for worker 1 to claim the step (persisted) and enter the handler
+    await env.until(run._id, (r) => started && r.steps[0]?.status === 'running');
     expect(started).toBe(true);
 
     // Worker 2 tries - should exit quickly without waiting
@@ -182,12 +138,10 @@ describe('Multi-Worker Basic Tests', () => {
 
     // Wait for worker 1 to finish
     await promise1;
-
-    console.log(`✓ No-progress detection: worker 2 exited in ${elapsed}ms`);
   });
 
   it('should refresh state when step already running', async () => {
-    const workflow1 = createWorkflow<Record<string, never>>('refresh-state', {
+    const config: WorkflowConfig<Record<string, never>> = {
       steps: {
         fast: async () => 'fast-done',
         slow: async () => {
@@ -196,29 +150,22 @@ describe('Multi-Worker Basic Tests', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false, // Manually control execution
-    });
-
-    const workflow2 = createWorkflow<Record<string, never>>('refresh-state', {
-      steps: {
-        fast: async () => 'fast-done',
-        slow: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          return 'slow-done';
-        },
-      },
-      context: () => ({}),
-      autoExecute: false, // Manually control execution
-    });
-    createdWorkflows.push(workflow1, workflow2);
+    };
+    const workflow1 = env.workflow('refresh-state', config);
+    const workflow2 = env.worker(workflow1, config);
 
     const run = await workflow1.start({});
 
     // Worker 1 executes
     const promise1 = workflow1.execute(run._id);
 
-    // Wait for fast step to complete
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Wait for the fast step to complete and the slow one to be claimed
+    await env.until(
+      run._id,
+      (r) =>
+        r.steps.find((s) => s.stepId === 'fast')?.status === 'done' &&
+        r.steps.find((s) => s.stepId === 'slow')?.status === 'running',
+    );
 
     // Worker 2 executes - should refresh and see fast step done
     const result2 = await workflow2.execute(run._id);
@@ -228,7 +175,5 @@ describe('Multi-Worker Basic Tests', () => {
     expect(fastStep?.output).toBe('fast-done');
 
     await promise1;
-
-    console.log('✓ State refreshed from DB when step running');
   });
 });

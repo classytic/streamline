@@ -1,6 +1,12 @@
-import { describe, it, expect, beforeAll } from 'vitest';
-import { setupTestDB, waitUntil } from '../../utils/setup.js';
+/**
+ * LEGACY SETUP (global connection) on purpose: the subject is the exported
+ * `helloWorld` docs example, a module-level singleton created without a
+ * container (autoExecute) — bound to the default mongoose connection.
+ */
+
+import { beforeAll, describe, expect, it } from 'vitest';
 import { helloWorld } from '../../../docs/examples/hello-world.js';
+import { setupTestDB, waitUntil } from '../../utils/setup.js';
 
 describe('Hello World Workflow', () => {
   beforeAll(setupTestDB);

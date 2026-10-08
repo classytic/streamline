@@ -5,6 +5,7 @@ export default defineConfig({
     'src/index.ts',
     'src/integrations/fastify.ts',
     'src/telemetry/index.ts',
+    'src/testkit/index.ts',
   ],
   format: 'esm',
   dts: true,
@@ -14,7 +15,14 @@ export default defineConfig({
     // every subpath — falsified in ../mongokit/tsdown.config.ts). `@spinekit/` added
     // because a scope that stops matching after a rename still reports success; see
     // commerce/AGENTS.md §"eight things that are NOT a source grep".
-    neverBundle: [/^@classytic\//, /^@spinekit\//, /^mongoose(\/|$)/, /^luxon(\/|$)/, /^semver(\/|$)/],
+    neverBundle: [
+      /^@classytic\//,
+      /^@spinekit\//,
+      /^mongoose(\/|$)/,
+      /^luxon(\/|$)/,
+      /^semver(\/|$)/,
+      /^mongodb-memory-server(\/|$)/,
+    ],
   },
   publint: 'ci-only',
   // ESM-only package: tell attw so it doesn't flag the intended

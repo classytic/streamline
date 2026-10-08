@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
-import { createWorkflow } from '../../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 interface TestContext {
   value: number;
@@ -10,16 +10,12 @@ interface TestContext {
   step2Done?: boolean;
 }
 
+type TestInput = { value: number };
+const context = (input: TestInput): TestContext => ({ value: input.value });
+
 describe('WorkflowEngine', () => {
-  beforeAll(setupTestDB);
-
-  afterEach(async () => {
-    // Clean up test data - commented out due to paginate plugin issues
-    // Will be cleaned up when database is dropped
-  });
-
   it('should start and execute a simple workflow', async () => {
-    const workflow = createWorkflow<TestContext>('simple-test', {
+    const workflow = env.workflow<TestContext, TestInput>('simple-test', {
       steps: {
         step1: async (ctx) => {
           await ctx.set('step1Done', true);
@@ -34,14 +30,13 @@ describe('WorkflowEngine', () => {
           return { step: 2, result };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context,
     });
 
     const run = await workflow.start({ value: 10 });
 
     expect(run._id).toBeDefined();
-    expect(run.workflowId).toBe('simple-test');
+    expect(run.workflowId).toBe(workflow.engine.definition.id);
     expect(run.status).toBe('running');
 
     const result = await workflow.execute(run._id);
@@ -53,14 +48,12 @@ describe('WorkflowEngine', () => {
     expect(result.steps).toHaveLength(2);
     expect(result.steps[0].status).toBe('done');
     expect(result.steps[1].status).toBe('done');
-
-    workflow.shutdown();
   });
 
   it('should handle workflow with retry', async () => {
     let attemptCount = 0;
 
-    const workflow = createWorkflow<TestContext>('retry-test', {
+    const workflow = env.workflow<TestContext, TestInput>('retry-test', {
       steps: {
         flaky: async (ctx) => {
           attemptCount++;
@@ -71,9 +64,8 @@ describe('WorkflowEngine', () => {
           return { success: true, attempts: attemptCount };
         },
       },
-      context: (input: any) => ({ value: input.value }),
+      context,
       defaults: { retries: 2 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({ value: 5 });
@@ -82,20 +74,17 @@ describe('WorkflowEngine', () => {
     expect(result.status).toBe('done');
     expect(result.context.result).toBe(15);
     expect(attemptCount).toBe(2);
-
-    workflow.shutdown();
   });
 
   it('should handle workflow failure after max retries', async () => {
-    const workflow = createWorkflow<TestContext>('failure-test', {
+    const workflow = env.workflow<TestContext, TestInput>('failure-test', {
       steps: {
         alwaysFail: async () => {
           throw new Error('Permanent failure');
         },
       },
-      context: (input: any) => ({ value: input.value }),
+      context,
       defaults: { retries: 1 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({ value: 5 });
@@ -105,12 +94,10 @@ describe('WorkflowEngine', () => {
     expect(result.steps[0].status).toBe('failed');
     expect(result.steps[0].error).toBeDefined();
     expect(result.steps[0].error?.message).toBe('Permanent failure');
-
-    workflow.shutdown();
   });
 
   it('should handle wait and resume', async () => {
-    const workflow = createWorkflow<TestContext>('wait-test', {
+    const workflow = env.workflow<TestContext, TestInput>('wait-test', {
       steps: {
         start: async (ctx) => {
           await ctx.set('step1Done', true);
@@ -125,8 +112,7 @@ describe('WorkflowEngine', () => {
           return { finished: true };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context,
     });
 
     const run = await workflow.start({ value: 7 });
@@ -142,12 +128,10 @@ describe('WorkflowEngine', () => {
     expect(resumedRun.status).toBe('done');
     expect(resumedRun.context.result).toBe(70);
     expect(resumedRun.steps[2].status).toBe('done');
-
-    workflow.shutdown();
   });
 
   it('should handle pause and resume', async () => {
-    const workflow = createWorkflow<TestContext>('pause-test', {
+    const workflow = env.workflow<TestContext, TestInput>('pause-test', {
       steps: {
         step1: async (ctx) => {
           await ctx.set('step1Done', true);
@@ -162,14 +146,13 @@ describe('WorkflowEngine', () => {
           return { step: 2 };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context,
     });
 
     const run = await workflow.start({ value: 12 });
 
     // Execute until waiting
-    let current = await workflow.execute(run._id);
+    const current = await workflow.execute(run._id);
     expect(current.status).toBe('waiting');
 
     // Pause (should still work on waiting workflow)
@@ -177,18 +160,16 @@ describe('WorkflowEngine', () => {
     expect(pausedRun.status).toBe('waiting');
 
     // Resume with payload
-    const resumedRun = await workflow.resume(run._id, { approved: true });
+    await workflow.resume(run._id, { approved: true });
 
     // Execute remaining steps
     const finalRun = await workflow.execute(run._id);
     expect(finalRun.status).toBe('done');
     expect(finalRun.context.result).toBe(24);
-
-    workflow.shutdown();
   });
 
   it('should handle cancel', async () => {
-    const workflow = createWorkflow<TestContext>('cancel-test', {
+    const workflow = env.workflow<TestContext, TestInput>('cancel-test', {
       steps: {
         step1: async (ctx) => {
           await ctx.set('step1Done', true);
@@ -202,8 +183,7 @@ describe('WorkflowEngine', () => {
           return { step: 2 };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context,
     });
 
     const run = await workflow.start({ value: 8 });
@@ -213,12 +193,10 @@ describe('WorkflowEngine', () => {
 
     expect(canceledRun.status).toBe('cancelled');
     expect(canceledRun.steps[2].status).toBe('pending');
-
-    workflow.shutdown();
   });
 
   it('should handle rewindTo', async () => {
-    const workflow = createWorkflow<TestContext>('rewind-test', {
+    const workflow = env.workflow<TestContext, TestInput>('rewind-test', {
       steps: {
         step1: async (ctx) => {
           await ctx.set('step1Done', true);
@@ -233,8 +211,7 @@ describe('WorkflowEngine', () => {
           return { step: 3 };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context,
     });
 
     const run = await workflow.start({ value: 6 });
@@ -254,20 +231,17 @@ describe('WorkflowEngine', () => {
 
     expect(reExecutedRun.status).toBe('done');
     expect(reExecutedRun.context.result).toBe(24);
-
-    workflow.shutdown();
   });
 
   it('should retrieve workflow from cache', async () => {
-    const workflow = createWorkflow<TestContext>('cache-test', {
+    const workflow = env.workflow<TestContext, TestInput>('cache-test', {
       steps: {
         step1: async (ctx) => {
           await ctx.set('result', ctx.context.value * 5);
           return { step: 1 };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context,
     });
 
     const run = await workflow.start({ value: 9 });
@@ -280,21 +254,18 @@ describe('WorkflowEngine', () => {
     const run2 = await workflow.get(run._id);
     expect(run2).toBeDefined();
     expect(run2?._id).toBe(run1?._id);
-
-    workflow.shutdown();
   });
 
   it('should handle step timeout', async () => {
-    const workflow = createWorkflow<TestContext>('timeout-test', {
+    const workflow = env.workflow<TestContext, TestInput>('timeout-test', {
       steps: {
         slow: async () => {
           await new Promise((resolve) => setTimeout(resolve, 200));
           return { completed: true };
         },
       },
-      context: (input: any) => ({ value: input.value }),
+      context,
       defaults: { timeout: 100, retries: 0 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({ value: 1 });
@@ -303,12 +274,10 @@ describe('WorkflowEngine', () => {
     expect(result.status).toBe('failed');
     expect(result.steps[0].status).toBe('failed');
     expect(result.steps[0].error?.message).toContain('timeout');
-
-    workflow.shutdown();
   });
 
   it('should handle getOutput from previous steps', async () => {
-    const workflow = createWorkflow<TestContext>('getoutput-test', {
+    const workflow = env.workflow<TestContext, TestInput>('getoutput-test', {
       steps: {
         step1: async () => {
           return { data: 100 };
@@ -324,8 +293,7 @@ describe('WorkflowEngine', () => {
           return { total: step1Output!.data + step2Output!.data };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context,
     });
 
     const run = await workflow.start({ value: 0 });
@@ -333,7 +301,5 @@ describe('WorkflowEngine', () => {
 
     expect(result.status).toBe('done');
     expect(result.context.result).toBe(300); // 100 + 200
-
-    workflow.shutdown();
   });
 });

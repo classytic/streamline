@@ -12,42 +12,43 @@
  * the shared collection). The run MUST complete, not be cancelled by B.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { createWorkflow } from '../../src/index.js';
-import { setupTestDB, cleanupTestDB, teardownTestDB, waitFor } from '../utils/setup.js';
+import { describe, expect, it } from 'vitest';
+import type { WorkflowConfig, WorkflowRun } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 describe('Multi-engine same-DB regression', () => {
-  beforeAll(async () => { await setupTestDB(); });
-  afterEach(async () => { await cleanupTestDB(); });
-  afterAll(async () => { await teardownTestDB(); });
-
   it('a run started by engine A is not cancelled by a second engine B (same workflow, same DB)', async () => {
-    const def = {
+    const def: WorkflowConfig<{ ready: boolean }> = {
       steps: {
         // Same shape as sniffer-job's setup step: a quick step that calls ctx.set.
-        setup: async (ctx: { set: (k: string, v: unknown) => Promise<void> }) => {
+        setup: async (ctx) => {
           await ctx.set('ready', true);
           return { ok: true };
         },
         work: async () => {
-          await waitFor(50);
+          await new Promise((r) => setTimeout(r, 50)); // simulated work
           return { done: true };
         },
       },
       context: () => ({ ready: false }),
+      autoExecute: true,
     };
 
-    const engineA = createWorkflow('sniffer-job-repro', def as never);
-    const engineB = createWorkflow('sniffer-job-repro', def as never); // 2nd engine, same id, same DB
+    const engineA = env.workflow('sniffer-job-repro', def);
+    // 2nd engine: same id, same DB, its own process-level state (container).
+    env.worker(engineA, def);
 
     const run = await engineA.start({});
-    await waitFor(500);
-    const result = await engineA.get(run._id);
+    const result = await env.until(run._id, (r: WorkflowRun) =>
+      ['done', 'failed', 'cancelled'].includes(r.status),
+    );
 
     // The crux: B must not abort/cancel A's freshly-started run.
-    expect(result?.status, `run ended ${result?.status} — steps: ${JSON.stringify(result?.steps?.map((s: { stepId: string; status: string }) => ({ id: s.stepId, status: s.status })))}`).toBe('done');
-
-    engineA.shutdown();
-    engineB.shutdown();
+    expect(
+      result.status,
+      `run ended ${result.status} — steps: ${JSON.stringify(result.steps.map((s) => ({ id: s.stepId, status: s.status })))}`,
+    ).toBe('done');
   });
 });

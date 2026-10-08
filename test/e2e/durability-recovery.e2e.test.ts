@@ -5,37 +5,21 @@
  * recovers from mid-execution crashes, and maintains data integrity.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitFor } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createContainer,
-  WorkflowEngine,
-  WorkflowRunModel,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // Checkpoint Crash Recovery
 // ============================================================================
 
 describe('Checkpoint crash recovery', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should resume from last checkpoint after simulated crash', async () => {
     const callLog: string[] = [];
 
     // First execution: process partially, then "crash"
-    const wf1 = createWorkflow<{ items: number[] }>('crash-recovery', {
+    const wf1 = env.workflow<{ items: number[] }, { items: number[] }>('crash-recovery', {
       steps: {
         process: async (ctx) => {
           const cp = ctx.getCheckpoint<number>() ?? 0;
@@ -52,8 +36,7 @@ describe('Checkpoint crash recovery', () => {
           return { done: true };
         },
       },
-      context: (input: { items: number[] }) => ({ items: input.items }),
-      autoExecute: false,
+      context: (input) => ({ items: input.items }),
       defaults: { retries: 1 }, // No retries for first execution
     });
 
@@ -64,18 +47,16 @@ describe('Checkpoint crash recovery', () => {
     expect(callLog).toEqual(['process-10', 'process-20', 'process-30']);
 
     // Verify checkpoint is persisted in DB
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    const step = doc!.steps.find((s: any) => s.stepId === 'process');
-    expect(step!.output).toBeDefined();
-    expect((step!.output as any).__checkpoint).toBe(3);
-
-    wf1.shutdown();
+    const doc = await env.runs.get(run._id);
+    const step = doc?.steps.find((s) => s.stepId === 'process');
+    expect(step?.output).toBeDefined();
+    expect((step?.output as { __checkpoint?: number } | undefined)?.__checkpoint).toBe(3);
   });
 
   it('should persist scatter checkpoint across task completions', async () => {
     const executionOrder: string[] = [];
 
-    const wf = createWorkflow('scatter-checkpoint', {
+    const wf = env.workflow('scatter-checkpoint', {
       steps: {
         parallel: async (ctx) => {
           const results = await ctx.scatter({
@@ -95,7 +76,6 @@ describe('Checkpoint crash recovery', () => {
           return results;
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -110,8 +90,6 @@ describe('Checkpoint crash recovery', () => {
       taskB: 'B-result',
       taskC: 'C-result',
     });
-
-    wf.shutdown();
   });
 });
 
@@ -120,28 +98,25 @@ describe('Checkpoint crash recovery', () => {
 // ============================================================================
 
 describe('Heartbeat mechanism', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should update heartbeat during long-running steps', async () => {
-    const wf = createWorkflow('heartbeat-test', {
+    const wf = env.workflow('heartbeat-test', {
       steps: {
         long_running: async (ctx) => {
-          const startHeartbeat = (await WorkflowRunModel.findById(ctx.runId).lean())?.lastHeartbeat;
+          const startHeartbeat = (await env.runs.get(ctx.runId))?.lastHeartbeat;
 
           // Wait enough time for at least one auto-heartbeat (30s is default, too long for test)
           // Instead, manually heartbeat
           await ctx.heartbeat();
 
-          const afterHeartbeat = (await WorkflowRunModel.findById(ctx.runId).lean())?.lastHeartbeat;
+          const afterHeartbeat = (await env.runs.get(ctx.runId))?.lastHeartbeat;
 
           return {
-            heartbeatUpdated: afterHeartbeat!.getTime() >= startHeartbeat!.getTime(),
+            heartbeatUpdated:
+              (afterHeartbeat?.getTime() ?? Number.NaN) >=
+              (startHeartbeat?.getTime() ?? Number.NaN),
           };
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -149,37 +124,31 @@ describe('Heartbeat mechanism', () => {
 
     expect(result.status).toBe('done');
     expect(result.output).toEqual({ heartbeatUpdated: true });
-
-    wf.shutdown();
   });
 
   it('should mark stale workflows with old heartbeats', async () => {
-    const wf = createWorkflow('stale-detect', {
+    const wf = env.workflow('stale-detect', {
       steps: {
         step1: async () => 'ok',
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
 
     // Manually set heartbeat to the past (simulate crashed process)
     const pastTime = new Date(Date.now() - 10 * 60 * 1000); // 10 min ago
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      { $set: { status: 'running', lastHeartbeat: pastTime } },
-    );
+    await env.runs.update(run._id, { status: 'running', lastHeartbeat: pastTime });
 
     // Query for stale workflows
-    const stale = await WorkflowRunModel.find({
-      status: 'running',
-      lastHeartbeat: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
-    }).lean();
+    const stale = await env.runModel
+      .find({
+        status: 'running',
+        lastHeartbeat: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
+      })
+      .lean();
 
     expect(stale.length).toBeGreaterThanOrEqual(1);
     expect(stale.some((s) => s._id === run._id)).toBe(true);
-
-    wf.shutdown();
   });
 });
 
@@ -188,13 +157,9 @@ describe('Heartbeat mechanism', () => {
 // ============================================================================
 
 describe('Atomic state transitions', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should use majority write concern for durability', async () => {
-    // Verify the model has majority write concern configured
-    const schema = WorkflowRunModel.schema;
+    // Verify the model the engine writes through has majority write concern configured
+    const schema = env.runModel.schema;
     const options = schema.options;
     expect(options.writeConcern).toEqual({ w: 'majority', j: true });
   });
@@ -202,7 +167,7 @@ describe('Atomic state transitions', () => {
   it('should atomically claim steps preventing double execution', async () => {
     const executionCount = { value: 0 };
 
-    const wf = createWorkflow('atomic-claim', {
+    const wf = env.workflow('atomic-claim', {
       steps: {
         counted: async () => {
           executionCount.value++;
@@ -210,16 +175,12 @@ describe('Atomic state transitions', () => {
           return { count: executionCount.value };
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
 
     // Attempt concurrent execution — only one should succeed
-    const [r1, r2] = await Promise.allSettled([
-      wf.execute(run._id),
-      wf.execute(run._id),
-    ]);
+    const [r1, r2] = await Promise.allSettled([wf.execute(run._id), wf.execute(run._id)]);
 
     // At least one should succeed
     const successes = [r1, r2].filter((r) => r.status === 'fulfilled');
@@ -227,8 +188,6 @@ describe('Atomic state transitions', () => {
 
     // Step should have been executed exactly once
     expect(executionCount.value).toBe(1);
-
-    wf.shutdown();
   });
 });
 
@@ -237,10 +196,6 @@ describe('Atomic state transitions', () => {
 // ============================================================================
 
 describe('Data integrity under concurrent context writes', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should preserve context integrity across sequential steps', async () => {
     interface CtxType {
       step1Result: string;
@@ -248,7 +203,7 @@ describe('Data integrity under concurrent context writes', () => {
       step3Result: string;
     }
 
-    const wf = createWorkflow<CtxType>('context-integrity', {
+    const wf = env.workflow<CtxType>('context-integrity', {
       steps: {
         step1: async (ctx) => {
           await ctx.set('step1Result', 'alpha');
@@ -273,7 +228,6 @@ describe('Data integrity under concurrent context writes', () => {
         step2Result: '',
         step3Result: '',
       }),
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -287,9 +241,7 @@ describe('Data integrity under concurrent context writes', () => {
     });
 
     // Verify DB state matches
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect(doc!.context).toEqual(result.context);
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(doc?.context).toEqual(result.context);
   });
 });

@@ -7,10 +7,10 @@
 
 import {
   createWorkflow,
-  type Workflow,
-  type WorkflowConfig,
   type StepConfig,
   type WaitForOptions,
+  type Workflow,
+  type WorkflowConfig,
   type WorkflowRun,
 } from '../src/index.js';
 
@@ -27,8 +27,9 @@ interface OrderCtx {
 
 // This is the exact pattern that failed with TS4023 before the fix.
 // If Workflow is not exported, this line errors.
-export const orderWorkflow: Workflow<OrderCtx, { id: string; email: string }> =
-  createWorkflow('order', {
+export const orderWorkflow: Workflow<OrderCtx, { id: string; email: string }> = createWorkflow(
+  'order',
+  {
     steps: {
       validate: async (ctx) => {
         // ctx.context should be OrderCtx — no annotation needed
@@ -37,7 +38,8 @@ export const orderWorkflow: Workflow<OrderCtx, { id: string; email: string }> =
       },
     },
     context: (input) => ({ orderId: input.id, email: input.email, total: 0, shipped: false }),
-  });
+  },
+);
 
 // ============================================================================
 // 2. TContext infers in StepConfig.handler, skipIf, runIf, condition
@@ -96,6 +98,12 @@ const _config: WorkflowConfig<OrderCtx> = {
 // ============================================================================
 
 const _opts: WaitForOptions = { pollInterval: 500, timeout: 10_000 };
+
+// StepConfig is importable and types a standalone step config.
+const _step: StepConfig<string, { orderId: string }> = {
+  handler: async (ctx) => ctx.context.orderId,
+  retries: 2,
+};
 
 // ============================================================================
 // 5. WorkflowRun generic flows through

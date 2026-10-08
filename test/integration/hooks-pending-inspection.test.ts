@@ -10,36 +10,10 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import {
-  createHook,
-  createWorkflow,
-  getHookByToken,
-  listPendingHooks,
-  resumeHook,
-} from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import { createHook, getHookByToken, listPendingHooks, resumeHook } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-let n = 0;
-const uid = (p: string) => `${p}-${Date.now()}-${++n}`;
-
-/**
- * `start()` resolves while execution is still async — the run is `running`
- * and parks to `waiting` a tick later when the step throws its WaitSignal.
- * Poll until it's parked (or time out) before inspecting the hook.
- */
-async function waitUntilParked(
-  wf: { get: (id: string) => Promise<{ status: string } | null> },
-  runId: string,
-  timeoutMs = 5000,
-): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const r = await wf.get(runId);
-    if (r?.status === 'waiting') return;
-    await new Promise((res) => setTimeout(res, 25));
-  }
-  throw new Error(`run ${runId} did not reach 'waiting' within ${timeoutMs}ms`);
-}
+const env = useStreamlineEnv();
 
 /**
  * A workflow that parks on a human approval. Uses a DETERMINISTIC token
@@ -47,9 +21,13 @@ async function waitUntilParked(
  * random suffix — real callers emit the random-suffixed token to their UI.
  * The token still starts with `${runId}:` so `getHookByToken`/`resumeHook`
  * can parse the run id.
+ *
+ * `start()` resolves while execution is still async — the run is `running`
+ * and parks to `waiting` a tick later when the step throws its WaitSignal, so
+ * every test waits for `waiting` before inspecting the hook.
  */
-function approvalWorkflow(wfId: string, metadata?: unknown) {
-  return createWorkflow(wfId, {
+function approvalWorkflow(name: string, metadata?: unknown) {
+  return env.workflow(name, {
     steps: {
       request: async (ctx) => {
         const hook = createHook(ctx, 'manager approval', {
@@ -63,22 +41,22 @@ function approvalWorkflow(wfId: string, metadata?: unknown) {
         return { done: true, approved: decision?.approved ?? false };
       },
     },
+    autoExecute: true,
   });
 }
 
 describe('hands-off: pending-hook inspection', () => {
-  useTestDb();
-
   it('surfaces a parked wait by token and in the pending list, then clears on resume', async () => {
-    const wfId = uid('approval');
-    const wf = approvalWorkflow(wfId, { allowedReviewers: ['u_42'] });
+    const wf = approvalWorkflow('approval', { allowedReviewers: ['u_42'] });
+    const wfId = wf.engine.definition.id;
+    const { container } = env;
 
     const run = await wf.start({ docId: 'd1' });
-    await waitUntilParked(wf, run._id);
+    await env.until(run._id, 'waiting');
 
     const token = `${run._id}:approve`;
 
-    const hook = await getHookByToken(token);
+    const hook = await getHookByToken(token, { container });
     expect(hook).not.toBeNull();
     expect(hook).toMatchObject({
       token,
@@ -90,60 +68,54 @@ describe('hands-off: pending-hook inspection', () => {
     });
     expect(hook?.waitingSince).toBeInstanceOf(Date);
 
-    const pending = await listPendingHooks({ workflowId: wfId });
+    const pending = await listPendingHooks({ workflowId: wfId, container });
     expect(pending).toHaveLength(1);
     expect(pending[0]?.token).toBe(token);
     expect(pending[0]?.metadata).toEqual({ allowedReviewers: ['u_42'] });
 
     // Resume → the waiting step completes and the run advances.
-    await resumeHook(token, { approved: true });
+    await resumeHook(token, { approved: true }, { container });
 
     // After resume the hook is gone from BOTH surfaces (run no longer waiting).
-    expect(await getHookByToken(token)).toBeNull();
-    expect(await listPendingHooks({ workflowId: wfId })).toHaveLength(0);
-
-    wf.shutdown();
+    expect(await getHookByToken(token, { container })).toBeNull();
+    expect(await listPendingHooks({ workflowId: wfId, container })).toHaveLength(0);
   });
 
   it('fail-closed: a wrong/guessed/malformed token returns null', async () => {
-    const wfId = uid('approval-guess');
-    const wf = approvalWorkflow(wfId);
+    const wf = approvalWorkflow('approval-guess');
+    const { container } = env;
 
     const run = await wf.start({});
-    await waitUntilParked(wf, run._id);
+    await env.until(run._id, 'waiting');
 
     // Right run prefix, wrong suffix — must NOT match (mirrors resume validation).
-    expect(await getHookByToken(`${run._id}:WRONG`)).toBeNull();
+    expect(await getHookByToken(`${run._id}:WRONG`, { container })).toBeNull();
     // Unknown run id.
-    expect(await getHookByToken('nonexistent:approve')).toBeNull();
+    expect(await getHookByToken('nonexistent:approve', { container })).toBeNull();
     // Malformed / empty.
-    expect(await getHookByToken('')).toBeNull();
-
-    wf.shutdown();
+    expect(await getHookByToken('', { container })).toBeNull();
   });
 
   it('listPendingHooks scopes by workflowId; unscoped sees all waiting workflows', async () => {
-    const wfIdA = uid('appr-A');
-    const wfIdB = uid('appr-B');
-    const wfA = approvalWorkflow(wfIdA);
-    const wfB = approvalWorkflow(wfIdB);
+    const wfA = approvalWorkflow('appr-A');
+    const wfB = approvalWorkflow('appr-B');
+    const wfIdA = wfA.engine.definition.id;
+    const wfIdB = wfB.engine.definition.id;
+    const { container } = env;
 
     const runA = await wfA.start({});
     const runB = await wfB.start({});
-    await waitUntilParked(wfA, runA._id);
-    await waitUntilParked(wfB, runB._id);
+    await env.until(runA._id, 'waiting');
+    await env.until(runB._id, 'waiting');
 
-    const onlyA = await listPendingHooks({ workflowId: wfIdA });
+    const onlyA = await listPendingHooks({ workflowId: wfIdA, container });
     expect(onlyA).toHaveLength(1);
     expect(onlyA[0]?.workflowId).toBe(wfIdA);
 
-    const all = await listPendingHooks({});
+    const all = await listPendingHooks({ container });
     const ids = all.map((h) => h.workflowId);
     expect(ids).toContain(wfIdA);
     expect(ids).toContain(wfIdB);
-
-    wfA.shutdown();
-    wfB.shutdown();
   });
 
   it('createHook echoes reason + metadata for one-place forwarding to ctx.wait', () => {

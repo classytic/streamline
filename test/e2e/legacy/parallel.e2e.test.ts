@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeAll } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
-import { createWorkflow } from '../../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 interface ParallelContext {
   urls: string[];
@@ -9,11 +9,11 @@ interface ParallelContext {
   fastest?: { url: string; data: string };
 }
 
-describe('Parallel Workflow', () => {
-  beforeAll(setupTestDB);
+type ParallelInput = { urls: string[] };
 
+describe('Parallel Workflow', () => {
   it('should execute steps in parallel (all mode)', async () => {
-    const workflow = createWorkflow<ParallelContext>('parallel-all-test', {
+    const workflow = env.workflow<ParallelContext, ParallelInput>('parallel-all-test', {
       steps: {
         fetchAll: async (ctx) => {
           const urls = ctx.context.urls;
@@ -28,7 +28,7 @@ describe('Parallel Workflow', () => {
                 data: `Data from ${url}`,
                 duration: delay,
               };
-            })
+            }),
           );
 
           const totalDuration = Date.now() - startTime;
@@ -42,13 +42,13 @@ describe('Parallel Workflow', () => {
           return { count: results.length, totalDuration };
         },
         process: async (ctx) => {
-          const results = ctx.context.results!;
+          const results = ctx.context.results;
+          if (!results) throw new Error('fetchAll results missing');
           ctx.log('Processing results', { count: results.length });
           return { processed: results.length };
         },
       },
-      context: (input: any) => ({ urls: input.urls }),
-      autoExecute: false,
+      context: (input) => ({ urls: input.urls }),
     });
 
     const run = await workflow.start({
@@ -59,14 +59,12 @@ describe('Parallel Workflow', () => {
 
     expect(result.status).toBe('done');
     expect(result.context.results).toHaveLength(3);
-    expect(result.context.results![0]).toHaveProperty('url');
-    expect(result.context.results![0]).toHaveProperty('data');
-
-    workflow.shutdown();
+    expect(result.context.results?.[0]).toHaveProperty('url');
+    expect(result.context.results?.[0]).toHaveProperty('data');
   });
 
   it('should execute with race mode (fastest wins)', async () => {
-    const workflow = createWorkflow<ParallelContext>('parallel-race-test', {
+    const workflow = env.workflow<ParallelContext, ParallelInput>('parallel-race-test', {
       steps: {
         fetchFastest: async (ctx) => {
           const urls = ctx.context.urls;
@@ -79,7 +77,7 @@ describe('Parallel Workflow', () => {
                 url,
                 data: `Data from ${url}`,
               };
-            })
+            }),
           );
 
           await ctx.set('fastest', fastest);
@@ -88,8 +86,7 @@ describe('Parallel Workflow', () => {
           return fastest;
         },
       },
-      context: (input: any) => ({ urls: input.urls }),
-      autoExecute: false,
+      context: (input) => ({ urls: input.urls }),
     });
 
     const run = await workflow.start({
@@ -100,13 +97,11 @@ describe('Parallel Workflow', () => {
 
     expect(result.status).toBe('done');
     expect(result.context.fastest).toBeDefined();
-    expect(result.context.fastest!.url).toBe('http://fast.example.com');
-
-    workflow.shutdown();
+    expect(result.context.fastest?.url).toBe('http://fast.example.com');
   });
 
   it('should handle parallel execution errors gracefully', async () => {
-    const workflow = createWorkflow<ParallelContext>('parallel-error-test', {
+    const workflow = env.workflow<ParallelContext, ParallelInput>('parallel-error-test', {
       steps: {
         fetchWithError: async (ctx) => {
           const urls = ctx.context.urls;
@@ -117,13 +112,12 @@ describe('Parallel Workflow', () => {
                 throw new Error(`Failed to fetch ${url}`);
               }
               return { url, data: `Data from ${url}` };
-            })
+            }),
           );
         },
       },
-      context: (input: any) => ({ urls: input.urls }),
+      context: (input) => ({ urls: input.urls }),
       defaults: { retries: 0 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({
@@ -134,7 +128,5 @@ describe('Parallel Workflow', () => {
 
     expect(result.status).toBe('failed');
     expect(result.steps[0].status).toBe('failed');
-
-    workflow.shutdown();
   });
 });

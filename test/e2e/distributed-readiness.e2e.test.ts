@@ -7,38 +7,31 @@
  * 3. Trigger cleanup is safe on shared event buses
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitFor, waitUntil } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createContainer,
-  WorkflowRunModel,
-  configureStreamlineLogger,
-} from '../../src/index.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { configureStreamlineLogger } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
+const env = useStreamlineEnv();
+
+beforeAll(() => {
   configureStreamlineLogger({ enabled: false });
 });
 
-afterAll(async () => {
+afterAll(() => {
   configureStreamlineLogger({ enabled: true });
-  await teardownTestDB();
 });
+
+const concurrencyLimitOf = (meta: unknown) =>
+  (meta as { concurrencyLimit?: number } | undefined)?.concurrencyLimit;
 
 // ============================================================================
 // 1. Idempotency Key — Reusable After Terminal Completion
 // ============================================================================
 
 describe('Idempotency key lifecycle', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should allow reuse of idempotency key after workflow completes', async () => {
-    const wf = createWorkflow('idemp-reuse', {
+    const wf = env.workflow('idemp-reuse', {
       steps: { a: async () => 'done' },
-      autoExecute: false,
     });
 
     // First run — succeeds
@@ -50,19 +43,18 @@ describe('Idempotency key lifecycle', () => {
     // Second start with same key — should create a NEW run (old one is terminal)
     const run2 = await wf.start({}, { idempotencyKey: 'order:100' });
     expect(run2._id).not.toBe(run1._id);
-
-    wf.shutdown();
   });
 
   it('should allow reuse of idempotency key after workflow fails', async () => {
-    const wf = createWorkflow('idemp-fail-reuse', {
+    const wf = env.workflow('idemp-fail-reuse', {
       steps: {
         a: {
-          handler: async () => { throw new Error('fail'); },
+          handler: async () => {
+            throw new Error('fail');
+          },
           retries: 1,
         },
       },
-      autoExecute: false,
     });
 
     // First run — fails
@@ -74,16 +66,13 @@ describe('Idempotency key lifecycle', () => {
     // Retry with same key — should create new run
     const run2 = await wf.start({}, { idempotencyKey: 'order:200' });
     expect(run2._id).not.toBe(run1._id);
-
-    wf.shutdown();
   });
 
   it('should allow reuse of idempotency key after workflow is cancelled', async () => {
-    const wf = createWorkflow('idemp-cancel-reuse', {
+    const wf = env.workflow('idemp-cancel-reuse', {
       steps: {
         a: async (ctx) => ctx.wait('waiting'),
       },
-      autoExecute: false,
     });
 
     const run1 = await wf.start({}, { idempotencyKey: 'order:300' });
@@ -93,16 +82,13 @@ describe('Idempotency key lifecycle', () => {
     // Same key — should create new run
     const run2 = await wf.start({}, { idempotencyKey: 'order:300' });
     expect(run2._id).not.toBe(run1._id);
-
-    wf.shutdown();
   });
 
   it('should block duplicate while run is still active', async () => {
-    const wf = createWorkflow('idemp-active-block', {
+    const wf = env.workflow('idemp-active-block', {
       steps: {
         a: async (ctx) => ctx.wait('waiting'),
       },
-      autoExecute: false,
     });
 
     const run1 = await wf.start({}, { idempotencyKey: 'order:400' });
@@ -111,8 +97,6 @@ describe('Idempotency key lifecycle', () => {
     // Run is waiting (non-terminal) — same key should return existing
     const run2 = await wf.start({}, { idempotencyKey: 'order:400' });
     expect(run2._id).toBe(run1._id);
-
-    wf.shutdown();
   });
 });
 
@@ -121,23 +105,18 @@ describe('Idempotency key lifecycle', () => {
 // ============================================================================
 
 describe('Concurrency draft promotion', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should promote queued draft when active run completes (via executeRetry)', async () => {
     let stepCalls = 0;
 
-    const wf = createWorkflow<{ userId: string }>('conc-promote', {
+    const wf = env.workflow<{ userId: string }, { userId: string }>('conc-promote', {
       steps: {
         process: async () => {
           stepCalls++;
           return 'done';
         },
       },
-      concurrency: { limit: 1, key: (input: { userId: string }) => input.userId },
-      context: (input: { userId: string }) => ({ userId: input.userId }),
-      autoExecute: false,
+      concurrency: { limit: 1, key: (input) => input.userId },
+      context: (input) => ({ userId: input.userId }),
     });
 
     // First run takes the slot
@@ -149,41 +128,39 @@ describe('Concurrency draft promotion', () => {
     expect(run2.status).toBe('draft');
 
     // Verify draft has concurrencyKey + concurrencyLimit stored
-    const draftDoc = await WorkflowRunModel.findById(run2._id).lean();
-    expect(draftDoc!.concurrencyKey).toBe('u1');
-    expect((draftDoc!.meta as any)?.concurrencyLimit).toBe(1);
+    const draftDoc = await env.runs.get(run2._id);
+    expect(draftDoc?.concurrencyKey).toBe('u1');
+    expect(concurrencyLimitOf(draftDoc?.meta)).toBe(1);
 
     // Complete run1 — frees the slot
     await wf.execute(run1._id);
-    const completed = await WorkflowRunModel.findById(run1._id).lean();
-    expect(completed!.status).toBe('done');
+    const completed = await env.runs.get(run1._id);
+    expect(completed?.status).toBe('done');
 
-    // executeRetry should now promote the draft (slot is free)
-    const promoted = await wf.engine.executeRetry(run2._id);
-    expect(promoted).not.toBeNull();
-    expect(promoted!.status).toBe('done');
+    // executeRetry should now promote the draft (slot is free). Completing run1
+    // also fires the engine's own immediate promotion; the two race for ONE
+    // claim, so assert the outcome — promoted, run exactly once — not the winner.
+    await wf.engine.executeRetry(run2._id);
+    await env.until(run2._id, 'done', { timeout: 2000 });
     expect(stepCalls).toBe(2);
-
-    wf.shutdown();
   });
 
   it('should NOT promote draft when concurrency slot is still occupied', async () => {
-    const wf = createWorkflow<{ userId: string }>('conc-block', {
+    const wf = env.workflow<{ userId: string }, { userId: string }>('conc-block', {
       steps: {
         process: async (ctx) => {
           return ctx.wait('hold slot open');
         },
       },
-      concurrency: { limit: 1, key: (input: { userId: string }) => input.userId },
-      context: (input: { userId: string }) => ({ userId: input.userId }),
-      autoExecute: false,
+      concurrency: { limit: 1, key: (input) => input.userId },
+      context: (input) => ({ userId: input.userId }),
     });
 
     // Run1 takes the slot and holds it (waiting)
     const run1 = await wf.start({ userId: 'u1' });
     await wf.execute(run1._id);
-    const waiting = await WorkflowRunModel.findById(run1._id).lean();
-    expect(waiting!.status).toBe('waiting');
+    const waiting = await env.runs.get(run1._id);
+    expect(waiting?.status).toBe('waiting');
 
     // Run2 queued as draft
     const run2 = await wf.start({ userId: 'u1' });
@@ -194,16 +171,14 @@ describe('Concurrency draft promotion', () => {
     expect(result).toBeNull();
 
     // Draft should still be draft
-    const stillDraft = await WorkflowRunModel.findById(run2._id).lean();
-    expect(stillDraft!.status).toBe('draft');
-
-    wf.shutdown();
+    const stillDraft = await env.runs.get(run2._id);
+    expect(stillDraft?.status).toBe('draft');
   });
 
   it('should auto-promote draft when active run completes (no manual intervention)', async () => {
     let stepCalls = 0;
 
-    const wf = createWorkflow<{ userId: string }>('conc-auto-promote', {
+    const wf = env.workflow<{ userId: string }, { userId: string }>('conc-auto-promote', {
       steps: {
         process: async () => {
           stepCalls++;
@@ -211,9 +186,8 @@ describe('Concurrency draft promotion', () => {
           return 'done';
         },
       },
-      concurrency: { limit: 1, key: (input: { userId: string }) => input.userId },
-      context: (input: { userId: string }) => ({ userId: input.userId }),
-      autoExecute: false,
+      concurrency: { limit: 1, key: (input) => input.userId },
+      context: (input) => ({ userId: input.userId }),
     });
 
     // Run1 takes the slot
@@ -229,21 +203,16 @@ describe('Concurrency draft promotion', () => {
     await wf.execute(run1._id);
 
     // Wait for the automatic promotion (setImmediate + execute)
-    const promoted = await waitUntil(async () => {
-      const doc = await WorkflowRunModel.findById(run2._id).lean();
-      return doc?.status === 'done';
-    }, 5000);
+    const promoted = await env.until(run2._id, 'done');
 
-    expect(promoted).toBe(true);
+    expect(promoted.status).toBe('done');
     expect(stepCalls).toBe(2);
-
-    wf.shutdown();
   });
 
   it('should promote multiple drafts when slots free (chain reaction)', async () => {
     let stepCalls = 0;
 
-    const wf = createWorkflow<{ userId: string }>('conc-chain', {
+    const wf = env.workflow<{ userId: string }, { userId: string }>('conc-chain', {
       steps: {
         process: async () => {
           stepCalls++;
@@ -251,9 +220,8 @@ describe('Concurrency draft promotion', () => {
           return `call-${stepCalls}`;
         },
       },
-      concurrency: { limit: 1, key: (i: { userId: string }) => i.userId },
-      context: (i: { userId: string }) => ({ userId: i.userId }),
-      autoExecute: false,
+      concurrency: { limit: 1, key: (i) => i.userId },
+      context: (i) => ({ userId: i.userId }),
     });
 
     // Fill slot
@@ -270,33 +238,22 @@ describe('Concurrency draft promotion', () => {
     await wf.execute(run1._id);
 
     // Wait for the chain to complete all 3
-    const allDone = await waitUntil(async () => {
-      const docs = await WorkflowRunModel.find({
-        workflowId: 'conc-chain',
-        status: 'done',
-      }).lean();
-      return docs.length === 3;
-    }, 5000);
+    const done = await env.untilCount({ workflowId: wf.engine.definition.id, status: 'done' }, 3);
 
-    expect(allDone).toBe(true);
+    expect(done).toHaveLength(3);
     expect(stepCalls).toBe(3);
-
-    wf.shutdown();
   });
 
   it('should store concurrencyLimit in meta for scheduler', async () => {
-    const wf = createWorkflow<{ userId: string }>('conc-meta', {
+    const wf = env.workflow<{ userId: string }, { userId: string }>('conc-meta', {
       steps: { a: async () => 'ok' },
-      concurrency: { limit: 3, key: (input: { userId: string }) => input.userId },
-      context: (input: { userId: string }) => ({ userId: input.userId }),
-      autoExecute: false,
+      concurrency: { limit: 3, key: (input) => input.userId },
+      context: (input) => ({ userId: input.userId }),
     });
 
     const run = await wf.start({ userId: 'u1' });
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    expect((doc!.meta as any)?.concurrencyLimit).toBe(3);
-
-    wf.shutdown();
+    const doc = await env.runs.get(run._id);
+    expect(concurrencyLimitOf(doc?.meta)).toBe(3);
   });
 });
 
@@ -305,54 +262,32 @@ describe('Concurrency draft promotion', () => {
 // ============================================================================
 
 describe('Trigger cleanup on shared bus', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should not remove other workflows trigger listeners on shutdown', async () => {
-    const container = createContainer();
-    let wf1Started = false;
-    let wf2Started = false;
-
-    const wf1 = createWorkflow('trigger-safe-1', {
-      steps: {
-        a: async () => {
-          wf1Started = true;
-          return 'ok';
-        },
-      },
+    // Both workflows share the env container — and so one event bus.
+    const wf1 = env.workflow('trigger-safe-1', {
+      steps: { a: async () => 'ok' },
       trigger: { event: 'shared.event' },
-      container,
-      autoExecute: false,
     });
 
-    const wf2 = createWorkflow('trigger-safe-2', {
-      steps: {
-        a: async () => {
-          wf2Started = true;
-          return 'ok';
-        },
-      },
+    const wf2 = env.workflow('trigger-safe-2', {
+      steps: { a: async () => 'ok' },
       trigger: { event: 'shared.event' },
-      container,
-      autoExecute: false,
     });
 
     // Shutdown wf1 — should NOT remove wf2's listener
     wf1.shutdown();
 
     // Fire the event — wf2 should still get it
-    container.eventBus.emit('shared.event' as any, { data: { test: true } });
-    await waitFor(200);
+    env.container.eventBus.emit('shared.event', { data: { test: true } });
 
     // wf2 should have started a run
-    const runs = await WorkflowRunModel.find({ workflowId: 'trigger-safe-2' }).lean();
-    expect(runs.length).toBeGreaterThanOrEqual(1);
+    const wf2Runs = await env.untilCount({ workflowId: wf2.engine.definition.id }, 1);
+    expect(wf2Runs.length).toBeGreaterThanOrEqual(1);
 
-    // wf1 should NOT have started
-    const wf1Runs = await WorkflowRunModel.find({ workflowId: 'trigger-safe-1' }).lean();
-    expect(wf1Runs.length).toBe(0);
-
-    wf2.shutdown();
+    // wf1 should NOT have started — give a live listener the same window again
+    // to land a run before asserting none did.
+    await new Promise((r) => setTimeout(r, 100));
+    const wf1Runs = await env.runModel.countDocuments({ workflowId: wf1.engine.definition.id });
+    expect(wf1Runs).toBe(0);
   });
 });

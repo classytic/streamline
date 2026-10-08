@@ -97,7 +97,7 @@ export async function handleChildWorkflowWait<TContext>(
     // status. Covers the crash-after-start-before-childRunId-write window where
     // the child may ALREADY be terminal: start()'s active-only idempotency dedup
     // would miss a terminal child and spawn a 2nd one (double execution). The
-    // sparse {idempotencyKey,status} index keeps this lookup cheap. A terminal
+    // partial {idempotencyKey,status} index keeps this lookup cheap. A terminal
     // adopted child is reconciled by the re-entry/sweep path (childRunId is set
     // below + nextReconcileAt seeded), so the parent still resumes correctly.
     const existingChild = await childEngine.container.repository.getOne(

@@ -1,12 +1,18 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
+/**
+ * LEGACY SETUP (global connection) on purpose: the subject is the exported
+ * `approvalWorkflow` docs example, a module-level singleton created without a
+ * container — bound to the default mongoose connection by construction.
+ */
+
+import { beforeAll, describe, expect, it } from 'vitest';
 import { approvalWorkflow } from '../../../docs/examples/wait-workflow.js';
+import { setupTestDB, waitUntil } from '../../utils/setup.js';
+
+const statusIs = (runId: string, status: string) => () =>
+  approvalWorkflow.get(runId).then((r) => r?.status === status);
 
 describe('Wait Workflow', () => {
   beforeAll(setupTestDB);
-
-  afterAll(teardownTestDB);
 
   it('should wait for approval and resume', async () => {
     const run = await approvalWorkflow.start({
@@ -14,7 +20,7 @@ describe('Wait Workflow', () => {
       requestedBy: 'Alice',
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitUntil(statusIs(run._id, 'waiting'), 5000, 20);
 
     const waiting = await approvalWorkflow.get(run._id);
     expect(waiting?.status).toBe('waiting');
@@ -27,7 +33,7 @@ describe('Wait Workflow', () => {
     };
 
     await approvalWorkflow.resume(run._id, approval);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitUntil(statusIs(run._id, 'done'), 5000, 20);
 
     const completed = await approvalWorkflow.get(run._id);
     expect(completed?.status).toBe('done');
@@ -42,7 +48,7 @@ describe('Wait Workflow', () => {
       requestedBy: 'Mallory',
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitUntil(statusIs(run._id, 'waiting'), 5000, 20);
 
     const rejection = {
       approved: false,
@@ -51,7 +57,7 @@ describe('Wait Workflow', () => {
     };
 
     await approvalWorkflow.resume(run._id, rejection);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitUntil(statusIs(run._id, 'done'), 5000, 20);
 
     const completed = await approvalWorkflow.get(run._id);
     expect(completed?.status).toBe('done');

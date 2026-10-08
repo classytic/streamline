@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeAll } from 'vitest';
-import mongoose from 'mongoose';
-import { setupTestDB, teardownTestDB } from '../../utils/setup.js';
-import { createWorkflow } from '../../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 interface SimpleContext {
   value: number;
@@ -9,10 +9,8 @@ interface SimpleContext {
 }
 
 describe('Simple Workflow Test', () => {
-  beforeAll(setupTestDB);
-
   it('should complete simple 2-step workflow', async () => {
-    const workflow = createWorkflow<SimpleContext>('simple-2-step', {
+    const workflow = env.workflow<SimpleContext, { value: number }>('simple-2-step', {
       steps: {
         step1: async (ctx) => {
           console.log('[step1] Executing step1, value:', ctx.context.value);
@@ -25,8 +23,7 @@ describe('Simple Workflow Test', () => {
           return { step2Done: true };
         },
       },
-      context: (input: any) => ({ value: input.value }),
-      autoExecute: false,
+      context: (input) => ({ value: input.value }),
     });
 
     console.log('Starting workflow...');
@@ -36,11 +33,12 @@ describe('Simple Workflow Test', () => {
     console.log('Executing workflow...');
     const result = await workflow.execute(run._id);
     console.log('Workflow executed, status:', result.status);
-    console.log('Steps:', result.steps.map((s) => `${s.stepId}: ${s.status}`));
+    console.log(
+      'Steps:',
+      result.steps.map((s) => `${s.stepId}: ${s.status}`),
+    );
 
     expect(result.status).toBe('done');
     expect(result.context.result).toBe(20);
-
-    workflow.shutdown();
   });
 });

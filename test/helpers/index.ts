@@ -7,6 +7,7 @@
  */
 
 export * from './assertions.js';
+export * from './env.js';
 export * from './fixtures.js';
 export * from './lifecycle.js';
 export * from './mocks.js';

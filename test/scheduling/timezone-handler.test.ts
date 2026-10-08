@@ -4,7 +4,7 @@
  * Comprehensive tests for timezone conversions and DST edge cases.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { TimezoneHandler, timezoneHandler } from '../../src/scheduling/timezone-handler.js';
 
 describe('TimezoneHandler', () => {
@@ -34,7 +34,7 @@ describe('TimezoneHandler', () => {
       const date = new Date('2024-06-15T09:00:00');
 
       expect(() => handler.calculateExecutionTime(date, 'Invalid/Zone')).toThrow(
-        'Invalid timezone'
+        'Invalid timezone',
       );
     });
   });
@@ -274,9 +274,7 @@ describe('TimezoneHandler', () => {
       const singletonResult = timezoneHandler.calculateExecutionTime(date, 'America/New_York');
       const instanceResult = handler.calculateExecutionTime(date, 'America/New_York');
 
-      expect(singletonResult.executionTime.getTime()).toBe(
-        instanceResult.executionTime.getTime()
-      );
+      expect(singletonResult.executionTime.getTime()).toBe(instanceResult.executionTime.getTime());
     });
   });
 
@@ -301,7 +299,8 @@ describe('TimezoneHandler', () => {
       expect(new Set(times).size).toBe(4);
 
       // LA should be 3 hours after NY in summer (both on DST)
-      const nyToLaDiff = (laResult.executionTime.getTime() - nyResult.executionTime.getTime()) / 3600000;
+      const nyToLaDiff =
+        (laResult.executionTime.getTime() - nyResult.executionTime.getTime()) / 3600000;
       expect(nyToLaDiff).toBe(3);
     });
 

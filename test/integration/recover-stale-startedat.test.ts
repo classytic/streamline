@@ -16,77 +16,50 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { createWorkflow, WorkflowRunModel } from '../../src/index.js';
-import type { StepState, WorkflowRun } from '../../src/core/types.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 describe('recoverStale clears startedAt on the reset step (Finding #4)', () => {
-  useTestDb();
-
   it('the reset (running→pending) write leaves startedAt absent', async () => {
-    const wfId = 'recover-stale-startedat';
-    const runId = 'stale-run-1';
-
     // A workflow whose single step parks on a wait, so after recoverStale
     // re-drives it the step does NOT immediately re-complete — keeps the run
     // observable. (We assert on the RESET write, captured below, regardless.)
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('recover-stale-startedat', {
       steps: {
         only: async (ctx) => ctx.waitFor('go'),
       },
-      autoExecute: false,
     });
 
-    // Persist the post-crash shape: status:running, step:running with an OLD
+    // The post-crash shape: status:running, step:running with an OLD
     // startedAt and a STALE lastHeartbeat (so recoverStale's stale claim fires).
-    const oldStarted = new Date(Date.now() - 10 * 60_000);
-    await WorkflowRunModel.create({
-      _id: runId,
-      workflowId: wfId,
-      status: 'running',
-      steps: [
-        {
-          stepId: 'only',
-          status: 'running',
-          attempts: 1,
-          startedAt: oldStarted,
-        } as StepState,
-      ],
-      currentStepId: 'only',
-      context: {},
-      input: {},
-      createdAt: oldStarted,
-      updatedAt: oldStarted,
-      startedAt: oldStarted,
-      lastHeartbeat: oldStarted, // stale
-    } as unknown as WorkflowRun);
+    const run = await env.runs.staleRunning(wf, { step: 'only' });
+    expect(run.steps[0]?.startedAt).toBeInstanceOf(Date); // the field the reset must clear
 
     // Capture the persisted step state at the instant the reset write lands.
     const repo = wf.engine.container.repository;
-    const origUpdateOne = repo.updateOne.bind(repo);
+    const origUpdateOne = repo.updateOne;
     let resetStartedAt: unknown = '__not-captured__';
-    (repo as unknown as { updateOne: typeof origUpdateOne }).updateOne = (async (
-      filter: unknown,
-      update: unknown,
-      options?: unknown,
-    ) => {
-      const result = await origUpdateOne(filter as never, update as never, options as never);
-      const set = (update as { $set?: Record<string, unknown> } | undefined)?.$set;
+    repo.updateOne = (async (...args: Parameters<typeof origUpdateOne>) => {
+      const result = await origUpdateOne.apply(repo, args);
+      const set = (args[1] as { $set?: Record<string, unknown> } | undefined)?.$set;
       // The reset write is the one flipping the step back to 'pending'.
       if (set && set['steps.0.status'] === 'pending') {
-        const fresh = await WorkflowRunModel.findById(runId).lean();
+        const fresh = await env.runs.get(run._id);
         resetStartedAt = fresh?.steps?.[0]?.startedAt;
       }
       return result;
     }) as typeof origUpdateOne;
 
-    // Drive recovery with a small stale threshold so the old heartbeat qualifies.
-    await wf.engine.recoverStale(runId, 60_000);
+    try {
+      // Drive recovery with a small stale threshold so the old heartbeat qualifies.
+      await wf.engine.recoverStale(run._id, 60_000);
+    } finally {
+      repo.updateOne = origUpdateOne; // the env's repository outlives this test
+    }
 
     // The reset write must have been observed AND it cleared startedAt.
     expect(resetStartedAt).not.toBe('__not-captured__');
     expect(resetStartedAt).toBeUndefined();
-
-    wf.shutdown();
   });
 });

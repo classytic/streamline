@@ -25,6 +25,8 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     setupFiles: ['./test/vitest-setup.ts'],
+    // One shared MongoDB for the run; every testkit env gets its own database on it.
+    globalSetup: ['./test/global-setup.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],

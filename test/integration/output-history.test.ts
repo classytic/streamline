@@ -23,36 +23,20 @@
  *  - disabled-default writes nothing (byte-for-byte v2.3.4).
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { createContainer, createWorkflow } from '../../src/index.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
+import { describe, expect, it } from 'vitest';
 import type { StepOutputVersion } from '../../src/core/types.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB, waitUntil } from '../utils/setup.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(setupTestDB);
-afterAll(teardownTestDB);
-afterEach(cleanupTestDB);
+const env = useStreamlineEnv();
 
-let wfCounter = 0;
-const uniqueId = (prefix: string) => `${prefix}-${Date.now()}-${++wfCounter}`;
-
-async function runToDone(wf: { get: (id: string) => Promise<{ status?: string } | null> }, runId: string) {
-  const ok = await waitUntil(async () => {
-    const r = await wf.get(runId);
-    return r?.status === 'done';
-  }, 10_000);
-  expect(ok).toBe(true);
-}
+const runToDone = (runId: string) => env.until(runId, 'done', { timeout: 10_000 });
 
 describe('per-step versioned output history', () => {
   it('records a version on rerun, in order, and ctx.outputHistory() reads them', async () => {
-    const container = createContainer();
-    const wfId = uniqueId('history');
-
     // A deterministic, monotonically-increasing output per generation so each
     // rerun produces a distinct value we can assert on.
     let gen = 0;
-    const wf = createWorkflow<{ done: boolean }>(wfId, {
+    const wf = env.workflow<{ done: boolean }>('history', {
       steps: {
         generate: {
           handler: async () => ({ gen: ++gen }),
@@ -61,11 +45,11 @@ describe('per-step versioned output history', () => {
         finalize: async () => 'ok',
       },
       context: () => ({ done: false }),
-      container,
+      autoExecute: true,
     });
 
     const run = await wf.start({});
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     // Gen 1 committed. No history yet — first forward success archives nothing.
     let cur = await wf.get(run._id);
@@ -75,18 +59,18 @@ describe('per-step versioned output history', () => {
     // Rerun #1: rewind to `generate` and re-execute → gen 2 commits, gen 1 archived.
     await wf.rewindTo(run._id, 'generate');
     await wf.engine.execute(run._id);
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     cur = await wf.get(run._id);
     let step = cur?.steps.find((s) => s.stepId === 'generate');
     expect(step?.output).toEqual({ gen: 2 });
-    expect((step?.outputHistory as StepOutputVersion[]).map((h) => h.output)).toEqual([{ gen: 1 }]);
-    expect((step?.outputHistory as StepOutputVersion[]).map((h) => h.version)).toEqual([1]);
+    expect(step?.outputHistory?.map((h) => h.output)).toEqual([{ gen: 1 }]);
+    expect(step?.outputHistory?.map((h) => h.version)).toEqual([1]);
 
     // Rerun #2 → gen 3 commits, gen 2 archived after gen 1 (ordered).
     await wf.rewindTo(run._id, 'generate');
     await wf.engine.execute(run._id);
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     cur = await wf.get(run._id);
     step = cur?.steps.find((s) => s.stepId === 'generate');
@@ -97,11 +81,8 @@ describe('per-step versioned output history', () => {
   });
 
   it('respects keep — oldest evicted', async () => {
-    const container = createContainer();
-    const wfId = uniqueId('history-keep');
-
     let gen = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('history-keep', {
       steps: {
         generate: {
           handler: async () => ({ gen: ++gen }),
@@ -109,18 +90,18 @@ describe('per-step versioned output history', () => {
         },
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await wf.start({});
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     // 3 reruns → committed gens 1..4; with keep=2 history holds the 2 newest
     // PRIOR generations (gen 2, gen 3) after the 4th commit.
     for (let i = 0; i < 3; i++) {
       await wf.rewindTo(run._id, 'generate');
       await wf.engine.execute(run._id);
-      await runToDone(wf, run._id);
+      await runToDone(run._id);
     }
 
     const cur = await wf.get(run._id);
@@ -132,13 +113,10 @@ describe('per-step versioned output history', () => {
   });
 
   it('ctx.pinOutput restores a prior version into output + sets pinnedVersion', async () => {
-    const container = createContainer();
-    const wfId = uniqueId('history-pin');
-
     let gen = 0;
     // The workflow only generates; pinning is driven by the host via
     // restoreStepOutput so the assertions are unambiguous (no step re-runs).
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('history-pin', {
       steps: {
         generate: {
           handler: async () => ({ gen: ++gen }),
@@ -146,29 +124,26 @@ describe('per-step versioned output history', () => {
         },
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await wf.start({});
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     // Two reruns → live output { gen: 3 }; history holds [{gen:1},{gen:2}].
     for (let i = 0; i < 2; i++) {
       await wf.rewindTo(run._id, 'generate');
       await wf.engine.execute(run._id);
-      await runToDone(wf, run._id);
+      await runToDone(run._id);
     }
 
     let cur = await wf.get(run._id);
     let gstep = cur?.steps.find((s) => s.stepId === 'generate');
     expect(gstep?.output).toEqual({ gen: 3 });
-    expect((gstep?.outputHistory as StepOutputVersion[]).map((h) => h.output)).toEqual([
-      { gen: 1 },
-      { gen: 2 },
-    ]);
+    expect(gstep?.outputHistory?.map((h) => h.output)).toEqual([{ gen: 1 }, { gen: 2 }]);
 
     // Restore version 1 (oldest = { gen: 1 }) into the live output slot.
-    const result = await workflowRunRepository.restoreStepOutput(run._id, 'generate', 1);
+    const result = await env.container.repository.restoreStepOutput(run._id, 'generate', 1);
     expect(result.modifiedCount).toBe(1);
 
     cur = await wf.get(run._id);
@@ -176,18 +151,15 @@ describe('per-step versioned output history', () => {
     expect(gstep?.output).toEqual({ gen: 1 });
     expect(gstep?.pinnedVersion).toBe(1);
     // History is left intact by the copy-back.
-    expect((gstep?.outputHistory as StepOutputVersion[]).length).toBe(2);
+    expect(gstep?.outputHistory?.length).toBe(2);
   });
 
   it('ctx.pinOutput (the context primitive) restores a prior version durably', async () => {
-    const container = createContainer();
-    const wfId = uniqueId('history-ctxpin');
-
     let gen = 0;
     let pinnedCount = -1;
     // `finalize` pins generate's oldest version. We rewind only to `finalize`
     // for the pin pass so `generate` is not reset and its history is stable.
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('history-ctxpin', {
       steps: {
         generate: {
           handler: async () => ({ gen: ++gen }),
@@ -196,24 +168,25 @@ describe('per-step versioned output history', () => {
         finalize: async (ctx) => {
           const versions = ctx.outputHistory('generate');
           pinnedCount = versions.length;
-          if (versions.length > 0) {
-            await ctx.pinOutput(versions[0].version, 'generate');
+          const oldest = versions[0];
+          if (oldest) {
+            await ctx.pinOutput(oldest.version, 'generate');
           }
           return 'ok';
         },
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await wf.start({});
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     // One rerun of generate → history [{gen:1}], live {gen:2}. finalize re-runs
     // too (rewind resets from generate onward) and pins version 1.
     await wf.rewindTo(run._id, 'generate');
     await wf.engine.execute(run._id);
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     const cur = await wf.get(run._id);
     const gstep = cur?.steps.find((s) => s.stepId === 'generate');
@@ -223,11 +196,8 @@ describe('per-step versioned output history', () => {
   });
 
   it('restoreStepOutput is refused on a cancelled run', async () => {
-    const container = createContainer();
-    const wfId = uniqueId('history-cancel');
-
     let gen = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('history-cancel', {
       steps: {
         generate: {
           handler: async () => ({ gen: ++gen }),
@@ -236,34 +206,30 @@ describe('per-step versioned output history', () => {
         hold: async (ctx) => ctx.wait('park here'),
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
+    const holdWaiting = (r: { steps: Array<{ stepId: string; status: string }> }) =>
+      r.steps.find((s) => s.stepId === 'hold')?.status === 'waiting';
 
     const run = await wf.start({});
     // Let it reach the wait, with one rerun first so history exists.
-    await waitUntil(async () => {
-      const r = await wf.get(run._id);
-      return r?.steps.find((s) => s.stepId === 'hold')?.status === 'waiting';
-    }, 10_000);
+    await env.until(run._id, holdWaiting, { timeout: 10_000 });
 
     await wf.rewindTo(run._id, 'generate');
     await wf.engine.execute(run._id);
-    await waitUntil(async () => {
-      const r = await wf.get(run._id);
-      return r?.steps.find((s) => s.stepId === 'hold')?.status === 'waiting';
-    }, 10_000);
+    await env.until(run._id, holdWaiting, { timeout: 10_000 });
 
     let cur = await wf.get(run._id);
     const history = cur?.steps.find((s) => s.stepId === 'generate')?.outputHistory as
       | StepOutputVersion[]
       | undefined;
-    expect(history && history.length).toBeGreaterThan(0);
-    const versionToRestore = history![0].version;
+    expect(history?.length).toBeGreaterThan(0);
+    const versionToRestore = (history as StepOutputVersion[])[0]?.version as number;
 
     // Cancel, then attempt restore — must be refused (modifiedCount 0) and not
     // mutate the step output.
     await wf.cancel(run._id);
-    const result = await workflowRunRepository.restoreStepOutput(
+    const result = await env.container.repository.restoreStepOutput(
       run._id,
       'generate',
       versionToRestore,
@@ -281,11 +247,8 @@ describe('per-step versioned output history', () => {
     // repository directly to simulate a recovery replay of the success write.
     // The engine's idempotency guard keys on the writing generation's
     // `attempt`, so the top-of-buffer already bearing it means "skip".
-    const container = createContainer();
-    const wfId = uniqueId('history-idem');
-
     let gen = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('history-idem', {
       steps: {
         generate: {
           handler: async () => ({ gen: ++gen }),
@@ -293,16 +256,16 @@ describe('per-step versioned output history', () => {
         },
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await wf.start({});
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     // One rerun → exactly one archived version.
     await wf.rewindTo(run._id, 'generate');
     await wf.engine.execute(run._id);
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     const cur = await wf.get(run._id);
     const history = cur?.steps.find((s) => s.stepId === 'generate')?.outputHistory as
@@ -321,33 +284,31 @@ describe('per-step versioned output history', () => {
   });
 
   it('disabled by default: no outputHistory is written when keep is unset', async () => {
-    const container = createContainer();
-    const wfId = uniqueId('history-disabled');
-
     let gen = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('history-disabled', {
       steps: {
         // No outputHistory config → feature disabled.
         generate: async () => ({ gen: ++gen }),
       },
       context: () => ({}),
-      container,
+      autoExecute: true,
     });
 
     const run = await wf.start({});
-    await runToDone(wf, run._id);
+    await runToDone(run._id);
 
     // Rerun several times — still nothing archived, output slot only.
     for (let i = 0; i < 2; i++) {
       await wf.rewindTo(run._id, 'generate');
       await wf.engine.execute(run._id);
-      await runToDone(wf, run._id);
+      await runToDone(run._id);
     }
 
     const cur = await wf.get(run._id);
     const step = cur?.steps.find((s) => s.stepId === 'generate');
     expect(step?.output).toEqual({ gen: 3 });
     expect(step?.outputHistory).toBeUndefined();
-    expect(Object.prototype.hasOwnProperty.call(step!, 'outputHistory')).toBe(false);
+    expect(step).toBeDefined();
+    expect(Object.hasOwn(step as object, 'outputHistory')).toBe(false);
   });
 });

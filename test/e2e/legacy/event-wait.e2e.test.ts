@@ -1,20 +1,26 @@
 /**
  * Verifies that `ctx.waitFor(eventName)` resumes workflows when the event is
  * emitted on `globalEventBus` — even when the workflow's container uses an
- * isolated bus (the default).
+ * isolated bus (the default; the env's container is one).
  *
  * Fixed in v2.2: `handleEventWait()` now also subscribes on `globalEventBus`
  * (unless the container is already using it), so out-of-container emissions
  * wake the run.
  */
 
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { createWorkflow, globalEventBus } from '../../../src/index.js';
-import { setupTestDB, waitFor } from '../../utils/setup.js';
+import { afterEach, describe, expect, it } from 'vitest';
+import { globalEventBus } from '../../../src/index.js';
+import { useStreamlineEnv } from '../../helpers/index.js';
+
+const env = useStreamlineEnv();
+
+interface EventWaitContext {
+  started: boolean;
+  completed: boolean;
+  eventData: unknown;
+}
 
 describe('Event-Based Wait Fix', () => {
-  beforeAll(setupTestDB);
-
   // The e2e tier runs in a singleFork — module state (including
   // `globalEventBus` and the global `workflowRegistry`) persists across
   // files. Strip any leftover `'user-action'` listeners a prior test left
@@ -28,7 +34,7 @@ describe('Event-Based Wait Fix', () => {
 
     let eventReceived = false;
 
-    const workflow = createWorkflow('event-wait-test', {
+    const workflow = env.workflow<EventWaitContext>('event-wait-test', {
       steps: {
         start: async (ctx) => {
           await ctx.set('started', true);
@@ -40,14 +46,13 @@ describe('Event-Based Wait Fix', () => {
         },
         complete: async (ctx) => {
           eventReceived = true;
-          const eventData = ctx.getOutput<any>('waitForEvent');
+          const eventData = ctx.getOutput<unknown>('waitForEvent');
           await ctx.set('completed', true);
           await ctx.set('eventData', eventData);
           return { done: true };
         },
       },
       context: () => ({ started: false, completed: false, eventData: null }),
-      autoExecute: false, // we drive execute() manually; avoids racing
     });
 
     // Start workflow
@@ -69,16 +74,12 @@ describe('Event-Based Wait Fix', () => {
       data: { action: 'approved', userId: '123' },
     });
 
-    // Wait for event processing
-    await waitFor(300);
-
-    // Check that workflow resumed and completed
+    // Wait for the event to be processed, then check the run resumed and completed
+    await env.until(run._id, 'done');
     const completed = await workflow.get(run._id);
     expect(completed?.status).toBe('done');
     expect(completed?.context.completed).toBe(true);
     expect(completed?.context.eventData).toEqual({ action: 'approved', userId: '123' });
     expect(eventReceived).toBe(true);
-
-    workflow.shutdown();
   });
 });

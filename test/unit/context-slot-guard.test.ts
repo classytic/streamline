@@ -12,11 +12,23 @@ import type { WorkflowRunRepository } from '../../src/storage/run.repository.js'
  * exercise the guard directly; only `writeCheckpoint`'s DB call is stubbed.
  */
 function makeCtx(): StepContextImpl {
-  const run = { _id: 'run-1', steps: [{ stepId: 'work', status: 'running' }] } as unknown as WorkflowRun;
+  const run = {
+    _id: 'run-1',
+    steps: [{ stepId: 'work', status: 'running' }],
+  } as unknown as WorkflowRun;
   const repo = {
     updateOne: async () => ({ modifiedCount: 1 }),
   } as unknown as WorkflowRunRepository;
-  return new StepContextImpl('run-1', 'work', {}, undefined, 0, run, repo, {} as unknown as WorkflowEventBus);
+  return new StepContextImpl(
+    'run-1',
+    'work',
+    {},
+    undefined,
+    0,
+    run,
+    repo,
+    {} as unknown as WorkflowEventBus,
+  );
 }
 
 const doneOnce = async (s: number) => ({ state: s, done: true });
@@ -36,16 +48,16 @@ describe('checkpoint-slot guard', () => {
 
   it('rejects a nested scatter() inside scatter()', async () => {
     const ctx = makeCtx();
-    await expect(
-      ctx.scatter({ a: async () => ctx.scatter({ b: async () => 1 }) }),
-    ).rejects.toThrow(/scatter\(\) cannot be nested inside ctx\.scatter\(\)/);
+    await expect(ctx.scatter({ a: async () => ctx.scatter({ b: async () => 1 }) })).rejects.toThrow(
+      /scatter\(\) cannot be nested inside ctx\.scatter\(\)/,
+    );
   });
 
   it('rejects loop() inside scatter()', async () => {
     const ctx = makeCtx();
-    await expect(
-      ctx.scatter({ a: async () => ctx.loop(0, doneOnce) }),
-    ).rejects.toThrow(/loop\(\) cannot be nested inside ctx\.scatter\(\)/);
+    await expect(ctx.scatter({ a: async () => ctx.loop(0, doneOnce) })).rejects.toThrow(
+      /loop\(\) cannot be nested inside ctx\.scatter\(\)/,
+    );
   });
 
   it('rejects checkpoint() called inside loop()', async () => {

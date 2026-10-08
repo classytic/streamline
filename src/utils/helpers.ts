@@ -81,6 +81,20 @@ export function guardPayloadSize(
 ): void {
   const size = approxByteSize(value);
   if (size === undefined) return;
+  guardPayloadBytes(kind, size, info);
+}
+
+/**
+ * {@link guardPayloadSize} for a size the caller already tracks — scatter keeps
+ * a running total instead of re-serializing its whole checkpoint per task.
+ * Returns true when it warned, so a caller can warn once per crossing.
+ */
+export function guardPayloadBytes(
+  kind: 'output' | 'checkpoint',
+  size: number,
+  info: { runId: string; stepId: string; maxPayloadBytes?: number },
+  options: { warn?: boolean } = {},
+): boolean {
   if (info.maxPayloadBytes !== undefined && size > info.maxPayloadBytes) {
     throw new NonRetriableError(
       `Step "${info.stepId}" (run ${info.runId}) ${kind} is ${size} bytes — exceeds ` +
@@ -89,10 +103,14 @@ export function guardPayloadSize(
     );
   }
   if (size > LIMITS.PAYLOAD_WARN_BYTES) {
-    logger.warn(`Large ${kind} payload — run document growing toward Mongo's 16MB cap`, {
-      runId: info.runId,
-      stepId: info.stepId,
-      bytes: size,
-    });
+    if (options.warn !== false) {
+      logger.warn(`Large ${kind} payload — run document growing toward Mongo's 16MB cap`, {
+        runId: info.runId,
+        stepId: info.stepId,
+        bytes: size,
+      });
+    }
+    return true;
   }
+  return false;
 }

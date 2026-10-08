@@ -165,6 +165,15 @@ export interface SmartSchedulerConfig {
    */
   maxConcurrentExecutions: number;
   /**
+   * In-process dispatch pool: how many runs this scheduler drives at once.
+   * A poll DISPATCHES and returns — one slow workflow no longer stalls
+   * discovery, recovery, or every other run behind it — and its budget is
+   * reduced by the work still in flight. A run already in flight here is never
+   * dispatched twice. `drain()` awaits the pool (shutdown, tests).
+   * @default 10
+   */
+  dispatchConcurrency?: number;
+  /**
    * Whether `scheduleResume` arms an in-process `setTimeout` for fast,
    * sub-poll-interval resume of timer/sleep waits.
    *
@@ -182,6 +191,16 @@ export interface SmartSchedulerConfig {
   inMemoryTimers?: boolean;
 }
 
+/** One kind of due work a poll admits (timer waits, retries, scheduled drafts, …). */
+interface AdmissionCategory {
+  /** `scheduler:error` context for a failure while driving one of these runs. */
+  context: string;
+  /** Up to `limit` due runs, oldest first. */
+  fetch(limit: number): Promise<Array<{ _id: string }>>;
+  /** The work for one run, or `null` to skip it (it still used budget). */
+  work(runId: string): (() => Promise<unknown>) | null;
+}
+
 export const DEFAULT_SCHEDULER_CONFIG: SmartSchedulerConfig = {
   basePollInterval: SCHEDULER.BASE_POLL_INTERVAL_MS,
   maxPollInterval: SCHEDULER.MAX_POLL_INTERVAL_MS,
@@ -193,6 +212,7 @@ export const DEFAULT_SCHEDULER_CONFIG: SmartSchedulerConfig = {
   staleCheckInterval: SCHEDULER.STALE_CHECK_INTERVAL_MS,
   staleThreshold: TIMING.STALE_WORKFLOW_THRESHOLD_MS,
   maxConcurrentExecutions: Infinity,
+  dispatchConcurrency: 10,
   inMemoryTimers: true,
 };
 
@@ -203,6 +223,8 @@ export class SmartScheduler {
   private pollInterval: NodeJS.Timeout | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
   private staleCheckTimer: NodeJS.Timeout | undefined;
+  /** One timer for the next scheduled deadline while idle — see `armNextDeadline`. */
+  private deadlineTimer: NodeJS.Timeout | undefined;
   private isPolling = false;
   private isStaleCheckActive = false;
   private currentInterval: number;
@@ -212,6 +234,11 @@ export class SmartScheduler {
   private retryCallback?: (runId: string) => Promise<unknown>;
   private compensationRecoveryCallback?: (runId: string, thresholdMs: number) => Promise<unknown>;
   private expiryCallback?: (runId: string) => Promise<unknown>;
+  private signalCallback?: (runId: string) => Promise<unknown>;
+  /** Runs this scheduler is driving right now — the dispatch pool. */
+  private readonly inFlight = new Map<string, Promise<void>>();
+  /** Rotates which admission category goes first — see `admitFairly`. */
+  private admissionRound = 0;
 
   /**
    * Engine-scoping filter (v2.4.0 distributed-correctness fix). Every engine
@@ -247,6 +274,101 @@ export class SmartScheduler {
     }
   }
 
+  /** Free pool slots right now. */
+  private freeSlots(): number {
+    const limit =
+      this.config.dispatchConcurrency ?? DEFAULT_SCHEDULER_CONFIG.dispatchConcurrency ?? 10;
+    return Math.max(0, limit - this.inFlight.size);
+  }
+
+  /**
+   * Hand one run to the pool WITHOUT awaiting it. Returns false when the run
+   * is already in flight here (an overlapping poll picked it up again).
+   * Errors become `scheduler:error` with `context` — never a poll failure.
+   */
+  private dispatch(runId: string, context: string, work: () => Promise<unknown>): boolean {
+    if (this.inFlight.has(runId)) return false;
+    const task = (async () => {
+      try {
+        await work();
+      } catch (err) {
+        this.emitError(context, err, runId);
+      } finally {
+        this.inFlight.delete(runId);
+      }
+    })();
+    this.inFlight.set(runId, task);
+    return true;
+  }
+
+  /**
+   * Split one poll's admission budget FAIRLY across work categories. A fixed
+   * order let a continuous backlog in the first category (timer waits) take
+   * every slot, starving retries, scheduled starts and drafts indefinitely.
+   *
+   *   Pass 1 — each category gets an equal share (at least 1), starting from a
+   *            category that rotates every poll (so a budget smaller than the
+   *            category count still reaches each in turn).
+   *   Pass 2 — leftover budget goes to categories that FILLED their share, in
+   *            the same rotated order, re-reading past the rows already taken.
+   * Unsaturated categories cost one query, as before; pass 2 runs only under load.
+   */
+  private async admitFairly(
+    categories: AdmissionCategory[],
+    budget: number,
+  ): Promise<Array<{ category: AdmissionCategory; runs: Array<{ _id: string }> }>> {
+    const n = categories.length;
+    if (n === 0 || budget <= 0) return [];
+    const start = this.admissionRound++ % n;
+    const order = [...categories.slice(start), ...categories.slice(0, start)];
+    const share = Math.max(1, Math.floor(budget / n));
+    let remaining = budget;
+
+    const taken = order.map((category) => ({
+      category,
+      runs: [] as Array<{ _id: string }>,
+      full: false,
+    }));
+    for (const slot of taken) {
+      if (remaining <= 0) break;
+      const want = Math.min(share, remaining);
+      slot.runs = await slot.category.fetch(want);
+      slot.full = slot.runs.length === want;
+      remaining -= slot.runs.length;
+    }
+    for (const slot of taken) {
+      if (remaining <= 0) break;
+      if (!slot.full) continue;
+      const have = slot.runs.length;
+      const more = (await slot.category.fetch(have + remaining)).slice(have);
+      const seen = new Set(slot.runs.map((r) => r._id));
+      const extra = more.filter((r) => !seen.has(r._id));
+      slot.runs.push(...extra);
+      remaining -= extra.length;
+    }
+    return taken.map(({ category, runs }) => ({ category, runs }));
+  }
+
+  /**
+   * Run ONE poll now — recovery then admission — outside the timer cadence.
+   * Dispatches like a timed poll (does not await the work; see `drain()`).
+   */
+  async pollOnce(): Promise<void> {
+    await this.poll();
+  }
+
+  /** Await every run the pool is driving (shutdown, tests). */
+  async drain(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight.values()]);
+    }
+  }
+
+  /** Runs currently in flight in this scheduler's pool. */
+  get inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
   /**
    * Set callback for recovering stale 'running' workflows
    * Separate from resume because stale recovery requires different atomic claim logic
@@ -278,6 +400,15 @@ export class SmartScheduler {
   }
 
   /**
+   * Set callback that delivers a queued durable signal to a run whose current
+   * `waitFor` it matches — the sweep for a crash between `signal()`'s push and
+   * its delivery. The engine wires this to `deliverSignal`.
+   */
+  setSignalCallback(callback: (runId: string) => Promise<unknown>): void {
+    this.signalCallback = callback;
+  }
+
+  /**
    * Set callback for resuming a `human`/`webhook` wait that has hit its
    * `expiresAt` deadline. Separate from `resumeCallback` because it must
    * resume WITH a timeout sentinel payload (so the next step can branch on the
@@ -304,6 +435,9 @@ export class SmartScheduler {
       return true;
     }
 
+    // Nothing due now — but a scheduled draft may become due before the next
+    // discovery tick. Best-effort: discovery re-arms on its own cadence.
+    await this.armNextDeadline().catch((error) => this.emitError('discovery', error));
     return false;
   }
 
@@ -421,7 +555,10 @@ export class SmartScheduler {
 
     this.isPolling = true;
     this.metrics.start(this.currentInterval);
-    this.schedulePoll();
+    // First poll NOW: polling only starts because work was just found (idle
+    // discovery, boot, a new wait). Arming it a full interval out left a
+    // crashed run unrecovered for that long — with a 60s interval, 60s.
+    this.schedulePoll(0);
     this.resetIdleTimer();
   }
 
@@ -462,7 +599,7 @@ export class SmartScheduler {
       if (!this.isStaleCheckActive) return;
 
       this.staleCheckTimer = setTimeout(async () => {
-        await this.checkForStaleWorkflows();
+        await this.discoverWork();
         scheduleNext(); // Schedule next check
       }, this.config.staleCheckInterval);
       this.staleCheckTimer.unref();
@@ -482,39 +619,66 @@ export class SmartScheduler {
       clearTimeout(this.staleCheckTimer);
       this.staleCheckTimer = undefined;
     }
-  }
-
-  /**
-   * Background check for stale workflows (runs even when scheduler is idle)
-   * If stale workflows found, start the main polling loop
-   */
-  private async checkForStaleWorkflows(): Promise<void> {
-    try {
-      const staleWorkflows = await this.repository.getStaleRunningWorkflows(
-        this.config.staleThreshold,
-        1,
-        this.scopedOpts,
-      );
-
-      if (staleWorkflows.length > 0 && !this.isPolling) {
-        logger.info(`Background check found stale workflows - starting polling`, {
-          count: staleWorkflows.length,
-        });
-        this.startPolling();
-      }
-    } catch (error) {
-      // Emit error but don't crash - stale check will retry on next interval
-      this.emitError('stale-check', error);
+    if (this.deadlineTimer) {
+      clearTimeout(this.deadlineTimer);
+      this.deadlineTimer = undefined;
     }
   }
 
-  private schedulePoll(): void {
+  /**
+   * Background discovery — runs even while the scheduler is idle.
+   *
+   * An idle scheduler stops polling, so this is how it learns about work it
+   * did not create itself: anything `hasActiveWorkflows()` reports (runs
+   * another process inserted, stale runs, promotable drafts). When nothing is
+   * due yet it arms ONE timer for the next scheduled deadline — checking only
+   * for stale runs here left a future scheduled draft undiscovered forever
+   * once polling had gone idle.
+   */
+  private async discoverWork(): Promise<void> {
+    try {
+      if (this.isPolling) return;
+      if (await this.hasActiveWorkflows()) {
+        logger.info('Background discovery found work - starting polling');
+        this.startPolling();
+        return;
+      }
+      await this.armNextDeadline();
+    } catch (error) {
+      // Emit error but don't crash - discovery retries on the next interval
+      this.emitError('discovery', error);
+    }
+  }
+
+  /**
+   * Arm a single timer for the earliest scheduled draft, so it starts on time
+   * rather than at the next discovery tick. Deadlines beyond that tick are left
+   * to it (it re-arms), which keeps this to one short-lived timer, never one
+   * per run.
+   */
+  private async armNextDeadline(): Promise<void> {
+    if (this.deadlineTimer) {
+      clearTimeout(this.deadlineTimer);
+      this.deadlineTimer = undefined;
+    }
+    const at = await this.repository.getNextScheduledTime(this.scopedOpts);
+    if (!at || !this.isStaleCheckActive) return;
+    const delay = Math.max(0, at.getTime() - Date.now());
+    if (delay > this.config.staleCheckInterval) return;
+    this.deadlineTimer = setTimeout(() => {
+      this.deadlineTimer = undefined;
+      if (this.isStaleCheckActive && !this.isPolling) this.startPolling();
+    }, delay);
+    this.deadlineTimer.unref();
+  }
+
+  private schedulePoll(delay: number = this.currentInterval): void {
     if (!this.isPolling) return;
 
     this.pollInterval = setTimeout(async () => {
       await this.poll();
       this.schedulePoll(); // Schedule next poll
-    }, this.currentInterval);
+    }, delay);
     this.pollInterval.unref();
   }
 
@@ -523,226 +687,120 @@ export class SmartScheduler {
 
     try {
       const now = new Date();
-      let limit = this.config.maxWorkflowsPerPoll;
 
-      // Concurrency gating: check how many slots are available.
-      // Cross-tenant — `maxConcurrentExecutions` is a global cap across all
-      // tenants this scheduler serves.
+      // ── Maintenance: recover runs that already COUNT as executing (stale
+      // `running`, stuck `compensating`). Never gated by the execution cap —
+      // stale runs occupy the very slots their recovery would free, so gating
+      // recovery on free slots deadlocked it.
+      const recovery = await this.recoverStuck();
+
+      // ── Admission: new work, under the execution cap and ONE shared budget.
+      // Each category draws from the same `maxWorkflowsPerPoll`; handing every
+      // category the full budget let one poll dispatch several times it.
+      // (`countRunning` is an observation, not a reservation — a cross-replica
+      // hard cap needs a durable counter; this bounds each worker's intake.)
+      // The pool bounds THIS process: work still in flight from earlier polls
+      // occupies slots, so intake never outruns what this worker can drive.
+      let budget = Math.min(this.config.maxWorkflowsPerPoll, this.freeSlots());
       if (this.config.maxConcurrentExecutions !== Infinity) {
         const activeCount = await this.repository.countRunning({ bypassTenant: true });
-        if (activeCount >= this.config.maxConcurrentExecutions) {
-          // All slots full — skip this poll cycle
-          const duration = Date.now() - startTime;
-          this.metrics.recordPoll(duration, true, 0);
-          return;
-        }
-        const availableSlots = this.config.maxConcurrentExecutions - activeCount;
-        limit = Math.min(limit, availableSlots);
+        budget = Math.min(budget, Math.max(0, this.config.maxConcurrentExecutions - activeCount));
       }
+      // Everything below DISPATCHES into the pool and moves on — the claims
+      // inside the callbacks keep concurrent drivers (listeners, other
+      // workers, an overlapping poll) to one winner. Cross-tenant sweeps;
+      // per-row writes downstream are id-scoped.
+      const repo = this.repository;
+      const opts = this.scopedOpts;
+      const resume = (runId: string) => this.resumeWorkflow(runId);
+      const retry = this.retryCallback;
+      const expire = this.expiryCallback;
+      const deliver = this.signalCallback;
+      const categories: AdmissionCategory[] = [
+        // Timer waits ready to resume (runs an in-memory timer will resume are skipped).
+        {
+          context: 'resume-workflow',
+          fetch: (n) => repo.getReadyToResume(now, n, opts),
+          work: (id) => (this.timers.has(id) ? null : () => resume(id)),
+        },
+        // Exponential-backoff retries: execute() re-runs the step.
+        ...(retry
+          ? [
+              {
+                context: 'retry-workflow',
+                fetch: (n: number) => repo.getReadyForRetry(now, n, opts),
+                work: (id: string) => () => retry(id),
+              },
+            ]
+          : []),
+        // Orphaned childWorkflow / branchJoin waits (no listener after a crash):
+        // engine.resume reconciles against the children; the waiting→running
+        // claim keeps a live listener or another worker to one driver.
+        {
+          context: 'resume-workflow',
+          fetch: (n) => repo.getChildWaitingRuns(now, n, opts),
+          work: (id) => () => resume(id),
+        },
+        {
+          context: 'resume-workflow',
+          fetch: (n) => repo.getBranchJoinWaitingRuns(now, n, opts),
+          work: (id) => () => resume(id),
+        },
+        // Human/webhook waits past `expiresAt` resume WITH a timeout sentinel.
+        ...(expire
+          ? [
+              {
+                context: 'expire-wait',
+                fetch: (n: number) => repo.getExpiredWaits(now, n, opts),
+                work: (id: string) => () => expire(id),
+              },
+            ]
+          : []),
+        // Due scheduled drafts — executeRetry() owns the draft→running claim
+        // (pre-claiming here would make its own filter miss).
+        ...(retry
+          ? [
+              {
+                context: 'execute-scheduled',
+                fetch: (n: number) => repo.getScheduledReady(now, n, opts),
+                work: (id: string) => () => retry(id),
+              },
+            ]
+          : []),
+        // Concurrency-queued drafts awaiting a free slot.
+        ...(retry
+          ? [
+              {
+                context: 'promote-concurrency-draft',
+                fetch: (n: number) => repo.getConcurrencyDrafts(n, opts),
+                work: (id: string) => () => retry(id),
+              },
+            ]
+          : []),
+        // Durable signals stranded by a crash between push and delivery.
+        ...(deliver
+          ? [
+              {
+                context: 'deliver-signal',
+                fetch: (n: number) => repo.getSignalReadyRuns(n, opts),
+                work: (id: string) => () => deliver(id),
+              },
+            ]
+          : []),
+      ];
 
-      // Query workflows ready to resume (timer-based) - PAGINATED.
-      // Cross-tenant sweep — bypass scope; per-row writes downstream are id-scoped.
-      const waiting = await this.repository.getReadyToResume(now, limit, this.scopedOpts);
-
-      // Query workflows ready for retry (exponential backoff) - PAGINATED.
-      const retrying = await this.repository.getReadyForRetry(now, limit, this.scopedOpts);
-
-      // Query workflows blocked on a childWorkflow wait that are due for
-      // crash-durable reconciliation - PAGINATED.
-      //
-      // THE BUG THIS CLOSES: a parent suspended on ctx.startChildWorkflow()
-      // is normally resumed only by in-process event-bus listeners. After a
-      // crash/restart those listeners are gone and NO other sweep reclaims
-      // the wait (it has no resumeAt/retryAfter and isn't status='running').
-      // This sweep hands the orphaned wait to resumeCallback → engine.resume,
-      // which reconciles against the child run (resume if the child already
-      // finished, else re-register listeners + bump nextReconcileAt). The
-      // engine's waiting→running atomic claim makes a concurrent in-memory
-      // listener or a second polling worker a no-op (race-safe, idempotent).
-      // Cross-tenant sweep — bypass scope; per-row writes downstream are
-      // id-scoped.
-      const childWaiting = await this.repository.getChildWaitingRuns(now, limit, this.scopedOpts);
-
-      // Query workflows blocked on a branchJoin (declarative parallel) wait
-      // due for crash-durable reconciliation - PAGINATED. Same orphaned-wait
-      // bug class as childWorkflow: a parent parked on ctx.joinBranches() is
-      // normally resumed by in-process listeners; after a crash those are gone
-      // and no other sweep reclaims it. This hands the wait to resumeCallback →
-      // engine.resume, which re-reads each branch child and resolves the join
-      // quorum. The waiting→running claim makes concurrent drivers no-op.
-      const branchJoinWaiting = await this.repository.getBranchJoinWaitingRuns(
-        now,
-        limit,
-        this.scopedOpts,
-      );
-
-      let resumedCount = 0;
-
-      // Resume waiting workflows
-      for (const run of waiting) {
-        // Skip if already has in-memory timer (will resume via setTimeout)
-        if (this.timers.has(run._id)) continue;
-
-        // Resume workflow (atomic claim happens inside resumeCallback/engine)
-        await this.resumeWorkflow(run._id);
-        resumedCount++;
-      }
-
-      // Reconcile childWorkflow waits. resumeCallback → engine.resume drives
-      // reconciliation; the waiting→running claim guards against double-drive
-      // by an in-memory listener or another worker.
-      for (const run of childWaiting) {
-        await this.resumeWorkflow(run._id);
-        resumedCount++;
-      }
-
-      // Reconcile branchJoin waits — same race-safe drive as childWorkflow.
-      for (const run of branchJoinWaiting) {
-        await this.resumeWorkflow(run._id);
-        resumedCount++;
-      }
-
-      // Execute workflows ready for retry
-      // Retries need execute() (re-run step), not resumeStep() (mark done with payload)
-      for (const run of retrying) {
-        if (this.retryCallback) {
-          try {
-            await this.retryCallback(run._id);
-            resumedCount++;
-          } catch (err) {
-            this.emitError('retry-workflow', err, run._id);
-          }
-        } else {
-          logger.warn(`Retry workflow detected but no retry callback set`, { runId: run._id });
-        }
-      }
-
-      // Expire human/webhook waits that have hit their `expiresAt` deadline.
-      // Hands each to expiryCallback → engine.resume(runId, timeoutSentinel),
-      // completing the waiting step with `{ __waitResolved: 'timeout' }` so the
-      // next step can branch on the timeout — an unanswered approval can't park
-      // a long-running workflow forever. The waiting→running CAS inside resume
-      // makes this race-safe against a concurrent resumeHook (whichever wins,
-      // the other is a no-op). Cross-tenant sweep; per-row writes are id-scoped.
-      if (this.expiryCallback) {
-        const expired = await this.repository.getExpiredWaits(now, limit, this.scopedOpts);
-        for (const run of expired) {
-          try {
-            await this.expiryCallback(run._id);
-            resumedCount++;
-          } catch (err) {
-            this.emitError('expire-wait', err, run._id);
-          }
-        }
-      }
-
-      // Execute scheduled workflows (timezone-aware scheduling) - PAGINATED
-      // Query: status='draft' AND executionTime <= now AND paused != true.
-      // Cross-tenant sweep — bypass scope; per-row writes downstream are id-scoped.
-      const scheduledResult = await this.repository.getScheduledWorkflowsReadyToExecute(now, {
-        limit,
-        ...this.scopedOpts,
-      });
-      const scheduled = scheduledResult.data || [];
-
-      for (const run of scheduled) {
-        if (this.retryCallback) {
-          try {
-            // Delegate atomic claim to executeRetry() — it handles both
-            // draft→running (scheduled) and waiting→running (retry) transitions.
-            // The scheduler must NOT pre-claim here, otherwise executeRetry()
-            // sees status='running' and its own claim filters don't match.
-            await this.retryCallback(run._id);
-            resumedCount++;
-          } catch (err) {
-            this.emitError('execute-scheduled', err, run._id);
-          }
-        } else {
-          logger.warn(`Scheduled workflow detected but no execution callback set`, {
-            runId: run._id,
-          });
-        }
-      }
-
-      // Promote concurrency-queued drafts (status='draft', no scheduling, has concurrencyKey)
-      // These are runs that were queued because the concurrency limit was reached at start time.
-      // Cross-tenant sweep — one scheduler serves every tenant's queue, so
-      // bypass tenant scope on the read. Per-row promotion writes downstream
-      // are `_id`-scoped.
-      const concurrencyDrafts = await this.repository.getConcurrencyDrafts(limit, this.scopedOpts);
-
-      for (const draft of concurrencyDrafts) {
-        if (this.retryCallback) {
-          try {
-            await this.retryCallback(draft._id);
-            resumedCount++;
-          } catch (err) {
-            this.emitError('promote-concurrency-draft', err, draft._id);
-          }
-        }
-      }
-
-      // Recover stale running workflows — STREAMING via mongokit's cursor().
-      // Cross-tenant sweep; per-row recovery writes are id-scoped.
-      //
-      // Why cursor instead of buffered findAll: a cluster crash can leave
-      // thousands of stale runs. Buffering the full page peaks memory at
-      // `limit × runDocSize` (potentially MBs); streaming holds one doc.
-      // The consumer breaks at `limit` for the per-poll budget, so wire
-      // cost is identical to the bounded read.
-      let staleCount = 0;
-      for await (const run of this.repository.cursorStaleRunning(
-        this.config.staleThreshold,
-        this.scopedOpts,
-      )) {
-        if (staleCount >= limit) break;
-        staleCount++;
-        if (this.staleRecoveryCallback) {
-          try {
-            await this.staleRecoveryCallback(run._id, this.config.staleThreshold);
-            resumedCount++;
-          } catch (err) {
-            this.emitError('recover-stale', err, run._id);
-          }
-        } else {
-          logger.warn(`Stale workflow detected but no recovery callback set`, { runId: run._id });
-        }
-      }
-
-      // Recover runs stuck in `compensating` after a crash mid-saga-rollback
-      // (durable saga, v2.4). Mirrors stale-running recovery: a genuinely
-      // crashed compensation has a stale heartbeat (a live one heartbeats),
-      // and the recovery callback re-enters the compensation phase which skips
-      // per-step compensations already `done` (effectively-once, no
-      // double-compensation). Cross-tenant sweep; per-row writes id-scoped.
-      let compensatingCount = 0;
-      if (this.compensationRecoveryCallback) {
-        const stuckCompensating = await this.repository.getStaleCompensatingRuns(
-          this.config.staleThreshold,
-          limit,
-          this.scopedOpts,
-        );
-        for (const run of stuckCompensating) {
-          compensatingCount++;
-          try {
-            await this.compensationRecoveryCallback(run._id, this.config.staleThreshold);
-            resumedCount++;
-          } catch (err) {
-            this.emitError('recover-compensation', err, run._id);
-          }
+      const admitted = await this.admitFairly(categories, budget);
+      let resumedCount = recovery.dispatched;
+      for (const { category, runs } of admitted) {
+        for (const run of runs) {
+          const work = category.work(run._id);
+          if (work && this.dispatch(run._id, category.context, work)) resumedCount++;
         }
       }
 
       // Record successful poll
       const duration = Date.now() - startTime;
-      const totalWorkflows =
-        waiting.length +
-        retrying.length +
-        childWaiting.length +
-        branchJoinWaiting.length +
-        scheduled.length +
-        staleCount +
-        compensatingCount;
+      const totalWorkflows = admitted.reduce((sum, a) => sum + a.runs.length, 0) + recovery.found;
       this.metrics.recordPoll(duration, true, totalWorkflows);
       this.consecutiveFailures = 0;
 
@@ -788,6 +846,58 @@ export class SmartScheduler {
     }
   }
 
+  /**
+   * Maintenance phase of a poll: recover runs left `running` (stale heartbeat)
+   * or `compensating` / `failed`-awaiting-saga after a crash. Has its own
+   * `maxWorkflowsPerPoll` budget and is NEVER gated by `maxConcurrentExecutions`
+   * or by the dispatch pool being full — a pool busy with long steps must not
+   * delay crash recovery. Dispatched (not awaited) and deduped like the rest.
+   * Cross-tenant sweeps; per-row recovery writes are id-scoped.
+   */
+  private async recoverStuck(): Promise<{ found: number; dispatched: number }> {
+    const budget = this.config.maxWorkflowsPerPoll;
+    const threshold = this.config.staleThreshold;
+    let found = 0;
+    let dispatched = 0;
+
+    // Stale running — STREAMING via mongokit's cursor(): a cluster crash can
+    // leave thousands; streaming holds one doc and breaks at the budget, so the
+    // wire cost equals a bounded read without its `budget × docSize` peak.
+    const recoverStale = this.staleRecoveryCallback;
+    for await (const run of this.repository.cursorStaleRunning(threshold, this.scopedOpts)) {
+      if (found >= budget) break;
+      found++;
+      if (!recoverStale) {
+        logger.warn(`Stale workflow detected but no recovery callback set`, { runId: run._id });
+        continue;
+      }
+      if (this.dispatch(run._id, 'recover-stale', () => recoverStale(run._id, threshold))) {
+        dispatched++;
+      }
+    }
+
+    // Stuck sagas: a crashed rollback (stale `compensating`) or a crash before
+    // the saga was entered (`failed` + `compensationDue`). The callback
+    // re-enters the walk, skipping per-step compensations already `done`.
+    const recoverSaga = this.compensationRecoveryCallback;
+    if (recoverSaga && found < budget) {
+      const stuck = await this.repository.getStaleCompensatingRuns(
+        threshold,
+        budget - found,
+        this.scopedOpts,
+      );
+      for (const run of stuck) {
+        found++;
+        if (this.dispatch(run._id, 'recover-compensation', () => recoverSaga(run._id, threshold))) {
+          dispatched++;
+        }
+      }
+    }
+
+    return { found, dispatched };
+  }
+
+  /** Resume one run, recording the outcome. Never throws (errors → `scheduler:error`). */
   private async resumeWorkflow(runId: string): Promise<void> {
     try {
       await this.resumeCallback(runId);
@@ -840,11 +950,8 @@ export class SmartScheduler {
       if (branchJoinWaiting.length > 0) return true;
 
       // Check for scheduled workflows ready to execute (timezone-aware)
-      const scheduled = await this.repository.getScheduledWorkflowsReadyToExecute(new Date(), {
-        limit: 1,
-        ...this.scopedOpts,
-      });
-      if (scheduled.data && scheduled.data.length > 0) return true;
+      const scheduled = await this.repository.getScheduledReady(new Date(), 1, this.scopedOpts);
+      if (scheduled.length > 0) return true;
 
       // Check for STALE running workflows (might need recovery after crashes)
       // Don't start scheduler for healthy running workflows
@@ -908,6 +1015,8 @@ export class SmartScheduler {
       if (!hasWaiting && this.timers.size === 0) {
         logger.info('No workflows for idle timeout - stopping polling');
         this.stopPolling();
+        // Going idle must not strand a scheduled draft that is not due yet.
+        await this.armNextDeadline().catch((error) => this.emitError('discovery', error));
       }
     }, this.config.idleTimeout);
     this.idleTimer.unref();

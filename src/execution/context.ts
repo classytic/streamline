@@ -11,8 +11,8 @@ import type {
   WorkflowRun,
 } from '../core/types.js';
 import type { WorkflowRunRepository } from '../storage/run.repository.js';
-import { NonRetriableError } from '../utils/errors.js';
-import { approxByteSize, guardPayloadSize } from '../utils/helpers.js';
+import { AttemptSupersededError, NonRetriableError } from '../utils/errors.js';
+import { approxByteSize, guardPayloadBytes, guardPayloadSize } from '../utils/helpers.js';
 import { logger } from '../utils/logger.js';
 
 export class WaitSignal extends Error {
@@ -97,8 +97,27 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
      * stamped once and reused for every task's `TaskHookContext`.
      */
     private taskHooks?: TaskHooks,
+    /**
+     * Filter fragment matching only while this attempt owns its work — the
+     * step (`steps.<i>.attemptId`) or the saga walk (`compensationAttemptId`).
+     * Empty for an unowned context. Every durable write below requires it, so
+     * a superseded handler cannot overwrite the new owner's state.
+     */
+    private ownerFilter: Record<string, unknown> = {},
   ) {
     this.signal = signal ?? new AbortController().signal;
+  }
+
+  /** Match the run only while it is not cancelled AND this attempt owns the step. */
+  private guard(): Record<string, unknown> {
+    return { _id: this.runId, status: { $ne: 'cancelled' }, ...this.ownerFilter };
+  }
+
+  /** A guarded write that matched nothing means cancelled or superseded — stop the handler. */
+  private refusedError(action: string): Error {
+    return Object.keys(this.ownerFilter).length > 0
+      ? new AttemptSupersededError(this.runId, this.stepId)
+      : new Error(`Cannot ${action}: workflow ${this.runId} may have been cancelled`);
   }
 
   /**
@@ -126,10 +145,7 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
 
     // Use atomic update with cancellation guard to prevent overwriting cancelled workflows
     const result = await this.repository.updateOne(
-      {
-        _id: this.runId,
-        status: { $ne: 'cancelled' }, // Only update if not cancelled
-      },
+      this.guard(),
       {
         $set: {
           [`context.${String(key)}`]: value,
@@ -139,9 +155,8 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
       { bypassTenant: true }, // Internal operation - already scoped by runId
     );
 
-    // If update failed (workflow was cancelled), throw error
     if (result.modifiedCount === 0) {
-      throw new Error(`Cannot update context: workflow ${this.runId} may have been cancelled`);
+      throw this.refusedError('update context');
     }
   }
 
@@ -170,13 +185,13 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     }
 
     try {
+      // Owned: a superseded attempt must not keep the run looking alive.
       await this.repository.updateOne(
-        {
-          _id: this.runId,
-          status: { $ne: 'cancelled' },
-        },
+        this.guard(),
         { lastHeartbeat: new Date() },
-        { bypassTenant: true },
+        {
+          bypassTenant: true,
+        },
       );
     } catch {
       // Ignore heartbeat failures - step continues execution
@@ -275,7 +290,7 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
 
     try {
       await this.repository.updateOne(
-        { _id: this.runId, status: { $ne: 'cancelled' } },
+        this.guard(),
         { $set: { [`steps.${stepIndex}.lastProgress`]: snapshot } },
         { bypassTenant: true },
       );
@@ -421,10 +436,13 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     const taskIds = Object.keys(tasks);
     const concurrency = options?.concurrency ?? Infinity;
 
-    // Recover already-completed tasks from checkpoint
-    const checkpoint =
-      this.getCheckpoint<Record<string, { done: boolean; value?: unknown; error?: string }>>() ??
-      {};
+    // Recover already-completed tasks from checkpoint. Anything but a task map
+    // (an earlier `ctx.checkpoint(5)` in this step) is not scatter's — start
+    // fresh rather than writing task entries into a scalar.
+    type TaskMap = Record<string, { done: boolean; value?: unknown; error?: string }>;
+    const existing = this.getCheckpoint<unknown>();
+    const isTaskMap = typeof existing === 'object' && existing !== null && !Array.isArray(existing);
+    const checkpoint: TaskMap = isTaskMap ? (existing as TaskMap) : {};
     const results: Record<string, unknown> = {};
 
     // Restore completed results
@@ -441,6 +459,23 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     if (pending.length === 0) {
       return results as { [K in keyof T]: Awaited<ReturnType<T[K]>> };
     }
+
+    // Delta checkpoints: each success writes ONLY its own entry
+    // (`…__checkpoint.<taskId>`), so N tasks cost O(N) bytes, not the O(N²)
+    // of re-sending the whole map per task. Needs ids that are valid field-path
+    // segments; otherwise fall back to whole-map writes. The slot is
+    // initialized once so the dotted writes have an object to land in.
+    const deltaSafe = taskIds.every((id) => id !== '' && !id.includes('.') && !id.startsWith('$'));
+    if (deltaSafe && !isTaskMap) {
+      await this.writeCheckpoint(checkpoint);
+    }
+    const sizeInfo = {
+      runId: this.runId,
+      stepId: this.stepId,
+      ...(this.maxPayloadBytes !== undefined && { maxPayloadBytes: this.maxPayloadBytes }),
+    };
+    let checkpointBytes = approxByteSize(checkpoint) ?? 0;
+    let warned = false;
 
     // Execute pending tasks with a concurrency limit.
     //
@@ -484,11 +519,18 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
           // Only successful tasks checkpoint `{done:true}`; a failed task is
           // NOT recorded done, so crash recovery re-runs exactly the
           // incomplete/failed tasks (completed ones are restored above).
-          checkpoint[id] = { done: true, value };
+          const entry = { done: true, value };
+          // Size guard on a running total — re-serializing the map per task
+          // would bring back the quadratic cost the delta write removes.
+          checkpointBytes += approxByteSize({ [id]: entry }) ?? 0;
+          warned =
+            guardPayloadBytes('checkpoint', checkpointBytes, sizeInfo, { warn: !warned }) || warned;
+          checkpoint[id] = entry;
           // Persist after each SUCCESS — crash recovery resumes from here.
-          // Use the raw writer (not the guarded public `checkpoint()`) — scatter
-          // legitimately owns the slot it just claimed via `slotInUse`.
-          await this.writeCheckpoint(checkpoint);
+          // Raw writers (not the guarded public `checkpoint()`) — scatter
+          // legitimately owns the slot it claimed via `slotInUse`.
+          if (deltaSafe) await this.writeCheckpointEntry(id, entry);
+          else await this.writeCheckpoint(checkpoint);
           if (this.taskHooks) {
             await this.taskHooks.after(id, {
               result: value,
@@ -563,8 +605,8 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
     const stepIndex = this.run.steps.findIndex((s) => s.stepId === this.stepId);
     if (stepIndex === -1) return;
 
-    await this.repository.updateOne(
-      { _id: this.runId, status: { $ne: 'cancelled' } },
+    const result = await this.repository.updateOne(
+      this.guard(),
       {
         $set: {
           [`steps.${stepIndex}.output`]: { __checkpoint: value },
@@ -574,11 +616,42 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
       },
       { bypassTenant: true },
     );
+    // A superseded attempt's checkpoint would rewind the recovered one — stop.
+    // (Unowned: unchanged, a cancelled run's checkpoint is silently dropped.)
+    if (result.modifiedCount === 0 && Object.keys(this.ownerFilter).length > 0) {
+      throw this.refusedError('checkpoint');
+    }
 
     // Update in-memory state
     const step = this.run.steps[stepIndex];
     if (step) {
       step.output = { __checkpoint: value };
+    }
+  }
+
+  /**
+   * Persist ONE entry of an object checkpoint (scatter's per-task record) via
+   * a dotted `$set`. Same ownership/cancel guard as {@link writeCheckpoint};
+   * the in-memory map is mutated by the caller (it is the slot's own object).
+   */
+  private async writeCheckpointEntry(key: string, entry: unknown): Promise<void> {
+    if (this.signal.aborted) return;
+    const stepIndex = this.run.steps.findIndex((s) => s.stepId === this.stepId);
+    if (stepIndex === -1) return;
+
+    const result = await this.repository.updateOne(
+      this.guard(),
+      {
+        $set: {
+          [`steps.${stepIndex}.output.__checkpoint.${key}`]: entry,
+          updatedAt: new Date(),
+          lastHeartbeat: new Date(),
+        },
+      },
+      { bypassTenant: true },
+    );
+    if (result.modifiedCount === 0 && Object.keys(this.ownerFilter).length > 0) {
+      throw this.refusedError('checkpoint');
     }
   }
 
@@ -628,7 +701,7 @@ export class StepContextImpl<TContext = Record<string, unknown>, TOutputs = Reco
       // Durable commit BEFORE returning — a crash after this point replays the
       // step and reads the cached value instead of re-running fn.
       await this.repository.updateOne(
-        { _id: this.runId, status: { $ne: 'cancelled' } },
+        this.guard(),
         {
           $set: {
             [`steps.${stepIndex}.dedupeCache.${key}`]: value,

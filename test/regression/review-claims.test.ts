@@ -1,8 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
-import { executeParallel } from '../../src/features/parallel.js';
-import { StepContextImpl } from '../../src/execution/context.js';
+import { describe, expect, it, vi } from 'vitest';
 import { WorkflowEventBus } from '../../src/core/events.js';
-import type { WorkflowRun, WorkflowRunRepository } from '../../src/core/types.js';
+import type { WorkflowRun } from '../../src/core/types.js';
+import { StepContextImpl } from '../../src/execution/context.js';
+import { executeParallel } from '../../src/features/parallel.js';
+import type { WorkflowRunRepository } from '../../src/storage/run.repository.js';
 
 describe('Review Claims Fixes', () => {
   it('should throw error when using race mode with concurrency limits', async () => {
@@ -12,9 +13,9 @@ describe('Review Claims Fixes', () => {
       () => Promise.resolve('slow-2'),
     ];
 
-    await expect(
-      executeParallel(tasks, { mode: 'race', concurrency: 2 })
-    ).rejects.toThrow("mode 'race' cannot be combined with concurrency limiting");
+    await expect(executeParallel(tasks, { mode: 'race', concurrency: 2 })).rejects.toThrow(
+      "mode 'race' cannot be combined with concurrency limiting",
+    );
   });
 
   it('should throw error when using any mode with concurrency limits', async () => {
@@ -24,9 +25,9 @@ describe('Review Claims Fixes', () => {
       () => Promise.resolve('slow-2'),
     ];
 
-    await expect(
-      executeParallel(tasks, { mode: 'any', concurrency: 2 })
-    ).rejects.toThrow("mode 'any' cannot be combined with concurrency limiting");
+    await expect(executeParallel(tasks, { mode: 'any', concurrency: 2 })).rejects.toThrow(
+      "mode 'any' cannot be combined with concurrency limiting",
+    );
   });
 
   // Note: handleShortDelayOrSchedule test removed - function is now an internal implementation detail
@@ -58,7 +59,7 @@ describe('Review Claims Fixes', () => {
         1,
         run,
         repository,
-        new WorkflowEventBus()
+        new WorkflowEventBus(),
       );
 
       // Pass data that tries to override reserved fields
@@ -83,7 +84,11 @@ describe('Review Claims Fixes', () => {
     try {
       // Fast tasks with a LONG timeout: before the fix, each task left a live
       // 60s timer after settling; now the timer is cleared in `finally`.
-      const tasks = [() => Promise.resolve('a'), () => Promise.resolve('b'), () => Promise.resolve('c')];
+      const tasks = [
+        () => Promise.resolve('a'),
+        () => Promise.resolve('b'),
+        () => Promise.resolve('c'),
+      ];
       const result = await executeParallel(tasks, { timeout: 60_000 });
       expect(result).toEqual(['a', 'b', 'c']);
       // No timers left ticking toward their deadline.

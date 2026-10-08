@@ -6,33 +6,18 @@
  * - ctx.startChildWorkflow() — auto-start child, auto-resume parent
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createContainer,
-  WorkflowRunModel,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // ctx.scatter() — Durable Parallel
 // ============================================================================
 
 describe('ctx.scatter() — durable parallel execution', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should execute all tasks in parallel and return keyed results', async () => {
-    const workflow = createWorkflow('scatter-basic', {
+    const workflow = env.workflow('scatter-basic', {
       steps: {
         fetchAll: async (ctx) => {
           const results = await ctx.scatter({
@@ -44,7 +29,6 @@ describe('ctx.scatter() — durable parallel execution', () => {
           return results;
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -56,14 +40,12 @@ describe('ctx.scatter() — durable parallel execution', () => {
       orders: [{ id: 'o1' }, { id: 'o2' }],
       settings: { theme: 'dark' },
     });
-
-    workflow.shutdown();
   });
 
   it('should resume from checkpoint after crash — completed tasks not re-executed', async () => {
     const executionLog: string[] = [];
 
-    const workflow = createWorkflow('scatter-crash-recovery', {
+    const workflow = env.workflow('scatter-crash-recovery', {
       steps: {
         fetchAll: async (ctx) => {
           const results = await ctx.scatter({
@@ -85,7 +67,6 @@ describe('ctx.scatter() — durable parallel execution', () => {
         },
       },
       defaults: { retries: 3 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -102,15 +83,13 @@ describe('ctx.scatter() — durable parallel execution', () => {
       fast: 'fast-result',
       slow: 'slow-result',
     });
-
-    workflow.shutdown();
   });
 
   it('should respect concurrency limit', async () => {
     let maxConcurrent = 0;
     let currentConcurrent = 0;
 
-    const workflow = createWorkflow('scatter-concurrency', {
+    const workflow = env.workflow('scatter-concurrency', {
       steps: {
         limited: async (ctx) => {
           return ctx.scatter(
@@ -137,11 +116,10 @@ describe('ctx.scatter() — durable parallel execution', () => {
                 return 'c';
               },
             },
-            { concurrency: 2 }
+            { concurrency: 2 },
           );
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -150,12 +128,10 @@ describe('ctx.scatter() — durable parallel execution', () => {
     expect(result.status).toBe('done');
     expect(maxConcurrent).toBeLessThanOrEqual(2);
     expect(result.output).toEqual({ a: 'a', b: 'b', c: 'c' });
-
-    workflow.shutdown();
   });
 
   it('should fail if any task fails (after checkpoint)', async () => {
-    const workflow = createWorkflow('scatter-fail', {
+    const workflow = env.workflow('scatter-fail', {
       steps: {
         mixed: async (ctx) => {
           return ctx.scatter({
@@ -167,15 +143,12 @@ describe('ctx.scatter() — durable parallel execution', () => {
         },
       },
       defaults: { retries: 1 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
 
     expect(result.status).toBe('failed');
-
-    workflow.shutdown();
   });
 
   it('should THROW when a fast task fails early among slower successes (no partial success)', async () => {
@@ -186,7 +159,7 @@ describe('ctx.scatter() — durable parallel execution', () => {
     // step must FAIL.
     const settledOrder: string[] = [];
 
-    const workflow = createWorkflow('scatter-early-fail', {
+    const workflow = env.workflow('scatter-early-fail', {
       steps: {
         mixed: async (ctx) => {
           // concurrency:1 forces the gate to `Promise.race` (and, in the
@@ -219,7 +192,6 @@ describe('ctx.scatter() — durable parallel execution', () => {
         },
       },
       defaults: { retries: 1 }, // no retry — fail on first attempt
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -229,8 +201,6 @@ describe('ctx.scatter() — durable parallel execution', () => {
     expect(result.status).toBe('failed');
     // Sanity: the early failure really did settle before the slow successes.
     expect(settledOrder[0]).toBe('boom');
-
-    workflow.shutdown();
   });
 
   it('crash mid-scatter re-runs ONLY the incomplete/failed task on recovery', async () => {
@@ -239,7 +209,7 @@ describe('ctx.scatter() — durable parallel execution', () => {
     // re-runs only the previously-failed task.
     const runs: Record<string, number> = { done1: 0, done2: 0, flaky: 0 };
 
-    const workflow = createWorkflow('scatter-recovery-selective', {
+    const workflow = env.workflow('scatter-recovery-selective', {
       steps: {
         fetchAll: async (ctx) => {
           return ctx.scatter({
@@ -260,7 +230,6 @@ describe('ctx.scatter() — durable parallel execution', () => {
         },
       },
       defaults: { retries: 3 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -273,18 +242,15 @@ describe('ctx.scatter() — durable parallel execution', () => {
     expect(runs.done1).toBe(1);
     expect(runs.done2).toBe(1);
     expect(runs.flaky).toBe(2);
-
-    workflow.shutdown();
   });
 
   it('should handle empty scatter (no tasks)', async () => {
-    const workflow = createWorkflow('scatter-empty', {
+    const workflow = env.workflow('scatter-empty', {
       steps: {
         empty: async (ctx) => {
           return ctx.scatter({});
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -292,8 +258,6 @@ describe('ctx.scatter() — durable parallel execution', () => {
 
     expect(result.status).toBe('done');
     expect(result.output).toEqual({});
-
-    workflow.shutdown();
   });
 });
 
@@ -302,16 +266,12 @@ describe('ctx.scatter() — durable parallel execution', () => {
 // ============================================================================
 
 describe('Child workflow auto-orchestration', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should auto-start child and auto-resume parent on child completion', async () => {
-    // Use shared container so both workflows share the same event bus
-    const container = createContainer();
+    // Both workflows share the env's container, so they share one event bus.
 
-    // Create child workflow FIRST (must be registered before parent starts)
-    const child = createWorkflow<{ doubled: number }>('math-worker', {
+    // Create child workflow FIRST (must be registered before parent starts).
+    // The child runs on its own once started — autoExecute is the feature.
+    const child = env.workflow<{ doubled: number }>('math-worker', {
       steps: {
         compute: async (ctx) => {
           const input = ctx.input as { value: number };
@@ -320,17 +280,17 @@ describe('Child workflow auto-orchestration', () => {
         },
       },
       context: () => ({ doubled: 0 }),
-      container,
+      autoExecute: true,
     });
 
     // Create parent workflow
-    const parent = createWorkflow<{ childResult?: unknown }>('orchestrator', {
+    const parent = env.workflow<{ childResult?: unknown }>('orchestrator', {
       steps: {
-        prepare: async (ctx) => {
+        prepare: async () => {
           return { ready: true };
         },
         delegateToChild: async (ctx) => {
-          return ctx.startChildWorkflow('math-worker', { value: 21 });
+          return ctx.startChildWorkflow(child.engine.definition.id, { value: 21 });
         },
         processChildResult: async (ctx) => {
           const childOutput = ctx.getOutput('delegateToChild');
@@ -339,8 +299,6 @@ describe('Child workflow auto-orchestration', () => {
         },
       },
       context: () => ({}),
-      container,
-      autoExecute: false,
     });
 
     const parentRun = await parent.start({});
@@ -351,51 +309,39 @@ describe('Child workflow auto-orchestration', () => {
     expect(waiting?.status).toBe('waiting');
 
     // Wait for auto-orchestration: child starts, completes, parent auto-resumes
-    const completed = await waitUntil(async () => {
-      const r = await parent.get(parentRun._id);
-      return r?.status === 'done';
-    }, 10000);
-
-    expect(completed).toBe(true);
+    await env.until(parentRun._id, 'done', { timeout: 10000 });
 
     const final = await parent.get(parentRun._id);
     expect(final?.status).toBe('done');
     // Child output should have been passed to parent
     expect(final?.context.childResult).toEqual({ result: 42 });
-
-    parent.shutdown();
-    child.shutdown();
   });
 
   it('should store childRunId in waitingFor data after auto-start', async () => {
-    const container = createContainer();
-
-    const child = createWorkflow('tracked-child', {
+    const child = env.workflow('tracked-child', {
       steps: {
-        work: async (ctx) => {
+        work: async () => {
           // Take a moment so we can inspect parent state
           await new Promise((r) => setTimeout(r, 200));
           return 'child-done';
         },
       },
-      container,
+      autoExecute: true,
     });
 
-    const parent = createWorkflow('tracking-parent', {
+    const parent = env.workflow('tracking-parent', {
       steps: {
         launch: async (ctx) => {
-          return ctx.startChildWorkflow('tracked-child', {});
+          return ctx.startChildWorkflow(child.engine.definition.id, {});
         },
       },
-      container,
-      autoExecute: false,
     });
 
     const parentRun = await parent.start({});
     await parent.execute(parentRun._id);
 
     // Check that childRunId was stored
-    const dbRun = await WorkflowRunModel.findById(parentRun._id).lean();
+    const dbRun = await env.runs.get(parentRun._id);
     const step = dbRun?.steps?.find((s) => s.stepId === 'launch');
     const data = step?.waitingFor?.data as Record<string, unknown> | undefined;
 
@@ -403,12 +349,6 @@ describe('Child workflow auto-orchestration', () => {
     expect(typeof data?.childRunId).toBe('string');
 
     // Wait for everything to complete
-    await waitUntil(async () => {
-      const r = await parent.get(parentRun._id);
-      return r?.status === 'done';
-    }, 10000);
-
-    parent.shutdown();
-    child.shutdown();
+    await env.until(parentRun._id, 'done', { timeout: 10000 });
   });
 });

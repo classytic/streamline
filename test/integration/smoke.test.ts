@@ -9,25 +9,19 @@
  *         resume → checkpoint → metrics → events → cancel → abort
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitFor } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createEventSink,
-  configureStreamlineLogger,
-  WorkflowRunModel,
-  type StepLogEntry,
-} from '../../src/index.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { configureStreamlineLogger, createEventSink, type StepLogEntry } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
+const env = useStreamlineEnv();
+
+beforeAll(() => {
   // Suppress log output during tests
   configureStreamlineLogger({ enabled: false });
 });
 
-afterAll(async () => {
+afterAll(() => {
   configureStreamlineLogger({ enabled: true });
-  await teardownTestDB();
 });
 
 // ============================================================================
@@ -35,10 +29,6 @@ afterAll(async () => {
 // ============================================================================
 
 describe('Integration smoke: order processing pipeline', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should process a complete order through all stages', async () => {
     interface OrderCtx {
       orderId: string;
@@ -48,10 +38,14 @@ describe('Integration smoke: order processing pipeline', () => {
       shipped: boolean;
       trackingNumber: string;
     }
+    interface OrderInput {
+      orderId: string;
+      amount: number;
+    }
 
     const events: string[] = [];
 
-    const orderWorkflow = createWorkflow<OrderCtx>('order-pipeline', {
+    const orderWorkflow = env.workflow<OrderCtx, OrderInput>('order-pipeline', {
       steps: {
         validate: async (ctx) => {
           ctx.log('Validating order', { orderId: ctx.context.orderId });
@@ -82,7 +76,7 @@ describe('Integration smoke: order processing pipeline', () => {
           return { notified: true };
         },
       },
-      context: (input: { orderId: string; amount: number }) => ({
+      context: (input) => ({
         orderId: input.orderId,
         amount: input.amount,
         validated: false,
@@ -90,7 +84,6 @@ describe('Integration smoke: order processing pipeline', () => {
         shipped: false,
         trackingNumber: '',
       }),
-      autoExecute: false,
     });
 
     const unsub = createEventSink(
@@ -104,7 +97,6 @@ describe('Integration smoke: order processing pipeline', () => {
     // Execute
     const run = await orderWorkflow.start({ orderId: 'ORD-001', amount: 99.99 });
     const result = await orderWorkflow.execute(run._id);
-    await waitFor(300);
 
     // Verify final state
     expect(result.status).toBe('done');
@@ -113,9 +105,12 @@ describe('Integration smoke: order processing pipeline', () => {
     expect(result.context.shipped).toBe(true);
     expect(result.context.trackingNumber).toBeTruthy();
 
-    // Verify all steps completed with metrics
-    const doc = await WorkflowRunModel.findById(run._id).lean();
-    for (const step of doc!.steps) {
+    // Verify all steps completed with metrics (logs are flushed after the run settles)
+    const doc = await env.until(
+      run._id,
+      (r) => r.status === 'done' && (r.stepLogs?.length ?? 0) >= 4,
+    );
+    for (const step of doc.steps) {
       expect(step.status).toBe('done');
       expect(step.completedAt).toBeDefined();
       expect(typeof step.durationMs).toBe('number');
@@ -123,9 +118,9 @@ describe('Integration smoke: order processing pipeline', () => {
     }
 
     // Verify logs persisted
-    const logs = doc!.stepLogs as StepLogEntry[];
+    const logs = doc.stepLogs as StepLogEntry[];
     expect(logs.length).toBeGreaterThanOrEqual(4);
-    expect(logs[0].message).toContain('Validating');
+    expect(logs[0]?.message).toContain('Validating');
 
     // Verify events captured
     expect(events).toContain('step:completed');
@@ -133,33 +128,27 @@ describe('Integration smoke: order processing pipeline', () => {
     expect(events.filter((e) => e === 'step:completed')).toHaveLength(4);
 
     unsub();
-    orderWorkflow.shutdown();
   });
 
   it('should handle failed order with non-retriable error', async () => {
-    const orderWorkflow = createWorkflow('order-fail', {
+    const orderWorkflow = env.workflow('order-fail', {
       steps: {
         validate: {
           handler: async () => {
-            const err = new Error('Payment declined');
-            (err as any).retriable = false;
-            throw err;
+            throw Object.assign(new Error('Payment declined'), { retriable: false });
           },
           retries: 5,
         },
       },
-      autoExecute: false,
     });
 
     const run = await orderWorkflow.start({});
     const result = await orderWorkflow.execute(run._id);
 
     expect(result.status).toBe('failed');
-    expect(result.steps[0].error?.message).toContain('Payment declined');
+    expect(result.steps[0]?.error?.message).toContain('Payment declined');
     // Should NOT have retried (retriable=false)
-    expect(result.steps[0].attempts).toBe(1);
-
-    orderWorkflow.shutdown();
+    expect(result.steps[0]?.attempts).toBe(1);
   });
 });
 
@@ -168,17 +157,13 @@ describe('Integration smoke: order processing pipeline', () => {
 // ============================================================================
 
 describe('Integration smoke: content approval with human review', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should pause for human review and resume on approval', async () => {
     interface ContentCtx {
       title: string;
       autoApproved: boolean;
     }
 
-    const wf = createWorkflow<ContentCtx>('content-review', {
+    const wf = env.workflow<ContentCtx, { title: string }>('content-review', {
       steps: {
         analyze: async (ctx) => {
           ctx.log('Analyzing content quality');
@@ -200,11 +185,10 @@ describe('Integration smoke: content approval with human review', () => {
           skipIf: (ctx) => !ctx.autoApproved,
         },
       },
-      context: (input: { title: string }) => ({
+      context: (input) => ({
         title: input.title,
         autoApproved: false,
       }),
-      autoExecute: false,
     });
 
     const run = await wf.start({ title: 'Draft Article' });
@@ -223,8 +207,6 @@ describe('Integration smoke: content approval with human review', () => {
     // publish step was skipped because autoApproved is false
     const publishStep = result.steps.find((s) => s.stepId === 'publish');
     expect(publishStep?.status).toBe('skipped');
-
-    wf.shutdown();
   });
 });
 
@@ -233,30 +215,30 @@ describe('Integration smoke: content approval with human review', () => {
 // ============================================================================
 
 describe('Integration smoke: cancel with abort signal', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should cancel in-flight workflow and fire abort signal', async () => {
     let abortFired = false;
+    let entered!: () => void;
+    const inStep = new Promise<void>((r) => {
+      entered = r;
+    });
 
-    const wf = createWorkflow('cancel-smoke', {
+    const wf = env.workflow('cancel-smoke', {
       steps: {
         slow: async (ctx) => {
           ctx.signal.addEventListener('abort', () => {
             abortFired = true;
           });
+          entered();
           await new Promise((r) => setTimeout(r, 10000));
           return 'unreachable';
         },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
     const execPromise = wf.execute(run._id).catch(() => {});
 
-    await waitFor(50);
+    await inStep; // the step is in flight, abort listener attached
     const cancelled = await wf.cancel(run._id);
 
     expect(cancelled.status).toBe('cancelled');
@@ -264,7 +246,6 @@ describe('Integration smoke: cancel with abort signal', () => {
     expect(abortFired).toBe(true);
 
     await execPromise;
-    wf.shutdown();
   });
 });
 
@@ -274,31 +255,30 @@ describe('Integration smoke: cancel with abort signal', () => {
 
 describe('Integration smoke: logger configuration', () => {
   it('should support custom transport for collecting logs', async () => {
-    const collected: unknown[] = [];
+    const collected: Array<{ message?: unknown }> = [];
 
     configureStreamlineLogger({
       enabled: true,
       transport: (entry) => collected.push(entry),
     });
 
-    const wf = createWorkflow('logger-smoke', {
-      steps: {
-        step1: async (ctx) => {
-          ctx.log('hello from step');
-          return 'ok';
+    try {
+      const wf = env.workflow('logger-smoke', {
+        steps: {
+          step1: async (ctx) => {
+            ctx.log('hello from step');
+            return 'ok';
+          },
         },
-      },
-      autoExecute: false,
-    });
+      });
 
-    const run = await wf.start({});
-    await wf.execute(run._id);
+      const run = await wf.start({});
+      await wf.execute(run._id);
 
-    // ctx.log goes through the centralized logger
-    expect(collected.some((e: any) => e.message === 'hello from step')).toBe(true);
-
-    // Cleanup
-    configureStreamlineLogger({ enabled: false, transport: null });
-    wf.shutdown();
+      // ctx.log goes through the centralized logger
+      expect(collected.some((e) => e.message === 'hello from step')).toBe(true);
+    } finally {
+      configureStreamlineLogger({ enabled: false, transport: null });
+    }
   });
 });

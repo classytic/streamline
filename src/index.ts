@@ -400,6 +400,7 @@ export type { ErrorCode as ErrorCodeType } from './utils/errors.js';
  * ```
  */
 export {
+  AttemptSupersededError,
   ConcurrencyLimitReachedError,
   DataCorruptionError,
   ERROR_STATUS_MAP,

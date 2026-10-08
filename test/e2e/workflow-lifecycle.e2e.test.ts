@@ -5,66 +5,52 @@
  * per-step config execution, scheduler concurrency, and multi-step scenarios.
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createHook,
-  resumeHook,
-  createContainer,
-  type Workflow,
-  type WorkflowRun,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { createHook, createWorkflow, resumeHook, type Workflow } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
+const env = useStreamlineEnv();
 
-afterAll(async () => {
-  await teardownTestDB();
-});
+/** `getOutput` is optional by type; these tests' steps always produced it. */
+function required<T>(value: T | undefined, what: string): T {
+  if (value === undefined) throw new Error(`missing output: ${what}`);
+  return value;
+}
 
 // ============================================================================
 // Cancel Workflow
 // ============================================================================
 
 describe('Cancel workflow', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should cancel a running workflow and mark it cancelled', async () => {
-    const workflow = createWorkflow('cancel-test', {
+    const workflow = env.workflow('cancel-test', {
       steps: {
-        slow: async (ctx) => {
+        slow: async () => {
           await new Promise((r) => setTimeout(r, 5000));
           return 'should not reach';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     // Don't await execute — start it and cancel immediately
     const executePromise = workflow.execute(run._id).catch(() => {});
 
-    // Give execute a moment to start
-    await new Promise((r) => setTimeout(r, 50));
+    // Wait until execute has actually started the step
+    await env.until(run._id, (r) => r.steps[0]?.status === 'running');
 
     const cancelled = await workflow.cancel(run._id);
     expect(cancelled.status).toBe('cancelled');
     expect(cancelled.endedAt).toBeInstanceOf(Date);
 
     await executePromise;
-    workflow.shutdown();
   });
 
   it('should prevent resuming a cancelled workflow', async () => {
-    const workflow = createWorkflow('cancel-no-resume', {
+    const workflow = env.workflow('cancel-no-resume', {
       steps: {
         waitStep: async (ctx) => ctx.wait('test'),
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -79,16 +65,13 @@ describe('Cancel workflow', () => {
 
     // Resume should fail
     await expect(workflow.resume(run._id, { data: 'test' })).rejects.toThrow();
-
-    workflow.shutdown();
   });
 
   it('should cancel without error on already-done workflow', async () => {
-    const workflow = createWorkflow('cancel-done', {
+    const workflow = env.workflow('cancel-done', {
       steps: {
         quick: async () => 'done',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -106,8 +89,6 @@ describe('Cancel workflow', () => {
 
     const persisted = await workflow.get(run._id);
     expect(persisted?.status).toBe('done');
-
-    workflow.shutdown();
   });
 });
 
@@ -116,29 +97,24 @@ describe('Cancel workflow', () => {
 // ============================================================================
 
 describe('Rewind workflow', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should rewind to a previous step and re-execute', async () => {
     let step2Count = 0;
 
-    const workflow = createWorkflow<{ value: number }>('rewind-test', {
+    const workflow = env.workflow<{ value: number }>('rewind-test', {
       steps: {
         step1: async (ctx) => {
           await ctx.set('value', 10);
           return 'step1-done';
         },
-        step2: async (ctx) => {
+        step2: async () => {
           step2Count++;
           return { count: step2Count };
         },
-        step3: async (ctx) => {
+        step3: async () => {
           return 'final';
         },
       },
       context: () => ({ value: 0 }),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -152,7 +128,7 @@ describe('Rewind workflow', () => {
     const rewound = await workflow.rewindTo(run._id, 'step2');
     expect(rewound.status).toBe('running');
     expect(rewound.currentStepId).toBe('step2');
-    expect(rewound.steps[0].status).toBe('done');   // step1 kept
+    expect(rewound.steps[0].status).toBe('done'); // step1 kept
     expect(rewound.steps[1].status).toBe('pending'); // step2 reset
     expect(rewound.steps[2].status).toBe('pending'); // step3 reset
 
@@ -160,12 +136,10 @@ describe('Rewind workflow', () => {
     const reExecuted = await workflow.execute(rewound._id);
     expect(reExecuted.status).toBe('done');
     expect(step2Count).toBe(2); // step2 ran again
-
-    workflow.shutdown();
   });
 
   it('should rewind to the first step and reset everything', async () => {
-    const workflow = createWorkflow<{ result: number }>('rewind-first', {
+    const workflow = env.workflow<{ result: number }>('rewind-first', {
       steps: {
         init: async (ctx) => {
           await ctx.set('result', 42);
@@ -176,7 +150,6 @@ describe('Rewind workflow', () => {
         },
       },
       context: () => ({ result: 0 }),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -186,8 +159,6 @@ describe('Rewind workflow', () => {
     const rewound = await workflow.rewindTo(run._id, 'init');
     expect(rewound.currentStepId).toBe('init');
     expect(rewound.steps.every((s) => s.status === 'pending')).toBe(true);
-
-    workflow.shutdown();
   });
 });
 
@@ -196,14 +167,10 @@ describe('Rewind workflow', () => {
 // ============================================================================
 
 describe('Hook-based resume', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should create a hook, pause, and resume via token', async () => {
     let hookToken: string | undefined;
 
-    const workflow = createWorkflow<{ approved?: boolean }>('hook-test', {
+    const workflow = env.workflow<{ approved?: boolean }>('hook-test', {
       steps: {
         requestApproval: async (ctx) => {
           const hook = createHook(ctx, 'awaiting-approval');
@@ -211,13 +178,15 @@ describe('Hook-based resume', () => {
           return ctx.wait(hook.token, { hookToken: hook.token });
         },
         processApproval: async (ctx) => {
-          const approval = ctx.getOutput<{ approved: boolean }>('requestApproval');
+          const approval = required(
+            ctx.getOutput<{ approved: boolean }>('requestApproval'),
+            'requestApproval',
+          );
           await ctx.set('approved', approval.approved);
           return { processed: true };
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -229,32 +198,28 @@ describe('Hook-based resume', () => {
     expect(hookToken).toBeDefined();
 
     // Resume via hook token
-    const result = await resumeHook(hookToken!, { approved: true });
+    const result = await resumeHook(required(hookToken, 'hookToken'), { approved: true });
     expect(result.runId).toBe(run._id);
 
     // Wait for completion
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
+    await env.until(run._id, 'done');
 
     const completed = await workflow.get(run._id);
     expect(completed?.status).toBe('done');
     expect(completed?.context.approved).toBe(true);
-
-    workflow.shutdown();
   });
 
   it('should reject invalid hook tokens', async () => {
     // With durable DB fallback, resumeHook tries DB when engine not in registry.
-    // Non-existent workflow → "Workflow not found"
-    await expect(resumeHook('nonexistent:step:random', {})).rejects.toThrow(
-      /not found/
-    );
+    // Non-existent workflow → "Workflow not found". The fallback resolves
+    // through the env's container (never the default-connection singleton).
+    await expect(
+      resumeHook('nonexistent:step:random', {}, { container: env.container }),
+    ).rejects.toThrow(/not found/);
   });
 
   it('should generate secure tokens with crypto random suffix', async () => {
-    const workflow = createWorkflow('hook-token-test', {
+    const workflow = env.workflow('hook-token-test', {
       steps: {
         wait: async (ctx) => {
           const hook = createHook(ctx, 'test');
@@ -265,7 +230,6 @@ describe('Hook-based resume', () => {
           return ctx.wait(hook.token, { hookToken: hook.token });
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -273,8 +237,6 @@ describe('Hook-based resume', () => {
 
     const waiting = await workflow.get(run._id);
     expect(waiting?.status).toBe('waiting');
-
-    workflow.shutdown();
   });
 });
 
@@ -283,17 +245,13 @@ describe('Hook-based resume', () => {
 // ============================================================================
 
 describe('StepConfig per-step retries E2E', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should retry fragile step only once then fail, while resilient step retries more', async () => {
     let fragileAttempts = 0;
 
-    const workflow = createWorkflow('step-retries-e2e', {
+    const workflow = env.workflow('step-retries-e2e', {
       steps: {
         fragile: {
-          handler: async (ctx) => {
+          handler: async () => {
             fragileAttempts++;
             throw new Error(`Fragile failure #${fragileAttempts}`);
           },
@@ -301,7 +259,6 @@ describe('StepConfig per-step retries E2E', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -309,15 +266,13 @@ describe('StepConfig per-step retries E2E', () => {
 
     expect(result.status).toBe('failed');
     expect(fragileAttempts).toBe(1);
-
-    workflow.shutdown();
   });
 
   it('should apply different retries per step in same workflow', async () => {
     let step1Attempts = 0;
     let step2Attempts = 0;
 
-    const workflow = createWorkflow('mixed-retries-e2e', {
+    const workflow = env.workflow('mixed-retries-e2e', {
       steps: {
         step1: {
           handler: async () => {
@@ -336,7 +291,6 @@ describe('StepConfig per-step retries E2E', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -351,8 +305,6 @@ describe('StepConfig per-step retries E2E', () => {
     const step2State = result.steps.find((s) => s.stepId === 'step2');
     expect(step1State?.status).toBe('done');
     expect(step2State?.status).toBe('failed');
-
-    workflow.shutdown();
   });
 
   it('should skipIf via StepConfig during execution', async () => {
@@ -361,7 +313,7 @@ describe('StepConfig per-step retries E2E', () => {
       results: string[];
     }
 
-    const workflow = createWorkflow<Ctx>('skipif-e2e', {
+    const workflow = env.workflow<Ctx, { premium: boolean }>('skipif-e2e', {
       steps: {
         basic: async (ctx) => {
           ctx.context.results.push('basic');
@@ -379,8 +331,7 @@ describe('StepConfig per-step retries E2E', () => {
           return 'ok';
         },
       },
-      context: (input: any) => ({ premium: input.premium, results: [] as string[] }),
-      autoExecute: false,
+      context: (input) => ({ premium: input.premium, results: [] as string[] }),
     });
 
     // Free user — premium skipped
@@ -394,8 +345,6 @@ describe('StepConfig per-step retries E2E', () => {
     const proResult = await workflow.execute(pro._id);
     expect(proResult.status).toBe('done');
     expect(proResult.context.results).toEqual(['basic', 'premium', 'finish']);
-
-    workflow.shutdown();
   });
 });
 
@@ -404,27 +353,18 @@ describe('StepConfig per-step retries E2E', () => {
 // ============================================================================
 
 describe('Heartbeat mechanism', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should auto-send heartbeats during step execution', async () => {
-    const container = createContainer();
-
-    const workflow = createWorkflow('heartbeat-test', {
+    const workflow = env.workflow('heartbeat-test', {
       steps: {
-        longStep: async (ctx) => {
-          // Simulate work for 2 seconds
+        longStep: async () => {
+          // Simulate work for 2 seconds (the long step IS the subject)
           await new Promise((r) => setTimeout(r, 2000));
           return 'done';
         },
       },
-      container,
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
-    const beforeHeartbeat = run.lastHeartbeat;
 
     await workflow.execute(run._id);
 
@@ -432,12 +372,10 @@ describe('Heartbeat mechanism', () => {
     expect(completed?.status).toBe('done');
     // lastHeartbeat should have been updated during execution
     expect(completed?.lastHeartbeat).toBeInstanceOf(Date);
-
-    workflow.shutdown();
   });
 
   it('should allow manual heartbeat calls', async () => {
-    const workflow = createWorkflow('manual-heartbeat', {
+    const workflow = env.workflow('manual-heartbeat', {
       steps: {
         batchWork: async (ctx) => {
           for (let i = 0; i < 3; i++) {
@@ -447,14 +385,11 @@ describe('Heartbeat mechanism', () => {
           return 'done';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
-
-    workflow.shutdown();
   });
 });
 
@@ -463,19 +398,14 @@ describe('Heartbeat mechanism', () => {
 // ============================================================================
 
 describe('Pause and resume', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should pause a waiting workflow and resume it later', async () => {
-    const workflow = createWorkflow('pause-waiting', {
+    const workflow = env.workflow('pause-waiting', {
       steps: {
         work: async (ctx) => {
           return ctx.wait('Need approval');
         },
         after: async () => 'done',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -491,24 +421,18 @@ describe('Pause and resume', () => {
     // Resume (should clear paused flag and continue)
     await workflow.resume(run._id, { approved: true });
 
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
+    await env.until(run._id, 'done');
 
     const done = await workflow.get(run._id);
     expect(done?.status).toBe('done');
     expect(done?.paused).toBeFalsy();
-
-    workflow.shutdown();
   });
 
   it('should be idempotent — pausing twice is a no-op', async () => {
-    const workflow = createWorkflow('pause-idempotent', {
+    const workflow = env.workflow('pause-idempotent', {
       steps: {
         work: async (ctx) => ctx.wait('test'),
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -519,8 +443,6 @@ describe('Pause and resume', () => {
 
     expect(first.paused).toBe(true);
     expect(second.paused).toBe(true);
-
-    workflow.shutdown();
   });
 });
 
@@ -532,16 +454,22 @@ describe('Workflow type export', () => {
   it('should allow exporting workflow instances with Workflow type annotation', () => {
     // This test guards against TS4023 regression.
     // If Workflow type is not exported, TypeScript compilation fails.
+    // Deliberately `createWorkflow` (its return type is the subject); no run
+    // is ever started, so the fixed id cannot collide.
     const wf: Workflow<{ n: number }> = createWorkflow<{ n: number }>('type-export-guard', {
       steps: {
         step1: async (ctx) => ctx.context.n * 2,
       },
       context: () => ({ n: 1 }),
+      container: env.container,
       autoExecute: false,
     });
 
-    expect(wf.definition.id).toBe('type-export-guard');
-    wf.shutdown();
+    try {
+      expect(wf.definition.id).toBe('type-export-guard');
+    } finally {
+      wf.shutdown();
+    }
   });
 });
 
@@ -550,10 +478,6 @@ describe('Workflow type export', () => {
 // ============================================================================
 
 describe('Real-world: order processing pipeline', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should process an order through validate → charge → fulfill → notify', async () => {
     interface OrderCtx {
       orderId: string;
@@ -564,7 +488,7 @@ describe('Real-world: order processing pipeline', () => {
       notified: boolean;
     }
 
-    const workflow = createWorkflow<OrderCtx, { orderId: string; email: string; amount: number }>(
+    const workflow = env.workflow<OrderCtx, { orderId: string; email: string; amount: number }>(
       'order-pipeline',
       {
         steps: {
@@ -599,8 +523,7 @@ describe('Real-world: order processing pipeline', () => {
           amount: input.amount,
           notified: false,
         }),
-        autoExecute: false,
-      }
+      },
     );
 
     const run = await workflow.start({
@@ -616,14 +539,12 @@ describe('Real-world: order processing pipeline', () => {
     expect(result.context.trackingNumber).toBeDefined();
     expect(result.context.notified).toBe(true);
     expect(result.steps.every((s) => s.status === 'done')).toBe(true);
-
-    workflow.shutdown();
   });
 
   it('should fail the pipeline if charge step fails after retries', async () => {
     let attempts = 0;
 
-    const workflow = createWorkflow('order-charge-fail', {
+    const workflow = env.workflow('order-charge-fail', {
       steps: {
         validate: async () => ({ valid: true }),
         charge: {
@@ -635,7 +556,6 @@ describe('Real-world: order processing pipeline', () => {
         },
         fulfill: async () => 'should not reach',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -648,8 +568,6 @@ describe('Real-world: order processing pipeline', () => {
     expect(result.steps[0].status).toBe('done');
     expect(result.steps[1].status).toBe('failed');
     expect(result.steps[2].status).toBe('pending');
-
-    workflow.shutdown();
   });
 });
 
@@ -658,24 +576,22 @@ describe('Real-world: order processing pipeline', () => {
 // ============================================================================
 
 describe('Step output chaining', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should pass output from one step to the next via getOutput', async () => {
-    const workflow = createWorkflow('output-chain', {
+    const workflow = env.workflow('output-chain', {
       steps: {
         generate: async () => ({ id: 'user-123', name: 'Alice' }),
         transform: async (ctx) => {
-          const user = ctx.getOutput<{ id: string; name: string }>('generate');
+          const user = required(
+            ctx.getOutput<{ id: string; name: string }>('generate'),
+            'generate',
+          );
           return { greeting: `Hello, ${user.name}!`, userId: user.id };
         },
         finalize: async (ctx) => {
-          const data = ctx.getOutput<{ greeting: string }>('transform');
+          const data = required(ctx.getOutput<{ greeting: string }>('transform'), 'transform');
           return { message: data.greeting };
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -683,8 +599,6 @@ describe('Step output chaining', () => {
 
     expect(result.status).toBe('done');
     expect(result.output).toEqual({ message: 'Hello, Alice!' });
-
-    workflow.shutdown();
   });
 });
 
@@ -693,38 +607,33 @@ describe('Step output chaining', () => {
 // ============================================================================
 
 describe('Workflow.waitFor()', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should wait for workflow to complete', async () => {
-    const workflow = createWorkflow('waitfor-test', {
+    // start() executing by itself is what waitFor() waits on.
+    const workflow = env.workflow('waitfor-test', {
       steps: {
         step1: async () => 'done',
       },
+      autoExecute: true,
     });
 
     const run = await workflow.start({});
     const completed = await workflow.waitFor(run._id, { timeout: 5000 });
 
     expect(completed.status).toBe('done');
-
-    workflow.shutdown();
   });
 
   it('should timeout if workflow does not complete', async () => {
-    const workflow = createWorkflow('waitfor-timeout', {
+    const workflow = env.workflow('waitfor-timeout', {
       steps: {
         hang: async (ctx) => ctx.wait('forever'),
       },
+      autoExecute: true,
     });
 
     const run = await workflow.start({});
 
-    await expect(
-      workflow.waitFor(run._id, { timeout: 500, pollInterval: 100 })
-    ).rejects.toThrow(/Timeout/);
-
-    workflow.shutdown();
+    await expect(workflow.waitFor(run._id, { timeout: 500, pollInterval: 100 })).rejects.toThrow(
+      /Timeout/,
+    );
   });
 });

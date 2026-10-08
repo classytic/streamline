@@ -1,15 +1,11 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import mongoose from 'mongoose';
-import {
-  createWorkflow,
-  createHook,
-  resumeHook,
-  createContainer,
-} from '../../src/index.js';
-import { SchedulingService } from '../../src/scheduling/scheduling.service.js';
-import { enableTelemetry, disableTelemetry } from '../../src/telemetry/index.js';
 import type { Span, Tracer } from '@opentelemetry/api';
-import { WorkflowRunModel } from '../../src/storage/models.js';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { createHook, resumeHook } from '../../src/index.js';
+import { SchedulingService } from '../../src/scheduling/scheduling.service.js';
+import { disableTelemetry, enableTelemetry } from '../../src/telemetry/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 class TestSpan {
   name: string;
@@ -34,22 +30,12 @@ class TestSpan {
 }
 
 describe('Telemetry and Scheduled Hooks Fixes', () => {
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(
-        process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test'
-      );
-    }
-  });
-
-  beforeEach(async () => {
-    await WorkflowRunModel.deleteMany({});
+  beforeEach(() => {
     disableTelemetry();
   });
 
-  afterAll(async () => {
+  afterAll(() => {
     disableTelemetry();
-    await mongoose.connection.close();
   });
 
   it('should capture workflow events when using global event bus', async () => {
@@ -66,15 +52,15 @@ describe('Telemetry and Scheduled Hooks Fixes', () => {
     // Enable telemetry with global event bus
     enableTelemetry({ tracer });
 
-    // Create container with global event bus - this is the recommended pattern
-    const container = createContainer({ eventBus: 'global' });
+    // Create container with global event bus - this is the recommended pattern.
+    // The env disposes it (detaching the bridge from the process-wide bus).
+    const container = env.createContainer({ eventBus: 'global' });
 
-    const workflow = createWorkflow<{ value: number }>('telemetry-fix', {
+    const workflow = env.workflow<{ value: number }, { value: number }>('telemetry-fix', {
       steps: {
         step1: async () => 'done',
       },
-      context: (input: { value: number }) => ({ value: input.value }),
-      autoExecute: false,
+      context: (input) => ({ value: input.value }),
       container,
     });
 
@@ -87,7 +73,6 @@ describe('Telemetry and Scheduled Hooks Fixes', () => {
       expect(spans.some((s) => s.name.includes('workflow'))).toBe(true);
       expect(spans.some((s) => s.name.includes('step'))).toBe(true);
     } finally {
-      workflow.shutdown();
       disableTelemetry();
     }
   });
@@ -95,7 +80,7 @@ describe('Telemetry and Scheduled Hooks Fixes', () => {
   it('should resume hook for scheduled workflows after executeNow()', async () => {
     let hookToken: string | null = null;
 
-    const workflow = createWorkflow<{ approved?: boolean }>('scheduled-hook-fix', {
+    const workflow = env.workflow<{ approved?: boolean }>('scheduled-hook-fix', {
       steps: {
         request: async (ctx) => {
           const hook = createHook(ctx, 'approval');
@@ -112,32 +97,31 @@ describe('Telemetry and Scheduled Hooks Fixes', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
-    // SchedulingService now uses unified container with proper hook registration
-    const service = new SchedulingService(workflow.definition, workflow.engine.handlers);
+    // SchedulingService now uses unified container with proper hook registration.
+    // Its own container (as before), on the env's database.
+    const service = new SchedulingService(workflow.definition, workflow.engine.handlers, {
+      container: env.createContainer(),
+    });
 
-    try {
-      const scheduledFor = new Date(Date.now() + 60_000)
-        .toISOString()
-        .slice(0, 19);
-      const run = await service.schedule({
-        scheduledFor,
-        timezone: 'UTC',
-        input: {},
-      });
+    const scheduledFor = new Date(Date.now() + 60_000).toISOString().slice(0, 19);
+    const run = await service.schedule({
+      scheduledFor,
+      timezone: 'UTC',
+      input: {},
+    });
 
-      // executeNow() now registers the engine with hookRegistry
-      const waitingRun = await service.executeNow(run._id);
-      expect(waitingRun.status).toBe('waiting');
-      expect(hookToken).toBeTruthy();
+    // executeNow() now registers the engine with hookRegistry
+    const waitingRun = await service.executeNow(run._id);
+    expect(waitingRun.status).toBe('waiting');
+    expect(hookToken).toBeTruthy();
 
-      // resumeHook should now work for scheduled workflows
-      const result = await resumeHook(hookToken as string, { approved: true });
-      expect(result.run.status).toBe('done');
-    } finally {
-      workflow.shutdown();
-    }
+    // resumeHook should now work for scheduled workflows — through the
+    // in-process registry (no container passed: the DB fallback would go to
+    // the default-connection singleton, not the env's database — so only
+    // the registry path can resume this run).
+    const result = await resumeHook(String(hookToken), { approved: true });
+    expect(result.run.status).toBe('done');
   });
 });

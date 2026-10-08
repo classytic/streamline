@@ -4,12 +4,16 @@
  * Tests timezone-aware workflow scheduling, rescheduling, and cancellation.
  */
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import mongoose from 'mongoose';
-import { WorkflowRunModel } from '../../src/storage/models.js';
-import { SchedulingService } from '../../src/scheduling/scheduling.service.js';
-import { createWorkflow } from '../../src/index.js';
-import type { WorkflowHandlers } from '../../src/core/types.js';
+import { beforeEach, describe, expect, it } from 'vitest';
+import type { WorkflowDefinition, WorkflowHandlers } from '../../src/core/types.js';
+import type { TenantFilterOptions } from '../../src/plugins/tenant-filter.plugin.js';
+import {
+  SchedulingService,
+  type SchedulingServiceConfig,
+} from '../../src/scheduling/scheduling.service.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 // Helper to convert Date to ISO string (YYYY-MM-DDTHH:mm:ss) - matches how scheduledFor is stored
 function toLocalISOString(date: Date): string {
@@ -28,19 +32,6 @@ interface TestContext {
   tenantId?: string;
 }
 
-const testWorkflow = createWorkflow<TestContext>('test-scheduled-workflow', {
-  steps: {
-    process: async (ctx) => {
-      return { processed: true, message: ctx.context.message };
-    },
-  },
-  context: (input: any) => ({
-    message: input.message || 'default',
-    tenantId: input.tenantId,
-  }),
-  autoExecute: false,
-});
-
 const testHandlers: WorkflowHandlers<TestContext> = {
   process: async (ctx) => {
     return { processed: true, message: ctx.context.message };
@@ -49,21 +40,34 @@ const testHandlers: WorkflowHandlers<TestContext> = {
 
 describe('SchedulingService', () => {
   let service: SchedulingService<TestContext>;
+  let testWorkflow: { definition: WorkflowDefinition<TestContext> };
 
-  beforeAll(async () => {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/streamline-test');
-    }
-  });
+  /** A service bound to the env's connection, with the given tenant config. */
+  const tenantService = (tenant: TenantFilterOptions) => {
+    const config: SchedulingServiceConfig = {
+      container: { connection: env.connection, repository: { tenant } },
+    };
+    return new SchedulingService(testWorkflow.definition, testHandlers, config);
+  };
 
-  afterAll(async () => {
-    testWorkflow.shutdown();
-    await mongoose.connection.close();
-  });
-
-  beforeEach(async () => {
-    await WorkflowRunModel.deleteMany({});
-    service = new SchedulingService(testWorkflow.definition, testHandlers);
+  beforeEach(() => {
+    testWorkflow = env.workflow<TestContext, { message?: string; tenantId?: string }>(
+      'test-scheduled-workflow',
+      {
+        steps: {
+          process: async (ctx) => {
+            return { processed: true, message: ctx.context.message };
+          },
+        },
+        context: (input) => ({
+          message: input.message || 'default',
+          ...(input.tenantId !== undefined && { tenantId: input.tenantId }),
+        }),
+      },
+    );
+    service = new SchedulingService(testWorkflow.definition, testHandlers, {
+      container: env.container,
+    });
   });
 
   describe('schedule()', () => {
@@ -166,13 +170,13 @@ describe('SchedulingService', () => {
       ];
 
       const runs = await Promise.all(
-        timezones.map((tz, i) =>
+        timezones.map((tz) =>
           service.schedule({
             scheduledFor: new Date(2024, 6, 15, 9, 0, 0),
             timezone: tz,
             input: { message: `Test for ${tz}` },
-          })
-        )
+          }),
+        ),
       );
 
       // All should be created successfully
@@ -217,16 +221,14 @@ describe('SchedulingService', () => {
       const rescheduled = await service.reschedule(
         original._id,
         new Date(2024, 6, 16, 9, 0, 0),
-        'America/Los_Angeles'
+        'America/Los_Angeles',
       );
 
       expect(rescheduled.scheduling?.timezone).toBe('America/Los_Angeles');
     });
 
     it('should throw error for non-existent workflow', async () => {
-      await expect(
-        service.reschedule('non-existent-id', new Date())
-      ).rejects.toThrow('not found');
+      await expect(service.reschedule('non-existent-id', new Date())).rejects.toThrow('not found');
     });
 
     it('should throw error when rescheduling non-draft workflow', async () => {
@@ -237,34 +239,27 @@ describe('SchedulingService', () => {
       });
 
       // Manually change status to simulate started workflow
-      await WorkflowRunModel.updateOne(
-        { _id: run._id },
-        { $set: { status: 'running' } }
-      );
+      await env.runs.update(run._id, { status: 'running' });
 
-      await expect(
-        service.reschedule(run._id, new Date(2024, 6, 16, 9, 0, 0))
-      ).rejects.toThrow('Only draft workflows');
+      await expect(service.reschedule(run._id, new Date(2024, 6, 16, 9, 0, 0))).rejects.toThrow(
+        'Only draft workflows',
+      );
     });
 
     it('should throw error when rescheduling non-scheduled workflow', async () => {
       // Create workflow directly without scheduling
-      const nonScheduled = await WorkflowRunModel.create({
+      const nonScheduled = await env.runs.insert(testWorkflow.definition.id, {
         _id: 'non-scheduled-run',
-        workflowId: 'test-scheduled-workflow',
         status: 'draft',
         steps: [],
         currentStepId: null,
         context: { message: 'test' },
-        input: {},
-        createdAt: new Date(),
-        updatedAt: new Date(),
         // No scheduling field
       });
 
-      await expect(
-        service.reschedule(nonScheduled._id, new Date())
-      ).rejects.toThrow('not a scheduled workflow');
+      await expect(service.reschedule(nonScheduled._id, new Date())).rejects.toThrow(
+        'not a scheduled workflow',
+      );
     });
   });
 
@@ -294,10 +289,7 @@ describe('SchedulingService', () => {
         input: { message: 'Test' },
       });
 
-      await WorkflowRunModel.updateOne(
-        { _id: run._id },
-        { $set: { status: 'done' } }
-      );
+      await env.runs.update(run._id, { status: 'done' });
 
       await expect(service.cancelScheduled(run._id)).rejects.toThrow('Only draft workflows');
     });
@@ -326,11 +318,9 @@ describe('SchedulingService', () => {
 
   describe('Multi-Tenant Scheduling', () => {
     it('should schedule with tenantId', async () => {
-      const multiTenantService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        tenant: {
-          tenantField: 'context.tenantId',
-          required: false, // Non-strict for testing
-        },
+      const multiTenantService = tenantService({
+        tenantField: 'context.tenantId',
+        required: false, // Non-strict for testing
       });
 
       const run = await multiTenantService.schedule({
@@ -345,11 +335,9 @@ describe('SchedulingService', () => {
     });
 
     it('should schedule under a strict-tenant repo: run is tenant-stamped and tenant-scoped-queryable', async () => {
-      const strictService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        tenant: {
-          tenantField: 'context.tenantId',
-          required: true,
-        },
+      const strictService = tenantService({
+        tenantField: 'context.tenantId',
+        required: true,
       });
 
       const run = await strictService.schedule({
@@ -364,25 +352,23 @@ describe('SchedulingService', () => {
 
       // Tenant-scoped-queryable through the same strict repo.
       const repo = strictService.container.repository;
-      const mine = await repo.findAll(
-        { _id: run._id },
-        { tenantId: 'strict-tenant-a', lean: true } as any,
-      );
+      const mine = await repo.findAll({ _id: run._id }, {
+        tenantId: 'strict-tenant-a',
+        lean: true,
+      } as any);
       expect(mine).toHaveLength(1);
 
-      const theirs = await repo.findAll(
-        { _id: run._id },
-        { tenantId: 'strict-tenant-b', lean: true } as any,
-      );
+      const theirs = await repo.findAll({ _id: run._id }, {
+        tenantId: 'strict-tenant-b',
+        lean: true,
+      } as any);
       expect(theirs).toHaveLength(0);
     });
 
     it('should throw under a strict-tenant repo when tenantId is missing', async () => {
-      const strictService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        tenant: {
-          tenantField: 'context.tenantId',
-          required: true,
-        },
+      const strictService = tenantService({
+        tenantField: 'context.tenantId',
+        required: true,
       });
 
       await expect(
@@ -395,11 +381,9 @@ describe('SchedulingService', () => {
     });
 
     it('should stamp the CONFIGURED tenant field, not a hardcoded context.tenantId literal', async () => {
-      const metaService = new SchedulingService(testWorkflow.definition, testHandlers, {
-        tenant: {
-          tenantField: 'meta.orgId',
-          required: true,
-        },
+      const metaService = tenantService({
+        tenantField: 'meta.orgId',
+        required: true,
       });
 
       const run = await metaService.schedule({
@@ -496,9 +480,7 @@ describe('SchedulingService', () => {
         input: { message: `Concurrent ${i}` },
       }));
 
-      const runs = await Promise.all(
-        schedules.map((s) => service.schedule(s))
-      );
+      const runs = await Promise.all(schedules.map((s) => service.schedule(s)));
 
       expect(runs).toHaveLength(10);
 

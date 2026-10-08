@@ -25,39 +25,33 @@
  * stale-vs-live decision deterministic without waiting on wall-clock.
  */
 
-import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
-import { createContainer, createWorkflow, WorkflowRunModel } from '../../src/index.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
-import { runCompensation } from '../../src/execution/saga.js';
+import { describe, expect, it } from 'vitest';
 import type { StepState, WorkflowRun } from '../../src/core/types.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB, waitUntil } from '../utils/setup.js';
+import { runCompensation } from '../../src/execution/saga.js';
+import type { WorkflowRef } from '../../src/testkit/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(setupTestDB);
-afterAll(teardownTestDB);
-afterEach(cleanupTestDB);
-
-let wfCounter = 0;
-const uniqueId = (prefix: string) => `${prefix}-${Date.now()}-${++wfCounter}`;
+const env = useStreamlineEnv();
 
 /**
  * Persist a `compensating` (or `failed`) run directly — the crash/entry DB
- * shape. Steps are seeded as `done` (compensable), with optional per-step
- * `compensation` records to simulate "already compensated" on the crash path.
+ * shape. Steps are given explicitly in execution order (the array the engine
+ * appends to), with optional per-step `compensation` records to simulate
+ * "already compensated" on the crash path. Returns the run id.
  */
-async function persistRun(opts: {
-  runId: string;
-  workflowId: string;
-  status: WorkflowRun['status'];
-  /** Ordered step states (execution order — the array the engine appends to). */
-  steps: Array<{
-    stepId: string;
-    status: StepState['status'];
-    output?: unknown;
-    compensation?: StepState['compensation'];
-  }>;
-  lastHeartbeat?: Date;
-  context?: Record<string, unknown>;
-}): Promise<void> {
+async function persistRun(
+  wf: WorkflowRef,
+  opts: {
+    status: WorkflowRun['status'];
+    steps: Array<{
+      stepId: string;
+      status: StepState['status'];
+      output?: unknown;
+      compensation?: StepState['compensation'];
+    }>;
+    lastHeartbeat?: Date;
+  },
+): Promise<string> {
   const now = new Date();
   const steps: StepState[] = opts.steps.map((s) => ({
     stepId: s.stepId,
@@ -66,21 +60,16 @@ async function persistRun(opts: {
     startedAt: now,
     ...(s.output !== undefined ? { output: s.output } : {}),
     ...(s.compensation ? { compensation: s.compensation } : {}),
-  })) as StepState[];
+  }));
 
-  await WorkflowRunModel.create({
-    _id: opts.runId,
-    workflowId: opts.workflowId,
+  const run = await env.runs.insert(wf, {
     status: opts.status,
     steps,
     currentStepId: opts.steps.at(-1)?.stepId ?? null,
-    context: opts.context ?? {},
-    input: {},
-    createdAt: now,
-    updatedAt: now,
     startedAt: now,
     ...(opts.lastHeartbeat ? { lastHeartbeat: opts.lastHeartbeat } : {}),
-  } as unknown as WorkflowRun);
+  });
+  return run._id;
 }
 
 // ============================================================================
@@ -90,13 +79,12 @@ async function persistRun(opts: {
 describe('saga compensation matrix', () => {
   it('[1] happy path: all steps succeed → done, NO compensation runs', async () => {
     const compensated: string[] = [];
-    const wf = createWorkflow(uniqueId('happy'), {
+    const wf = env.workflow('happy', {
       steps: {
         a: { handler: async () => 'a', onCompensate: async () => void compensated.push('a') },
         b: { handler: async () => 'b', onCompensate: async () => void compensated.push('b') },
         c: { handler: async () => 'c', onCompensate: async () => void compensated.push('c') },
       },
-      autoExecute: false,
     });
 
     const run = await wf.start({});
@@ -104,7 +92,6 @@ describe('saga compensation matrix', () => {
 
     expect(result.status).toBe('done');
     expect(compensated).toEqual([]); // compensation only fires on failure
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -114,40 +101,41 @@ describe('saga compensation matrix', () => {
   it('[2] C fails → A & B compensate in REVERSE order (B, then A); terminal compensated', async () => {
     const order: string[] = [];
     const events: string[] = [];
-    const container = createContainer();
-    container.eventBus.on('step:compensated', (p) => events.push(p.stepId as string));
+    const onCompensated = (p: { stepId?: unknown }) => events.push(p.stepId as string);
+    env.container.eventBus.on('step:compensated', onCompensated);
 
-    const wf = createWorkflow(uniqueId('reverse'), {
-      steps: {
-        a: { handler: async () => 'A', onCompensate: async () => void order.push('a') },
-        b: { handler: async () => 'B', onCompensate: async () => void order.push('b') },
-        c: {
-          handler: async () => {
-            throw new Error('C exploded');
+    try {
+      const wf = env.workflow('reverse', {
+        steps: {
+          a: { handler: async () => 'A', onCompensate: async () => void order.push('a') },
+          b: { handler: async () => 'B', onCompensate: async () => void order.push('b') },
+          c: {
+            handler: async () => {
+              throw new Error('C exploded');
+            },
+            retries: 1,
+            onCompensate: async () => void order.push('c-should-not-run'),
           },
-          retries: 1,
-          onCompensate: async () => void order.push('c-should-not-run'),
         },
-      },
-      container,
-      autoExecute: false,
-    });
+      });
 
-    const run = await wf.start({});
-    const result = await wf.execute(run._id);
+      const run = await wf.start({});
+      const result = await wf.execute(run._id);
 
-    expect(result.status).toBe('compensated');
-    // Reverse of completion order [a, b] → [b, a]. c never completed → not run.
-    expect(order).toEqual(['b', 'a']);
-    expect(events).toEqual(['b', 'a']);
+      expect(result.status).toBe('compensated');
+      // Reverse of completion order [a, b] → [b, a]. c never completed → not run.
+      expect(order).toEqual(['b', 'a']);
+      expect(events).toEqual(['b', 'a']);
 
-    // Per-step compensation memoization landed for the two done steps.
-    const persisted = await wf.get(run._id);
-    const byId = Object.fromEntries((persisted?.steps ?? []).map((s) => [s.stepId, s]));
-    expect(byId.a?.compensation?.status).toBe('done');
-    expect(byId.b?.compensation?.status).toBe('done');
-    expect(byId.c?.compensation).toBeUndefined(); // failed step never compensated
-    wf.shutdown();
+      // Per-step compensation memoization landed for the two done steps.
+      const persisted = await wf.get(run._id);
+      const byId = Object.fromEntries((persisted?.steps ?? []).map((s) => [s.stepId, s]));
+      expect(byId.a?.compensation?.status).toBe('done');
+      expect(byId.b?.compensation?.status).toBe('done');
+      expect(byId.c?.compensation).toBeUndefined(); // failed step never compensated
+    } finally {
+      env.container.eventBus.off('step:compensated', onCompensated);
+    }
   });
 
   // ==========================================================================
@@ -158,11 +146,10 @@ describe('saga compensation matrix', () => {
 
   it('[3] only done steps with handlers compensate (no-handler done step skipped; non-done skipped)', async () => {
     const compensated: string[] = [];
-    const wfId = uniqueId('only-done');
 
     // Build the engine so we can drive compensation from a hand-persisted
     // run shape that includes a `running` (incomplete) step at failure time.
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('only-done', {
       steps: {
         withHandler: {
           handler: async () => 'x',
@@ -181,15 +168,11 @@ describe('saga compensation matrix', () => {
           onCompensate: async () => void compensated.push('boom-should-not-run'),
         },
       },
-      autoExecute: false,
     });
 
     // Persist the failure-time shape directly: withHandler+noHandler done,
     // leftRunning still 'running' (incomplete effect), boom failed.
-    const runId = uniqueId('only-done-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+    const runId = await persistRun(wf, {
       status: 'failed',
       steps: [
         { stepId: 'withHandler', status: 'done', output: 'x' },
@@ -205,7 +188,6 @@ describe('saga compensation matrix', () => {
     // Only the done step WITH a handler ran. noHandler (no onCompensate) and
     // leftRunning (not done) were skipped; boom (failed) skipped.
     expect(compensated).toEqual(['withHandler']);
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -214,24 +196,19 @@ describe('saga compensation matrix', () => {
 
   it('[4] crash mid-compensation: C already done → recovery compensates B & A only, terminal compensated', async () => {
     const compensated: string[] = [];
-    const wfId = uniqueId('crash-recover');
 
     // Fresh engine — NO in-memory state from a prior run (post-crash process).
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('crash-recover', {
       steps: {
         a: { handler: async () => 'A', onCompensate: async () => void compensated.push('a') },
         b: { handler: async () => 'B', onCompensate: async () => void compensated.push('b') },
         c: { handler: async () => 'C', onCompensate: async () => void compensated.push('c') },
       },
-      autoExecute: false,
     });
 
     // Post-crash shape: run is `compensating`, C's compensation ALREADY done,
     // heartbeat is stale. A & B not yet compensated.
-    const runId = uniqueId('crash-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+    const runId = await persistRun(wf, {
       status: 'compensating',
       lastHeartbeat: new Date(Date.now() - 10 * 60_000), // 10 min ago — stale
       steps: [
@@ -258,7 +235,6 @@ describe('saga compensation matrix', () => {
     expect(byId.a?.compensation?.status).toBe('done');
     expect(byId.b?.compensation?.status).toBe('done');
     expect(byId.c?.compensation?.attempts).toBe(1); // not re-incremented
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -266,30 +242,22 @@ describe('saga compensation matrix', () => {
   // ==========================================================================
 
   it('[5] recovery reclaims a STALE compensating run but NOT a FRESH (live) one', async () => {
-    const wfId = uniqueId('stale-vs-live');
     const compensated: string[] = [];
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('stale-vs-live', {
       steps: {
         a: { handler: async () => 'A', onCompensate: async () => void compensated.push('a') },
       },
-      autoExecute: false,
     });
 
     // --- STALE run: heartbeat 10 min ago ---
-    const staleId = uniqueId('stale-run');
-    await persistRun({
-      runId: staleId,
-      workflowId: wfId,
+    const staleId = await persistRun(wf, {
       status: 'compensating',
       lastHeartbeat: new Date(Date.now() - 10 * 60_000),
       steps: [{ stepId: 'a', status: 'done', output: 'A' }],
     });
 
     // --- LIVE run: heartbeat just now (a real rollback is heartbeating) ---
-    const liveId = uniqueId('live-run');
-    await persistRun({
-      runId: liveId,
-      workflowId: wfId,
+    const liveId = await persistRun(wf, {
       status: 'compensating',
       lastHeartbeat: new Date(), // fresh
       steps: [{ stepId: 'a', status: 'done', output: 'A' }],
@@ -298,7 +266,7 @@ describe('saga compensation matrix', () => {
     const threshold = 60_000;
 
     // getStaleCompensatingRuns selects ONLY the stale one.
-    const stale = await workflowRunRepository.getStaleCompensatingRuns(threshold, 100, {
+    const stale = await env.container.repository.getStaleCompensatingRuns(threshold, 100, {
       bypassTenant: true,
     });
     const staleIds = stale.map((r) => r._id);
@@ -317,7 +285,6 @@ describe('saga compensation matrix', () => {
     expect(liveResult).toBeNull();
     const liveAfter = await wf.get(liveId);
     expect(liveAfter?.status).toBe('compensating'); // untouched by recovery
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -325,10 +292,9 @@ describe('saga compensation matrix', () => {
   // ==========================================================================
 
   it('[6] two concurrent runCompensation on a fresh failed run → handlers run exactly once', async () => {
-    const wfId = uniqueId('race');
     let aCount = 0;
     let bCount = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('race', {
       steps: {
         a: { handler: async () => 'A', onCompensate: async () => void aCount++ },
         b: { handler: async () => 'B', onCompensate: async () => void bCount++ },
@@ -339,14 +305,10 @@ describe('saga compensation matrix', () => {
           retries: 1,
         },
       },
-      autoExecute: false,
     });
 
     // Freshly-`failed` run with two done compensable steps.
-    const runId = uniqueId('race-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+    const runId = await persistRun(wf, {
       status: 'failed',
       steps: [
         { stepId: 'a', status: 'done', output: 'A' },
@@ -375,7 +337,7 @@ describe('saga compensation matrix', () => {
     // valid non-terminal/terminal snapshot but never re-ran handlers.
     const statuses = [r1.status, r2.status];
     expect(statuses).toContain('compensated');
-    statuses.forEach((s) => expect(['compensating', 'compensated']).toContain(s));
+    for (const s of statuses) expect(['compensating', 'compensated']).toContain(s);
 
     // THE load-bearing guarantee: each compensation handler ran EXACTLY once
     // total across both racing workers (no double-compensation).
@@ -385,7 +347,6 @@ describe('saga compensation matrix', () => {
     // The run itself reached terminal `compensated`.
     const finalRun = await wf.get(runId);
     expect(finalRun?.status).toBe('compensated');
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -393,9 +354,8 @@ describe('saga compensation matrix', () => {
   // ==========================================================================
 
   it('[7] always-throwing onCompensate with compensateRetries → retries N times, status failed, run compensation_failed', async () => {
-    const wfId = uniqueId('comp-retry');
     let attempts = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('comp-retry', {
       steps: {
         a: {
           handler: async () => 'A',
@@ -414,14 +374,9 @@ describe('saga compensation matrix', () => {
           retries: 1,
         },
       },
-      container: createContainer(),
-      autoExecute: false,
     });
 
-    const runId = uniqueId('comp-retry-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+    const runId = await persistRun(wf, {
       status: 'failed',
       steps: [
         { stepId: 'a', status: 'done', output: 'A' },
@@ -438,7 +393,6 @@ describe('saga compensation matrix', () => {
     const stepA = persisted?.steps.find((s) => s.stepId === 'a');
     expect(stepA?.compensation?.status).toBe('failed');
     expect(stepA?.compensation?.error?.message).toContain('comp boom');
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -446,24 +400,19 @@ describe('saga compensation matrix', () => {
   // ==========================================================================
 
   it('[8] re-entrant compensation of an already-done step does not double-run the handler', async () => {
-    const wfId = uniqueId('cas');
     let runs = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('cas', {
       steps: {
         a: {
           handler: async () => 'A',
           onCompensate: async () => void runs++,
         },
       },
-      autoExecute: false,
     });
 
     // Run #1: a fresh failed run → drive compensation once. Handler runs once,
     // step a's compensation flips pending→done.
-    const runId = uniqueId('cas-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+    const runId = await persistRun(wf, {
       status: 'failed',
       steps: [{ stepId: 'a', status: 'done', output: 'A' }],
     });
@@ -475,16 +424,14 @@ describe('saga compensation matrix', () => {
     // recovery that re-drives) and invoke recovery again. The skip-if-done
     // guard + the numeric-index CAS (which would get modifiedCount:0 anyway)
     // mean the handler does NOT run a second time.
-    await WorkflowRunModel.updateOne(
-      { _id: runId },
-      { $set: { status: 'compensating', lastHeartbeat: new Date(Date.now() - 10 * 60_000) } },
-    );
-    wf.container.cache.delete(runId);
+    await env.runs.update(runId, {
+      status: 'compensating',
+      lastHeartbeat: new Date(Date.now() - 10 * 60_000),
+    });
 
     const second = await wf.engine.recoverCompensation(runId, 60_000);
     expect(second?.status).toBe('compensated');
     expect(runs).toBe(1); // handler side effect happened ONCE within the cluster
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -495,15 +442,13 @@ describe('saga compensation matrix', () => {
   // ==========================================================================
 
   it('[9] onCompensate that suspends (via indirection) → that step fails with "non-suspending" error, run does not hang', async () => {
-    const wfId = uniqueId('suspend');
-
     // Indirection: a helper that closes over ctx and calls a suspending
     // primitive. The static SUSPENDING_PRIMITIVE_RE in define.ts matches
     // `ctx.sleep(` literally; passing ctx into a helper hides it, so define
     // does NOT throw and the RUNTIME guard is what we end up testing.
     const suspendVia = (c: { sleep: (ms: number) => Promise<void> }) => c.sleep(1000);
 
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('suspend', {
       steps: {
         a: {
           handler: async () => 'A',
@@ -519,14 +464,9 @@ describe('saga compensation matrix', () => {
           retries: 1,
         },
       },
-      container: createContainer(),
-      autoExecute: false,
     });
 
-    const runId = uniqueId('suspend-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+    const runId = await persistRun(wf, {
       status: 'failed',
       steps: [
         { stepId: 'a', status: 'done', output: 'A' },
@@ -541,7 +481,6 @@ describe('saga compensation matrix', () => {
     const stepA = result.steps.find((s) => s.stepId === 'a');
     expect(stepA?.compensation?.status).toBe('failed');
     expect(stepA?.compensation?.error?.message).toContain('non-suspending');
-    wf.shutdown();
   });
 
   // ==========================================================================
@@ -550,10 +489,9 @@ describe('saga compensation matrix', () => {
   // ==========================================================================
 
   it('[10] ctx.idempotencyKey("compensate") is stable across compensation retries (external effective-once)', async () => {
-    const wfId = uniqueId('idem-key');
     const keys: string[] = [];
     let attempt = 0;
-    const wf = createWorkflow(wfId, {
+    const wf = env.workflow('idem-key', {
       steps: {
         charge: {
           handler: async () => ({ chargeId: 'ch_1' }),
@@ -576,13 +514,9 @@ describe('saga compensation matrix', () => {
           retries: 1,
         },
       },
-      autoExecute: false,
     });
 
-    const runId = uniqueId('idem-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+    const runId = await persistRun(wf, {
       status: 'failed',
       steps: [
         { stepId: 'charge', status: 'done', output: { chargeId: 'ch_1' } },
@@ -598,28 +532,21 @@ describe('saga compensation matrix', () => {
     // Attempt-invariant: same key every retry, equal to `${runId}:charge:compensate`.
     expect(new Set(keys).size).toBe(1);
     expect(keys[0]).toBe(`${runId}:charge:compensate`);
-    wf.shutdown();
   });
 
   // A sanity assertion that the recovery path is also reachable through the
   // scheduler's documented query (defense for scenario 4/5 wiring): a stale
   // compensating run is visible to getStaleCompensatingRuns.
-  it('[guard] getStaleCompensatingRuns matches a stale compensating run and waitUntil is available', async () => {
-    const wfId = uniqueId('guard');
-    const runId = uniqueId('guard-run');
-    await persistRun({
-      runId,
-      workflowId: wfId,
+  it('[guard] getStaleCompensatingRuns matches a stale compensating run', async () => {
+    const runId = await persistRun('guard', {
       status: 'compensating',
       lastHeartbeat: new Date(Date.now() - 10 * 60_000),
       steps: [{ stepId: 'a', status: 'done', output: 'A' }],
     });
-    const found = await waitUntil(async () => {
-      const rows = await workflowRunRepository.getStaleCompensatingRuns(60_000, 100, {
-        bypassTenant: true,
-      });
-      return rows.some((r) => r._id === runId);
-    }, 2000);
-    expect(found).toBe(true);
+    // The run is written before the query — visible on the first read, no polling.
+    const rows = await env.container.repository.getStaleCompensatingRuns(60_000, 100, {
+      bypassTenant: true,
+    });
+    expect(rows.map((r) => r._id)).toContain(runId);
   });
 });

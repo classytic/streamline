@@ -26,39 +26,27 @@
  * calls) and assert the parent resumes to completion with the child output.
  */
 
-import { afterEach, beforeAll, afterAll, describe, expect, it } from 'vitest';
-import { createContainer, createWorkflow, WorkflowRunModel } from '../../src/index.js';
-import { workflowRunRepository } from '../../src/storage/run.repository.js';
+import { describe, expect, it } from 'vitest';
 import type { StepState, WorkflowRun } from '../../src/core/types.js';
-import { cleanupTestDB, setupTestDB, teardownTestDB, waitUntil } from '../utils/setup.js';
+import type { WorkflowLike } from '../../src/testkit/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(setupTestDB);
-afterAll(teardownTestDB);
-afterEach(cleanupTestDB);
-
-let wfCounter = 0;
-const uniqueId = (prefix: string) => `${prefix}-${Date.now()}-${++wfCounter}`;
+const env = useStreamlineEnv();
 
 /**
  * Persist a parent run that is `waiting` on a childWorkflow step whose child
  * has ALREADY been started (childRunId set) — i.e. the post-crash shape the
  * old code could never recover. `nextReconcileAt` is in the past so the
- * reconcile sweep considers it due.
+ * reconcile sweep considers it due. Every step after `stepId` is seeded
+ * `pending` — mirroring exactly what `engine.start()` materialises.
  */
-async function persistOrphanedParent(opts: {
-  parentRunId: string;
-  parentWorkflowId: string;
-  /** All step ids in definition order. The childWorkflow-waiting step is
-   *  `stepId`; everything after it is seeded `pending` — mirroring exactly
-   *  what `engine.start()` materialises (all step states up front). */
-  allStepIds: string[];
-  stepId: string;
-  childWorkflowId: string;
-  childRunId: string;
-  childInput: unknown;
-}): Promise<void> {
+async function persistOrphanedParent(
+  parent: WorkflowLike,
+  opts: { stepId: string; childWorkflowId: string; childRunId: string; childInput: unknown },
+): Promise<WorkflowRun> {
   const now = new Date();
-  const steps: StepState[] = opts.allStepIds.map((id) => {
+  const parentRunId = `${parent.engine.definition.id}-run`; // the workflow id is unique per env
+  const steps: StepState[] = parent.engine.definition.steps.map(({ id }) => {
     if (id === opts.stepId) {
       return {
         stepId: id,
@@ -73,7 +61,7 @@ async function persistOrphanedParent(opts: {
           data: {
             childWorkflowId: opts.childWorkflowId,
             childInput: opts.childInput,
-            parentRunId: opts.parentRunId,
+            parentRunId,
             parentStepId: opts.stepId,
             childRunId: opts.childRunId,
           },
@@ -83,29 +71,21 @@ async function persistOrphanedParent(opts: {
     return { stepId: id, status: 'pending', attempts: 0 } as StepState;
   });
 
-  await WorkflowRunModel.create({
-    _id: opts.parentRunId,
-    workflowId: opts.parentWorkflowId,
+  return env.runs.insert(parent, {
+    _id: parentRunId,
     status: 'waiting',
     steps,
     currentStepId: opts.stepId,
-    context: {},
-    input: {},
-    createdAt: now,
-    updatedAt: now,
     startedAt: now,
-  } as unknown as WorkflowRun);
+  });
 }
 
 describe('childWorkflow crash-durable reconciliation', () => {
   it('resumes an orphaned parent (no listener) once the DONE child is reconciled', async () => {
-    const container = createContainer();
-    const childWfId = uniqueId('recon-child');
-    const parentWfId = uniqueId('recon-parent');
     const stepId = 'delegate';
 
     // Child workflow — produces an output we can assert flowed into the parent.
-    const child = createWorkflow<{ doubled: number }>(childWfId, {
+    const child = env.workflow<{ doubled: number }>('recon-child', {
       steps: {
         compute: async (ctx) => {
           const input = ctx.input as { value: number };
@@ -113,11 +93,12 @@ describe('childWorkflow crash-durable reconciliation', () => {
         },
       },
       context: () => ({ doubled: 0 }),
-      container,
+      autoExecute: true,
     });
+    const childWfId = child.engine.definition.id;
 
     // Parent workflow — second step consumes the child output.
-    const parent = createWorkflow<{ childResult?: unknown }>(parentWfId, {
+    const parent = env.workflow<{ childResult?: unknown }>('recon-parent', {
       steps: {
         [stepId]: async (ctx) => ctx.startChildWorkflow(childWfId, { value: 21 }),
         finish: async (ctx) => {
@@ -126,26 +107,16 @@ describe('childWorkflow crash-durable reconciliation', () => {
         },
       },
       context: () => ({}),
-      container,
-      autoExecute: false,
     });
 
     // Run the child to completion on its own engine — NO parent listener is
     // attached (we never let the parent auto-start it). This is the crash:
     // the child finished while the parent's in-process listeners were gone.
     const childRun = await child.start({ value: 21 });
-    const doneChild = await waitUntil(async () => {
-      const r = await child.get(childRun._id);
-      return r?.status === 'done';
-    }, 10_000);
-    expect(doneChild).toBe(true);
+    await env.until(childRun._id, 'done', { timeout: 10_000 });
 
     // Manually persist the orphaned parent (the post-crash DB shape).
-    const parentRunId = uniqueId('parent-run');
-    await persistOrphanedParent({
-      parentRunId,
-      parentWorkflowId: parentWfId,
-      allStepIds: [stepId, 'finish'],
+    const { _id: parentRunId } = await persistOrphanedParent(parent, {
       stepId,
       childWorkflowId: childWfId,
       childRunId: childRun._id,
@@ -154,7 +125,7 @@ describe('childWorkflow crash-durable reconciliation', () => {
 
     // Sanity: the orphaned parent is exactly what CommonQueries.childWaiting
     // selects, and NOTHING else (timer/retry sweeps) would have reclaimed it.
-    const due = await workflowRunRepository.getChildWaitingRuns(new Date(), 100, {
+    const due = await env.container.repository.getChildWaitingRuns(new Date(), 100, {
       bypassTenant: true,
     });
     expect(due.map((r) => r._id)).toContain(parentRunId);
@@ -167,30 +138,25 @@ describe('childWorkflow crash-durable reconciliation', () => {
     expect(final?.status).toBe('done');
     // The child output must have flowed into the parent's second step.
     expect(final?.context.childResult).toEqual({ result: 42 });
-
-    parent.shutdown();
-    child.shutdown();
   });
 
   it('reconciles a FAILED child into the parent as __childFailed', async () => {
-    const container = createContainer();
-    const childWfId = uniqueId('recon-failchild');
-    const parentWfId = uniqueId('recon-failparent');
     const stepId = 'delegate';
 
-    const child = createWorkflow(childWfId, {
+    const child = env.workflow('recon-failchild', {
       steps: {
         boom: async () => {
           throw new Error('child blew up');
         },
       },
       defaults: { retries: 0 },
-      container,
+      autoExecute: true,
     });
+    const childWfId = child.engine.definition.id;
 
     // Parent's next step inspects the child result; a __childFailed marker
     // makes the parent itself fail (mirrors the in-process fail handler).
-    const parent = createWorkflow(parentWfId, {
+    const parent = env.workflow('recon-failparent', {
       steps: {
         [stepId]: async (ctx) => ctx.startChildWorkflow(childWfId, {}),
         finish: async (ctx) => {
@@ -200,22 +166,12 @@ describe('childWorkflow crash-durable reconciliation', () => {
         },
       },
       defaults: { retries: 0 },
-      container,
-      autoExecute: false,
     });
 
     const childRun = await child.start({});
-    const failed = await waitUntil(async () => {
-      const r = await child.get(childRun._id);
-      return r?.status === 'failed';
-    }, 10_000);
-    expect(failed).toBe(true);
+    await env.until(childRun._id, 'failed', { timeout: 10_000 });
 
-    const parentRunId = uniqueId('failparent-run');
-    await persistOrphanedParent({
-      parentRunId,
-      parentWorkflowId: parentWfId,
-      allStepIds: [stepId, 'finish'],
+    const { _id: parentRunId } = await persistOrphanedParent(parent, {
       stepId,
       childWorkflowId: childWfId,
       childRunId: childRun._id,
@@ -228,36 +184,27 @@ describe('childWorkflow crash-durable reconciliation', () => {
     // The reconciliation delivered { __childFailed: true } as the step output,
     // so the parent's finish step threw → run failed.
     expect(final?.status).toBe('failed');
-
-    parent.shutdown();
-    child.shutdown();
   });
 
   it('leaves the parent WAITING and bumps nextReconcileAt when the child is still active', async () => {
-    const container = createContainer();
-    const childWfId = uniqueId('recon-slowchild');
-    const parentWfId = uniqueId('recon-slowparent');
     const stepId = 'delegate';
 
     // Child that stays running long enough to be observed mid-flight.
-    const child = createWorkflow(childWfId, {
+    const child = env.workflow('recon-slowchild', {
       steps: {
         slow: async () => {
           await new Promise((r) => setTimeout(r, 3_000));
           return 'late';
         },
       },
-      container,
-      autoExecute: false,
     });
+    const childWfId = child.engine.definition.id;
 
-    const parent = createWorkflow(parentWfId, {
+    const parent = env.workflow('recon-slowparent', {
       steps: {
         [stepId]: async (ctx) => ctx.startChildWorkflow(childWfId, {}),
         finish: async () => 'ok',
       },
-      container,
-      autoExecute: false,
     });
 
     // Start the child but DON'T await completion — it's still running.
@@ -265,18 +212,14 @@ describe('childWorkflow crash-durable reconciliation', () => {
     // Kick execution without awaiting (autoExecute:false means start doesn't run it).
     const childExec = child.execute(childRun._id);
 
-    const parentRunId = uniqueId('slowparent-run');
-    await persistOrphanedParent({
-      parentRunId,
-      parentWorkflowId: parentWfId,
-      allStepIds: [stepId, 'finish'],
+    const { _id: parentRunId } = await persistOrphanedParent(parent, {
       stepId,
       childWorkflowId: childWfId,
       childRunId: childRun._id,
       childInput: {},
     });
 
-    const before = await WorkflowRunModel.findById(parentRunId).lean();
+    const before = await env.runs.get(parentRunId);
     const beforeReconcileAt = (before?.steps?.[0]?.waitingFor as { nextReconcileAt?: Date })
       ?.nextReconcileAt;
 
@@ -287,7 +230,7 @@ describe('childWorkflow crash-durable reconciliation', () => {
     expect(after?.status).toBe('waiting');
 
     // nextReconcileAt must have been pushed into the future (cadence bump).
-    const dbAfter = await WorkflowRunModel.findById(parentRunId).lean();
+    const dbAfter = await env.runs.get(parentRunId);
     const afterReconcileAt = (dbAfter?.steps?.[0]?.waitingFor as { nextReconcileAt?: Date })
       ?.nextReconcileAt;
     expect(afterReconcileAt).toBeDefined();
@@ -297,8 +240,6 @@ describe('childWorkflow crash-durable reconciliation', () => {
 
     // Let the child finish so we don't leak a dangling promise.
     await childExec;
-    parent.shutdown();
-    child.shutdown();
   });
 
   it('double-resume safety: in-memory listener + reconciliation poll → exactly one resume', async () => {
@@ -306,23 +247,20 @@ describe('childWorkflow crash-durable reconciliation', () => {
     // in-process listener), THEN also fire the reconciliation poll. The
     // waiting→running claim must make exactly one of them win — the parent
     // completes once, with the correct child output, and never double-runs.
-    const container = createContainer();
-    const childWfId = uniqueId('dr-child');
-    const parentWfId = uniqueId('dr-parent');
-
     let finishRuns = 0;
 
-    const child = createWorkflow(childWfId, {
+    const child = env.workflow('dr-child', {
       steps: {
         work: async () => {
           await new Promise((r) => setTimeout(r, 150));
           return { v: 7 };
         },
       },
-      container,
+      autoExecute: true,
     });
+    const childWfId = child.engine.definition.id;
 
-    const parent = createWorkflow<{ got?: unknown }>(parentWfId, {
+    const parent = env.workflow<{ got?: unknown }>('dr-parent', {
       steps: {
         delegate: async (ctx) => ctx.startChildWorkflow(childWfId, {}),
         finish: async (ctx) => {
@@ -332,8 +270,6 @@ describe('childWorkflow crash-durable reconciliation', () => {
         },
       },
       context: () => ({}),
-      container,
-      autoExecute: false,
     });
 
     const parentRun = await parent.start({});
@@ -346,19 +282,10 @@ describe('childWorkflow crash-durable reconciliation', () => {
       /* lost the race — expected and fine */
     });
 
-    const completed = await waitUntil(async () => {
-      const r = await parent.get(parentRun._id);
-      return r?.status === 'done';
-    }, 10_000);
-    expect(completed).toBe(true);
-
-    const final = await parent.get(parentRun._id);
-    expect(final?.status).toBe('done');
-    expect(final?.context.got).toEqual({ v: 7 });
+    const final = await env.until(parentRun._id, 'done', { timeout: 10_000 });
+    expect(final.status).toBe('done');
+    expect((final.context as { got?: unknown }).got).toEqual({ v: 7 });
     // The finish step ran EXACTLY once despite two resume drivers.
     expect(finishRuns).toBe(1);
-
-    parent.shutdown();
-    child.shutdown();
   });
 });

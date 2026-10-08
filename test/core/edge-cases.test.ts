@@ -10,23 +10,13 @@
  * - Graceful degradation patterns
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { createWorkflow } from '../../src/index.js';
-import { setupTestDB, cleanupTestDB, teardownTestDB, waitFor, waitUntil } from '../utils/setup.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 describe('Edge Cases and Real-World Scenarios', () => {
-  beforeAll(async () => {
-    await setupTestDB();
-  });
-
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
-  afterAll(async () => {
-    await teardownTestDB();
-  });
-
   describe('API Response Validation with Smart Retries', () => {
     it('should retry on specific API error codes (transient failures)', async () => {
       let attempt = 0;
@@ -35,10 +25,10 @@ describe('Edge Cases and Real-World Scenarios', () => {
       interface APIContext {
         orderId: string;
         statusCode?: number;
-        response?: any;
+        response?: { paymentId: string; status: string };
       }
 
-      const workflow = createWorkflow<APIContext>('api-validation', {
+      const workflow = env.workflow<APIContext, { orderId: string }>('api-validation', {
         steps: {
           'call-payment-api': async (ctx) => {
             const statusCode = errorSequence[attempt++];
@@ -47,17 +37,17 @@ describe('Edge Cases and Real-World Scenarios', () => {
 
             // Simulate transient failures
             if (statusCode === 503) {
-              const error: any = new Error('Service Unavailable');
-              error.code = 'SERVICE_UNAVAILABLE';
-              error.retriable = true;
-              throw error;
+              throw Object.assign(new Error('Service Unavailable'), {
+                code: 'SERVICE_UNAVAILABLE',
+                retriable: true,
+              });
             }
 
             if (statusCode === 429) {
-              const error: any = new Error('Rate Limit Exceeded');
-              error.code = 'RATE_LIMIT';
-              error.retriable = true;
-              throw error;
+              throw Object.assign(new Error('Rate Limit Exceeded'), {
+                code: 'RATE_LIMIT',
+                retriable: true,
+              });
             }
 
             // Success
@@ -75,9 +65,8 @@ describe('Edge Cases and Real-World Scenarios', () => {
             return { validated: true };
           },
         },
-        context: (input: { orderId: string }) => ({ orderId: input.orderId }),
+        context: (input) => ({ orderId: input.orderId }),
         defaults: { retries: 3, timeout: 5000 },
-        autoExecute: false,
       });
 
       // Configure fast scheduler for retries
@@ -92,8 +81,8 @@ describe('Edge Cases and Real-World Scenarios', () => {
       const run = await workflow.start({ orderId: 'ORD-789' });
       await workflow.execute(run._id); // First attempt fails
 
-      // Wait for scheduler to handle retries (exponential backoff: 1s + 2s)
-      await waitFor(4000);
+      // Retries (exponential backoff: 1s + 2s) run until the workflow finishes
+      await env.until(run._id, 'done', { timeout: 8000 });
 
       const result = await workflow.get(run._id);
 
@@ -101,19 +90,17 @@ describe('Edge Cases and Real-World Scenarios', () => {
       expect(result?.context.statusCode).toBe(200);
       expect(result?.context.response?.paymentId).toBe('PAY-123');
       expect(attempt).toBe(3); // Attempted 3 times
-
-      workflow.shutdown();
     }, 10000);
 
     it('should fail immediately on non-retriable errors (permanent failures)', async () => {
-      const workflow = createWorkflow('permanent-failure', {
+      const workflow = env.workflow('permanent-failure', {
         steps: {
           'check-balance': async () => {
-            // Permanent error (insufficient funds)
-            const error: any = new Error('Insufficient Funds');
-            error.code = 'INSUFFICIENT_FUNDS';
-            error.retriable = false; // Don't retry
-            throw error;
+            // Permanent error (insufficient funds) — don't retry
+            throw Object.assign(new Error('Insufficient Funds'), {
+              code: 'INSUFFICIENT_FUNDS',
+              retriable: false,
+            });
           },
         },
         context: () => ({}),
@@ -122,7 +109,7 @@ describe('Edge Cases and Real-World Scenarios', () => {
 
       const run = await workflow.start({});
 
-      // Note: Using manual execute for deterministic test (autoExecute has timing issues in tests)
+      // Manual execute for a deterministic test (env workflows never auto-execute)
       await workflow.execute(run._id);
 
       const result = await workflow.get(run._id);
@@ -130,8 +117,6 @@ describe('Edge Cases and Real-World Scenarios', () => {
       expect(result?.status).toBe('failed');
       expect(result?.steps[0]?.attempts).toBe(1); // Only 1 attempt (no retries)
       expect(result?.steps[0]?.error?.code).toBe('INSUFFICIENT_FUNDS');
-
-      workflow.shutdown();
     });
   });
 
@@ -146,59 +131,61 @@ describe('Edge Cases and Real-World Scenarios', () => {
         reviewedBy?: string;
       }
 
-      const workflow = createWorkflow<RiskContext>('risk-assessment', {
-        steps: {
-          'calculate-risk': async (ctx) => {
-            // Simulate ML-based risk calculation
-            const riskScore = ctx.context.amount > 10000 ? 75 : 25;
-            await ctx.set('riskScore', riskScore);
-            await ctx.set('requiresReview', riskScore > 50);
-            return { riskScore };
-          },
+      const workflow = env.workflow<RiskContext, { transactionId: string; amount: number }>(
+        'risk-assessment',
+        {
+          steps: {
+            'calculate-risk': async (ctx) => {
+              // Simulate ML-based risk calculation
+              const riskScore = ctx.context.amount > 10000 ? 75 : 25;
+              await ctx.set('riskScore', riskScore);
+              await ctx.set('requiresReview', riskScore > 50);
+              return { riskScore };
+            },
 
-          'auto-decision': async (ctx) => {
-            // Low risk = auto approve
-            if (!ctx.context.requiresReview) {
-              await ctx.set('autoApproved', true);
-              return { approved: true, auto: true };
-            }
-            // High risk = set autoApproved to false explicitly
-            await ctx.set('autoApproved', false);
-            return { approved: false, needsReview: true };
-          },
+            'auto-decision': async (ctx) => {
+              // Low risk = auto approve
+              if (!ctx.context.requiresReview) {
+                await ctx.set('autoApproved', true);
+                return { approved: true, auto: true };
+              }
+              // High risk = set autoApproved to false explicitly
+              await ctx.set('autoApproved', false);
+              return { approved: false, needsReview: true };
+            },
 
-          'manual-review': async (ctx) => {
-            // Skip if auto-approved
-            if (ctx.context.autoApproved) {
-              return { skipped: true };
-            }
+            'manual-review': async (ctx) => {
+              // Skip if auto-approved
+              if (ctx.context.autoApproved) {
+                return { skipped: true };
+              }
 
-            // Wait for human review
-            await ctx.wait('High-risk transaction requires review', {
-              transactionId: ctx.context.transactionId,
-              amount: ctx.context.amount,
-              riskScore: ctx.context.riskScore,
-            });
-          },
+              // Wait for human review
+              await ctx.wait('High-risk transaction requires review', {
+                transactionId: ctx.context.transactionId,
+                amount: ctx.context.amount,
+                riskScore: ctx.context.riskScore,
+              });
+            },
 
-          finalize: async (ctx) => {
-            // Get review result from previous step's output (resume payload)
-            const reviewResult = ctx.getOutput<{ reviewedBy?: string }>('manual-review');
-            if (reviewResult?.reviewedBy) {
-              await ctx.set('reviewedBy', reviewResult.reviewedBy);
-            }
-            return {
-              final: true,
-              approved: ctx.context.autoApproved || ctx.context.requiresReview,
-            };
+            finalize: async (ctx) => {
+              // Get review result from previous step's output (resume payload)
+              const reviewResult = ctx.getOutput<{ reviewedBy?: string }>('manual-review');
+              if (reviewResult?.reviewedBy) {
+                await ctx.set('reviewedBy', reviewResult.reviewedBy);
+              }
+              return {
+                final: true,
+                approved: ctx.context.autoApproved || ctx.context.requiresReview,
+              };
+            },
           },
+          context: (input) => ({
+            transactionId: input.transactionId,
+            amount: input.amount,
+          }),
         },
-        context: (input: { transactionId: string; amount: number }) => ({
-          transactionId: input.transactionId,
-          amount: input.amount,
-        }),
-        autoExecute: false,
-      });
+      );
 
       // Test 1: Low risk - auto approve
       const lowRisk = await workflow.start({ transactionId: 'TXN-001', amount: 5000 });
@@ -222,24 +209,21 @@ describe('Edge Cases and Real-World Scenarios', () => {
 
       expect(result.status).toBe('done');
       expect(result.context.reviewedBy).toBe('risk-manager@bank.com');
-
-      workflow.shutdown();
     });
   });
 
   describe('Timeout Handling for External Services', () => {
     it('should timeout slow external API calls', async () => {
-      const workflow = createWorkflow('timeout-test', {
+      const workflow = env.workflow('timeout-test', {
         steps: {
           'slow-api': async () => {
             // Simulate slow API (takes 3 seconds)
-            await waitFor(3000);
+            await delay(3000);
             return { slow: true };
           },
         },
         context: () => ({}),
         defaults: { timeout: 1000, retries: 0 },
-        autoExecute: false,
       });
 
       const run = await workflow.start({});
@@ -247,21 +231,18 @@ describe('Edge Cases and Real-World Scenarios', () => {
 
       expect(result.status).toBe('failed');
       expect(result.steps[0]?.error?.message).toContain('timeout');
-
-      workflow.shutdown();
     });
 
     it('should succeed if API responds within timeout', async () => {
-      const workflow = createWorkflow('fast-api-test', {
+      const workflow = env.workflow('fast-api-test', {
         steps: {
           'fast-api': async () => {
-            await waitFor(500); // Responds in 500ms
+            await delay(500); // Responds in 500ms
             return { fast: true };
           },
         },
         context: () => ({}),
         defaults: { timeout: 2000 },
-        autoExecute: false,
       });
 
       const run = await workflow.start({});
@@ -269,8 +250,6 @@ describe('Edge Cases and Real-World Scenarios', () => {
 
       expect(result.status).toBe('done');
       expect(result.steps[0]?.status).toBe('done');
-
-      workflow.shutdown();
     });
   });
 
@@ -283,7 +262,7 @@ describe('Edge Cases and Real-World Scenarios', () => {
         paymentStatus?: string;
       }
 
-      const workflow = createWorkflow<WebhookContext>('webhook-integration', {
+      const workflow = env.workflow<WebhookContext, { orderId: string }>('webhook-integration', {
         steps: {
           'initiate-payment': async (ctx) => {
             const gatewayId = `GATEWAY_${Date.now()}`;
@@ -303,7 +282,10 @@ describe('Edge Cases and Real-World Scenarios', () => {
 
           'process-result': async (ctx) => {
             // Get webhook result from previous step's output (resume payload)
-            const webhookResult = ctx.getOutput<{ webhookReceived?: boolean; paymentStatus?: string }>('wait-webhook');
+            const webhookResult = ctx.getOutput<{
+              webhookReceived?: boolean;
+              paymentStatus?: string;
+            }>('wait-webhook');
             if (webhookResult?.webhookReceived) {
               await ctx.set('webhookReceived', webhookResult.webhookReceived);
             }
@@ -315,8 +297,7 @@ describe('Edge Cases and Real-World Scenarios', () => {
             return { processed: true };
           },
         },
-        context: (input: { orderId: string }) => ({ orderId: input.orderId }),
-        autoExecute: false,
+        context: (input) => ({ orderId: input.orderId }),
       });
 
       const run = await workflow.start({ orderId: 'ORD-456' });
@@ -336,8 +317,6 @@ describe('Edge Cases and Real-World Scenarios', () => {
       expect(result.status).toBe('done');
       expect(result.context.webhookReceived).toBe(true);
       expect(result.context.paymentStatus).toBe('success');
-
-      workflow.shutdown();
     });
   });
 
@@ -348,16 +327,16 @@ describe('Edge Cases and Real-World Scenarios', () => {
         value: number;
       }
 
-      const workflow = createWorkflow<CounterContext>('concurrent-consistency', {
+      const workflow = env.workflow<CounterContext, { id: number }>('concurrent-consistency', {
         steps: {
           increment: async (ctx) => {
-            await waitFor(10); // Simulate async operation
+            await delay(10); // Simulate async operation
             await ctx.set('value', ctx.context.value + 1);
             return { incremented: true };
           },
 
           double: async (ctx) => {
-            await waitFor(10);
+            await delay(10);
             await ctx.set('value', ctx.context.value * 2);
             return { doubled: true };
           },
@@ -368,13 +347,12 @@ describe('Edge Cases and Real-World Scenarios', () => {
             return { verified: true };
           },
         },
-        context: (input: { id: number }) => ({ id: input.id, value: 0 }),
-        autoExecute: false,
+        context: (input) => ({ id: input.id, value: 0 }),
       });
 
       // Start and execute 50 workflows concurrently
       const runs = await Promise.all(
-        Array.from({ length: 50 }, (_, i) => workflow.start({ id: i + 1 }))
+        Array.from({ length: 50 }, (_, i) => workflow.start({ id: i + 1 })),
       );
 
       // Execute all workflows concurrently
@@ -386,8 +364,6 @@ describe('Edge Cases and Real-World Scenarios', () => {
         expect(result?.status).toBe('done');
         expect(result?.context.value).toBe(2);
       }
-
-      workflow.shutdown();
     });
   });
 
@@ -395,13 +371,13 @@ describe('Edge Cases and Real-World Scenarios', () => {
     it('should fallback to cached data if external service fails', async () => {
       interface FallbackContext {
         userId: string;
-        userData?: any;
+        userData?: { id: string; name: string; fromCache: boolean };
         usedCache?: boolean;
       }
 
       let attempts = 0;
 
-      const workflow = createWorkflow<FallbackContext>('fallback-pattern', {
+      const workflow = env.workflow<FallbackContext, { userId: string }>('fallback-pattern', {
         steps: {
           'fetch-user': async (ctx) => {
             attempts++;
@@ -428,9 +404,8 @@ describe('Edge Cases and Real-World Scenarios', () => {
             return { processed: true };
           },
         },
-        context: (input: { userId: string }) => ({ userId: input.userId }),
+        context: (input) => ({ userId: input.userId }),
         defaults: { retries: 3 },
-        autoExecute: false,
       });
 
       // Configure fast scheduler for retries
@@ -445,8 +420,8 @@ describe('Edge Cases and Real-World Scenarios', () => {
       const run = await workflow.start({ userId: 'user-123' });
       await workflow.execute(run._id); // First attempt fails
 
-      // Wait for scheduler to handle retries (exponential backoff: 1s + 2s)
-      await waitFor(4000);
+      // Retries (exponential backoff: 1s + 2s) run until the workflow finishes
+      await env.until(run._id, 'done', { timeout: 8000 });
 
       const result = await workflow.get(run._id);
 
@@ -454,8 +429,6 @@ describe('Edge Cases and Real-World Scenarios', () => {
       expect(result?.context.usedCache).toBe(true);
       expect(result?.context.userData?.fromCache).toBe(true);
       expect(attempts).toBeGreaterThanOrEqual(3);
-
-      workflow.shutdown();
     }, 10000);
   });
 
@@ -472,7 +445,10 @@ describe('Edge Cases and Real-World Scenarios', () => {
         status?: 'pending' | 'authenticating' | 'processing' | 'completed' | 'failed';
       }
 
-      const workflow = createWorkflow<PaymentContext>('3ds-payment-flow', {
+      const workflow = env.workflow<
+        PaymentContext,
+        { orderId: string; amount: number; currency: string }
+      >('3ds-payment-flow', {
         steps: {
           initiate: async (ctx) => {
             const paymentId = `PAY_${Date.now()}`;
@@ -487,7 +463,10 @@ describe('Edge Cases and Real-World Scenarios', () => {
             await ctx.set('requires3DS', requires3DS);
 
             if (requires3DS) {
-              await ctx.set('authenticationUrl', `https://3ds.example.com/auth/${ctx.context.paymentId}`);
+              await ctx.set(
+                'authenticationUrl',
+                `https://3ds.example.com/auth/${ctx.context.paymentId}`,
+              );
               await ctx.set('status', 'authenticating' as const);
             }
 
@@ -520,7 +499,7 @@ describe('Edge Cases and Real-World Scenarios', () => {
             await ctx.set('status', 'processing' as const);
 
             // Simulate payment processing
-            await waitFor(100);
+            await delay(100);
 
             await ctx.set('status', 'completed' as const);
             return { processed: true };
@@ -531,14 +510,13 @@ describe('Edge Cases and Real-World Scenarios', () => {
             return { confirmed: true };
           },
         },
-        context: (input: { orderId: string; amount: number; currency: string }) => ({
+        context: (input) => ({
           orderId: input.orderId,
           amount: input.amount,
           currency: input.currency,
           status: 'pending' as const,
         }),
         defaults: { timeout: 10000 },
-        autoExecute: false,
       });
 
       // Test high-value payment requiring 3DS
@@ -565,8 +543,6 @@ describe('Edge Cases and Real-World Scenarios', () => {
       expect(result.status).toBe('done');
       expect(result.context.authenticated).toBe(true);
       expect(result.context.status).toBe('completed');
-
-      workflow.shutdown();
     });
   });
 });

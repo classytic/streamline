@@ -1,4 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { assertAndClaim } from '@classytic/primitives/state-machine';
+import semver from 'semver';
 import type { StreamlineContainer } from '../core/container.js';
 import { globalEventBus } from '../core/events.js';
 import { isTerminalState, RUN_MACHINE } from '../core/status.js';
@@ -14,6 +16,7 @@ import type {
 } from '../core/types.js';
 import { makeWaitTimeout } from '../features/wait-resolution.js';
 import { computeNextOccurrence } from '../scheduling/recurrence.js';
+import { staleHeartbeatOr } from '../storage/query-builder.js';
 import { runSet } from '../storage/update-builders.js';
 import {
   InvalidStateError,
@@ -107,6 +110,7 @@ export interface WorkflowEngineOptions {
           retries?: number;
           retryDelay?: number;
           retryBackoff?: 'exponential' | 'linear' | 'fixed' | number;
+          timeout?: number;
         }
       >
     | undefined;
@@ -117,9 +121,7 @@ export interface WorkflowEngineOptions {
    * payload that is merged into the existing document; the engine then
    * continues executing under its own version.
    *
-   * Return `null` / `undefined` to fall through (the engine will fail
-   * the run with `VERSION_MISMATCH` if the step graph diverged — same
-   * pre-v2.3.3 behaviour).
+   * Return `null` / `undefined` to fall through to `versionPolicy`.
    *
    * Common patterns:
    *   - Map a removed step's `currentStepId` onto the new step graph.
@@ -147,6 +149,20 @@ export interface WorkflowEngineOptions {
     | null
     | undefined
     | Promise<Partial<WorkflowRun<unknown>> | null | undefined>;
+  /**
+   * What happens to a run pinned to a version that is neither registered nor
+   * migrated by `migrateRun`:
+   *   - `'compatible'` (default) — same semver MAJOR runs on this engine
+   *     (semver's own compatibility contract); a different major is PARKED.
+   *   - `'strict'` — any version difference is parked.
+   *   - `'any'` — always run on this engine's code (the old silent fallback).
+   *
+   * Parked = `paused` with `pauseReason: 'version-unavailable: …'`, a
+   * `workflow:paused` event and an `engine:error` (`version-unavailable`).
+   * Nothing executes under code the run was not written for; register the old
+   * definition or add `migrateRun`, then `resume(runId)`.
+   */
+  versionPolicy?: 'compatible' | 'strict' | 'any' | undefined;
   // NOTE (exactOptionalPropertyTypes): optional props above carry
   // `| undefined` because `createWorkflow` builds this options bag from
   // possibly-absent config fields.
@@ -207,6 +223,14 @@ export interface ControlOptions {
   bypassTenant?: boolean | undefined;
 }
 
+/** Terminal statuses that always free a strict-concurrency slot. */
+const RELEASABLE_FINAL = ['done', 'cancelled', 'compensated', 'compensation_failed'] as const;
+/** Plus `failed`, when the run will not compensate. */
+const RELEASABLE_INCLUDING_FAILED = [...RELEASABLE_FINAL, 'failed'] as const;
+
+/** Max PENDING entries in a run's durable signal inbox; a full inbox refuses. */
+const SIGNAL_INBOX_CAP = 100;
+
 /** Read a (possibly nested, dot-pathed) tenant field off a run doc. */
 function readTenantPath(obj: unknown, path: string): unknown {
   return path
@@ -238,14 +262,6 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     { listener: (...args: unknown[]) => void; eventName: string }
   >();
 
-  /**
-   * Run ids whose strict-concurrency slot has already been released. Guarantees
-   * a run's slot is decremented AT MOST ONCE across the multiple terminal-ish
-   * events it can emit (e.g. `failed` → `compensated`, or a re-emit after
-   * crash recovery). See the `releaseSlotOnTerminal` listener.
-   */
-  private readonly releasedSlots = new Set<string>();
-
   /** Teardown for the 5 `releaseSlotOnTerminal` bus listeners; invoked by `shutdown()`. */
   private removeSlotReleaseListeners?: () => void;
 
@@ -272,6 +288,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         | ReadonlyArray<import('../core/types.js').StepMiddleware<TContext>>
         | undefined,
       options.taskMiddleware,
+      options.compensationHandlers !== undefined,
     );
 
     const schedulerConfig = {
@@ -295,35 +312,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Register in global workflow registry for child workflow lookup
     workflowRegistry.register(definition.id, this as unknown as WorkflowEngine<unknown>);
 
-    // Set stale recovery callback for crashed workflows
-    this.scheduler.setStaleRecoveryCallback(async (runId, thresholdMs) => {
-      return this.recoverStale(runId, thresholdMs);
-    });
-
-    // Set retry callback for exponential backoff retries
-    this.scheduler.setRetryCallback(async (runId) => {
-      return this.executeRetry(runId);
-    });
-
-    // Set compensation recovery callback for crashed saga rollbacks (v2.4)
-    this.scheduler.setCompensationRecoveryCallback(async (runId, thresholdMs) => {
-      return this.recoverCompensation(runId, thresholdMs);
-    });
-
-    // Resume human/webhook waits that hit their `expiresAt` deadline WITH a
-    // timeout sentinel, so the next step branches on the timeout. The
-    // `waiting → running` claim inside `resume` makes this race-safe against a
-    // concurrent `resumeHook`; if the run already moved on (external resume
-    // won, or it completed), `resume` throws InvalidStateError — swallow it as
-    // a no-op rather than surfacing a scheduler error.
-    this.scheduler.setExpiryCallback(async (runId) => {
-      try {
-        await this.resume(runId, makeWaitTimeout());
-      } catch (err) {
-        if (err instanceof InvalidStateError) return;
-        throw err;
-      }
-    });
+    this.wireScheduler();
 
     // Smart start: Only start polling if workflows exist
     this.scheduler.startIfNeeded().catch((err) => {
@@ -360,43 +349,35 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
           const run = await this.container.repository.getById(payload.runId);
           if (!run) return;
 
-          // (H3) Multi-engine guard: on a SHARED container / global bus, every
-          // engine's listener receives every terminal event. Without this guard
-          // two engines would both decrement the counter for ONE terminal event
-          // (double-release). Only the engine that OWNS the workflow releases.
+          // (H3) Multi-engine guard: on a SHARED container / global bus, only
+          // engines of the owning workflow attempt the release. Two VERSIONS of
+          // one workflow both pass this guard — the durable claim below is what
+          // makes the release exactly-once.
           if (run.workflowId !== this.definition.id) return;
 
-          // Saga slot timing: a saga run emits `workflow:failed` and then enters
-          // `compensating` (which STILL holds its slot — see SLOT_HOLDING_STATUSES).
-          // Releasing on `failed` would free the slot mid-rollback and
-          // oversubscribe a strict cap. So:
-          //   - `failed` releases ONLY when the run will NOT compensate
-          //     (no compensation handlers configured). With handlers, the slot
-          //     is released later on `compensated`/`compensation_failed`.
-          //   - `compensating` never releases (slot held through rollback).
-          //   - all other terminal states (done/cancelled/compensated/
-          //     compensation_failed) release.
-          if (run.status === 'compensating') return;
-          if (run.status === 'failed' && this.options.compensationHandlers) return;
+          // Saga slot timing: `compensating` still holds the slot (see
+          // SLOT_HOLDING_STATUSES), so `failed` releases only when the run will
+          // NOT compensate; with handlers the slot frees on
+          // `compensated`/`compensation_failed`. Whether `failed` is final is
+          // the PINNED version's call (its handlers decide), so another
+          // version's listener releases only unambiguous terminals. The status
+          // set is enforced inside the claim, against the stored status.
+          const ownsVersion =
+            !run.definitionVersion || run.definitionVersion === this.definition.version;
+          const releasable =
+            ownsVersion && !this.options.compensationHandlers
+              ? RELEASABLE_INCLUDING_FAILED
+              : RELEASABLE_FINAL;
 
-          const counterId = (run.meta as Record<string, unknown> | undefined)
-            ?.concurrencyCounterId as string | undefined;
+          // At most once per run, across processes and engine versions: a CAS
+          // on the run document (`meta.concurrencySlotReleasedAt`), not process
+          // memory. Repeated terminal events (failed→compensated, re-emits after
+          // recovery, v1+v2 listeners) all lose after the first winner.
+          const counterId = await this.container.repository.claimSlotRelease(
+            payload.runId,
+            releasable,
+          );
           if (!counterId) return;
-
-          // Idempotent per run: a run's slot is released AT MOST ONCE, even
-          // though several terminal-ish events can fire for it (failed→compensated,
-          // or a re-emit after crash-recovery). releaseSlot itself is guarded
-          // (count > 0), but this Set stops a legitimate later run reusing the
-          // same counterId bucket from being decremented by THIS run's stale event.
-          if (this.releasedSlots.has(payload.runId)) return;
-          this.releasedSlots.add(payload.runId);
-          // Bound memory on a long-lived engine: a run's terminal events all fire
-          // within a short window, so evicting the oldest entries once the Set is
-          // large (10k runs) cannot cause a re-release of a still-relevant run.
-          if (this.releasedSlots.size > 10_000) {
-            const oldest = this.releasedSlots.values().next().value as string | undefined;
-            if (oldest !== undefined) this.releasedSlots.delete(oldest);
-          }
 
           await this.container.concurrencyCounterRepository.releaseSlot(counterId);
         } catch (err) {
@@ -429,6 +410,34 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     }
 
     this.options = { autoExecute: true, ...options };
+  }
+
+  /** Hand the scheduler every engine callback. One place, so a rebuilt scheduler can't miss one. */
+  private wireScheduler(): void {
+    // Crashed workflows (stale heartbeat).
+    this.scheduler.setStaleRecoveryCallback((runId, thresholdMs) =>
+      this.recoverStale(runId, thresholdMs),
+    );
+    // Exponential-backoff retries, scheduled drafts, concurrency promotion.
+    this.scheduler.setRetryCallback((runId) => this.executeRetry(runId));
+    // Stuck sagas: crashed rollbacks and failures that never entered the saga.
+    this.scheduler.setCompensationRecoveryCallback((runId, thresholdMs) =>
+      this.recoverCompensation(runId, thresholdMs),
+    );
+    // Human/webhook waits past `expiresAt` resume WITH a timeout sentinel, so
+    // the next step branches on it. The waiting→running claim inside `resume`
+    // makes this race-safe against a concurrent `resumeHook`; a run that moved
+    // on throws InvalidStateError — a no-op, not a scheduler error.
+    this.scheduler.setExpiryCallback(async (runId) => {
+      try {
+        await this.resume(runId, makeWaitTimeout());
+      } catch (err) {
+        if (err instanceof InvalidStateError) return;
+        throw err;
+      }
+    });
+    // Signals pushed but not delivered (crash between push and delivery).
+    this.scheduler.setSignalCallback((runId) => this.deliverSignal(runId));
   }
 
   /** Get the workflow definition */
@@ -659,67 +668,25 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     const routed = await this.routeForeignRun(run, (engine) => engine.execute(runId));
     if (routed.handled) return routed.result as WorkflowRun<TContext>;
 
-    // Version pinning — if the run was created against a different
-    // definition version that's also registered, route execution to that
-    // engine instead. The host can swap engines at deploy time without
-    // breaking in-flight runs (the canonical "deployed v2 while v1 runs
-    // are still walking the step graph" hazard).
-    //
-    // Resolution order:
-    //   1. exact-version pinned engine via `workflowRegistry.lookupVersion`
-    //   2. host-supplied `migrateRun(run)` hook (returns a fresh run shape
-    //      to apply, OR a workflowId+version to redirect to)
-    //   3. fall through to this engine — same back-compat behaviour as
-    //      pre-v2.3.3 runs (they have no `definitionVersion` field).
-    if (run.definitionVersion && run.definitionVersion !== this.definition.version) {
-      const pinned = workflowRegistry.lookupVersion(run.workflowId, run.definitionVersion);
-      if (pinned && pinned !== (this as unknown as WorkflowEngine<unknown>)) {
-        return (await pinned.execute(runId)) as unknown as WorkflowRun<TContext>;
-      }
-
-      const migrated = await this.options.migrateRun?.(run);
-      if (migrated) {
-        // Migrate-in-place: persist the new shape, then continue with this engine.
-        const now = new Date();
-        await this.container.repository.updateOne(
-          { _id: runId },
-          runSet({
-            ...migrated,
-            definitionVersion: this.definition.version,
-            updatedAt: now,
-          } as Record<string, unknown>),
-          { bypassTenant: true },
-        );
-        this.container.cache.delete(runId);
-        const refreshed = await this.getOrThrow(runId);
-        run = refreshed;
-      }
-      // Else: fall through. The version-mismatch StepNotFoundError catch
-      // below already handles "step not in this engine" by failing the
-      // run — same behaviour as before this block existed.
+    const version = await this.resolveVersion(run);
+    if (version.kind === 'pinned') {
+      return (await version.engine.execute(runId)) as unknown as WorkflowRun<TContext>;
     }
+    if (version.kind === 'park') return this.parkForVersion(run);
+    run = version.run;
 
     try {
       while (this.shouldContinueExecution(run)) {
         const { run: updatedRun, shouldBreak } = await this.executeNextStep(run);
         run = updatedRun;
 
-        if (shouldBreak) break;
-
         // Operator-pause boundary (v2.7). `pause()` sets the durable `paused`
         // flag WITHOUT interrupting the in-flight step (rule 33 honesty). The
-        // just-finished step is the boundary — re-read the flag and stop
-        // claiming further steps if it flipped. A cheap probe (only when the
-        // run is still active); the scheduler/executeRetry skip paused runs so
-        // the run stays parked at this step until `resume()`.
-        if (run.status === 'running') {
-          const fresh = await this.container.repository.getById(runId, { bypassTenant: true });
-          if (fresh?.paused) {
-            this.container.cache.set(fresh as WorkflowRun<TContext>);
-            run = fresh as WorkflowRun<TContext>;
-            break;
-          }
-        }
+        // NEXT step's claim (or skip) refuses a paused run and hands back the
+        // fresh paused run — so the boundary costs nothing per step (it used
+        // to be a full-run read after every step). The scheduler/executeRetry
+        // skip paused runs, so the run stays parked until `resume()`.
+        if (shouldBreak || run.paused) break;
 
         // Handle waiting state
         if (run.status === 'waiting') {
@@ -769,6 +736,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
               message: `Step "${stepId}" not found — code version changed while workflow was in-flight`,
               code: 'VERSION_MISMATCH',
             },
+            ...(this.options.compensationHandlers ? { compensationDue: true } : {}),
           }),
           { bypassTenant: true },
         );
@@ -811,12 +779,101 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
   }
 
   /**
+   * Decide which code may advance a run — BEFORE anything changes it. Every
+   * entry that mutates a run (execute, resume with a payload, inbox delivery)
+   * calls this first, so a payload is never consumed by code the run cannot
+   * execute under.
+   *
+   *   1. same version, or no `definitionVersion` (pre-v2.3.3) → `here`
+   *   2. the pinned version's engine is registered → `pinned` (route to it)
+   *   3. `migrateRun(run)` returns a shape → persist + re-pin → `here`
+   *   4. `versionPolicy` allows it → `here`; otherwise → `park`
+   * The old unconditional fall-through ran v1 runs on v2 code whenever the
+   * step names matched — changed behaviour under an unchanged name.
+   */
+  private async resolveVersion(
+    run: WorkflowRun<TContext>,
+  ): Promise<
+    | { kind: 'here'; run: WorkflowRun<TContext> }
+    | { kind: 'pinned'; engine: WorkflowEngine<unknown> }
+    | { kind: 'park' }
+  > {
+    if (!run.definitionVersion || run.definitionVersion === this.definition.version) {
+      return { kind: 'here', run };
+    }
+    const pinned = workflowRegistry.lookupVersion(run.workflowId, run.definitionVersion);
+    if (pinned && pinned !== (this as unknown as WorkflowEngine<unknown>)) {
+      return { kind: 'pinned', engine: pinned };
+    }
+
+    const migrated = await this.options.migrateRun?.(run);
+    if (migrated) {
+      // Migrate-in-place: persist the new shape, re-pin to this version.
+      await this.container.repository.updateOne(
+        { _id: run._id },
+        runSet({
+          ...migrated,
+          definitionVersion: this.definition.version,
+          updatedAt: new Date(),
+        } as Record<string, unknown>),
+        { bypassTenant: true },
+      );
+      this.container.cache.delete(run._id);
+      return { kind: 'here', run: await this.getOrThrow(run._id) };
+    }
+    return this.versionRunnable(run.definitionVersion) ? { kind: 'here', run } : { kind: 'park' };
+  }
+
+  /** May a run pinned to `pinned` (≠ this engine's version) execute here? See `versionPolicy`. */
+  private versionRunnable(pinned: string): boolean {
+    const policy = this.options.versionPolicy ?? 'compatible';
+    if (policy === 'any') return true;
+    if (policy === 'strict') return false;
+    const from = semver.parse(pinned);
+    const to = semver.parse(this.definition.version);
+    return from !== null && to !== null && from.major === to.major;
+  }
+
+  /**
+   * Park a run whose pinned version cannot execute here: `paused` with a
+   * `version-unavailable` reason, so every sweep skips it (they all filter
+   * `paused`) until an operator registers the old definition or a migration
+   * and resumes it. Returns the parked run; nothing executed.
+   */
+  private async parkForVersion(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
+    const policy = this.options.versionPolicy ?? 'compatible';
+    const reason =
+      `version-unavailable: run is pinned to v${run.definitionVersion}, this engine is ` +
+      `v${this.definition.version} (versionPolicy '${policy}'). Register the ` +
+      `v${run.definitionVersion} definition or add migrateRun, then resume the run.`;
+    await this.container.repository.updateOne(
+      { _id: run._id, paused: { $ne: true } },
+      { $set: { paused: true, pauseReason: reason, updatedAt: new Date() } },
+      { bypassTenant: true },
+    );
+    this.scheduler.cancelSchedule(run._id);
+    this.container.cache.delete(run._id);
+    this.container.eventBus.emit('workflow:paused', { runId: run._id, reason });
+    this.container.eventBus.emit('engine:error', {
+      runId: run._id,
+      error: new Error(reason),
+      context: 'version-unavailable',
+    });
+    return (await this.get(run._id)) ?? { ...run, paused: true, pauseReason: reason };
+  }
+
+  /**
    * Durable saga compensation phase (v2.4). Thin delegate — the walk lives in
    * `./saga.js` (`runCompensation`). Inline entry from a freshly-`failed` run:
    * `failed → compensating` CAS as the first durable action, then the walk.
    */
   private async runCompensation(run: WorkflowRun<TContext>): Promise<WorkflowRun<TContext>> {
     return runCompensationImpl(this, run);
+  }
+
+  /** Saga hook: register the compensation walk's controller so `cancel()` aborts it in-process. */
+  trackAbort(runId: string, controller: AbortController): () => void {
+    return this.executor.trackAbort(runId, controller);
   }
 
   /**
@@ -986,10 +1043,13 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
     if (!stepState) return false;
 
-    // Event wait
+    // Event wait. Listeners cover bus/pub-sub events; the durable inbox covers
+    // a `signal()` that arrived BEFORE this wait was written (it is in the
+    // inbox now — the push and the wait-write are each atomic, so whichever
+    // landed second sees the other). Delivered → keep executing.
     if (stepState.waitingFor?.type === 'event' && stepState.waitingFor.eventName) {
       this.handleEventWait(runId, stepState.waitingFor.eventName);
-      return false;
+      return this.consumeInbox(runId);
     }
 
     // Retry wait
@@ -1131,7 +1191,12 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
 
     await this.container.repository.updateOne(
       { _id: runId },
-      runSet({ status: 'failed', endedAt: now, error: errorPayload }),
+      runSet({
+        status: 'failed',
+        endedAt: now,
+        error: errorPayload,
+        ...(this.options.compensationHandlers ? { compensationDue: true } : {}),
+      }),
       { bypassTenant: true },
     );
 
@@ -1276,7 +1341,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    * @throws {InvalidStateError} If workflow is not in waiting/running state
    */
   async resume(runId: string, payload?: unknown): Promise<WorkflowRun<TContext>> {
-    const run = await this.getOrThrow(runId);
+    let run = await this.getOrThrow(runId);
 
     // workflowId routing guard (v2.4.0). If this run belongs to a different
     // workflow, delegate to its owning engine (preserving the payload) or
@@ -1290,6 +1355,26 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // untouched.
     const routed = await this.routeForeignRun(run, (engine) => engine.resume(runId, payload));
     if (routed.handled) return routed.result as WorkflowRun<TContext>;
+
+    // Version gate BEFORE the payload is consumed: `resumeStep` would advance
+    // the run through THIS engine's step graph before `execute()` could park
+    // it. Migration runs HERE too — a hook that declines (returns null) must
+    // not let the payload land first. Park and refuse loudly so the caller
+    // knows the signal was not delivered.
+    const version = await this.resolveVersion(run);
+    if (version.kind === 'pinned') {
+      return (await version.engine.resume(runId, payload)) as unknown as WorkflowRun<TContext>;
+    }
+    if (version.kind === 'park') {
+      await this.parkForVersion(run);
+      throw new InvalidStateError(
+        'resume workflow',
+        'version-unavailable',
+        [`a v${this.definition.version}-compatible run (pinned v${run.definitionVersion})`],
+        { runId },
+      );
+    }
+    run = version.run;
 
     // Atomic claim: clear paused flag with guard to prevent concurrent resume race.
     // Two workers calling resume() simultaneously — only one wins the atomic claim.
@@ -1305,7 +1390,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       const claimed = await this.container.repository.claim(
         runId,
         { field: 'paused', from: true, to: false },
-        { updatedAt: new Date() },
+        { $set: { updatedAt: new Date() }, $unset: { pauseReason: '' } },
         { bypassTenant: true },
       );
 
@@ -1316,6 +1401,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       }
 
       run.paused = false;
+      delete run.pauseReason;
       run.updatedAt = new Date();
       this.container.cache.set(run);
     }
@@ -1333,12 +1419,119 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     throw new InvalidStateError('resume workflow', run.status, ['waiting', 'running'], { runId });
   }
 
+  /**
+   * Durable signal (`signal(runId, name, data)`): unlike a bus/pub-sub event it
+   * is never lost to timing — it waits in the run's inbox until a matching
+   * `ctx.waitFor(name)` consumes it, even across restarts. Delivered at most
+   * once: the inbox entry is pulled in the same write that completes the wait.
+   *
+   *   - `delivered` — the run was waiting on `name`; it resumed with `data`.
+   *   - `queued` — stored; the next `waitFor(name)` receives it.
+   *   - `duplicate` — a pending entry already has this `signalId`.
+   * Refused (InvalidStateError) for terminal runs or a full inbox; a missing
+   * run throws WorkflowNotFoundError.
+   */
+  async signal(
+    runId: string,
+    name: string,
+    data?: unknown,
+    options: { signalId?: string } = {},
+  ): Promise<{ status: 'delivered' | 'queued' | 'duplicate'; run: WorkflowRun<TContext> }> {
+    const entry = { id: options.signalId ?? randomUUID(), name, data, at: new Date() };
+    const pushed = await this.container.repository.pushSignal(runId, entry, SIGNAL_INBOX_CAP, {
+      dedupe: options.signalId !== undefined,
+    });
+    this.container.cache.delete(runId);
+
+    if (!pushed) {
+      const run = await this.getOrThrow(runId);
+      if (options.signalId && run.signals?.some((s) => s.id === options.signalId)) {
+        return { status: 'duplicate', run };
+      }
+      if ((run.signals?.length ?? 0) >= SIGNAL_INBOX_CAP) {
+        throw new InvalidStateError('signal run', 'inbox-full', [`< ${SIGNAL_INBOX_CAP} pending`], {
+          runId,
+        });
+      }
+      throw new InvalidStateError('signal run', run.status, ['draft', 'running', 'waiting'], {
+        runId,
+      });
+    }
+
+    const delivered = await this.deliverSignal(runId);
+    return delivered
+      ? { status: 'delivered', run: delivered }
+      : { status: 'queued', run: (await this.get(runId)) ?? (pushed as WorkflowRun<TContext>) };
+  }
+
+  /**
+   * If the run's CURRENT wait is an event with a pending inbox signal, deliver
+   * it and drive execution. Returns the run after execution, or `null` when
+   * there was nothing to deliver (or another driver won). Scheduler sweep entry.
+   */
+  async deliverSignal(runId: string): Promise<WorkflowRun<TContext> | null> {
+    const run = await this.get(runId);
+    if (!run) return null;
+    const routed = await this.routeForeignRun(run, (engine) => engine.deliverSignal(runId));
+    if (routed.handled) return routed.result as WorkflowRun<TContext> | null;
+    // The pinned version's engine (when registered here) delivers it now.
+    if (run.definitionVersion && run.definitionVersion !== this.definition.version) {
+      const pinned = workflowRegistry.lookupVersion(run.workflowId, run.definitionVersion);
+      if (pinned && pinned !== (this as unknown as WorkflowEngine<unknown>)) {
+        return (await pinned.deliverSignal(runId)) as WorkflowRun<TContext> | null;
+      }
+    }
+    if (!(await this.consumeInbox(runId))) return null;
+    return this.execute(runId);
+  }
+
+  /**
+   * Complete the current event wait from the inbox, atomically (the step
+   * flip + `$pull` are one write). Returns true when THIS caller delivered.
+   * Does not drive execution — callers inside the execute loop continue it.
+   */
+  private async consumeInbox(runId: string): Promise<boolean> {
+    this.container.cache.delete(runId);
+    const run = await this.get(runId);
+    if (run?.status !== 'waiting' || run.paused || !run.signals?.length) return false;
+    const step = this.findCurrentStep(run);
+    const eventName =
+      step?.status === 'waiting' && step.waitingFor?.type === 'event'
+        ? step.waitingFor.eventName
+        : undefined;
+    const entry = eventName ? run.signals.find((s) => s.name === eventName) : undefined;
+    if (!entry) return false;
+
+    // Same gate as resume(): resolve the version BEFORE the signal is consumed.
+    // A pinned engine elsewhere delivers it itself (via its own sweep/signal).
+    const version = await this.resolveVersion(run);
+    if (version.kind === 'pinned') return false;
+    if (version.kind === 'park') {
+      await this.parkForVersion(run);
+      return false;
+    }
+
+    const { run: advanced, won } = await this.executor.resumeStep(version.run, entry.data, {
+      signalId: entry.id,
+    });
+    this.container.cache.set(advanced);
+    if (won) cleanupEventListeners(runId, this.eventListeners, this.container.eventBus);
+    return won;
+  }
+
   private async resumeWaitingWorkflow(
     run: WorkflowRun<TContext>,
     payload?: unknown,
   ): Promise<WorkflowRun<TContext>> {
     const runId = run._id;
     const currentStepId = run.currentStepId;
+
+    // Operator/scheduler resume with no payload on an event wait that already
+    // has its signal queued: deliver THAT, rather than completing the wait
+    // with `undefined` and stranding the signal for some later waitFor.
+    if (payload === undefined && run.signals?.length && (await this.consumeInbox(runId))) {
+      return this.execute(runId);
+    }
 
     if (currentStepId) {
       const stepState = run.steps.find((s) => s.stepId === currentStepId);
@@ -1444,9 +1637,7 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       {
         from: 'running',
         to: 'running',
-        where: {
-          $or: [{ lastHeartbeat: { $lt: staleTime } }, { lastHeartbeat: { $exists: false } }],
-        },
+        where: { $or: staleHeartbeatOr(staleTime) },
       },
       {
         $set: { lastHeartbeat: new Date(), updatedAt: new Date() },
@@ -1482,6 +1673,11 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
             // fresh startedAt on the next claim).
             $unset: {
               [`steps.${stepIndex}.startedAt`]: '',
+              // Revoke the crashed-or-stalled attempt. If it is in fact still
+              // alive, every write it makes from here matches nothing
+              // (AttemptSupersededError) — it can no longer overwrite the
+              // recovered attempt's result.
+              [`steps.${stepIndex}.attemptId`]: '',
             },
           },
           { bypassTenant: true },
@@ -1717,6 +1913,9 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
       unset[`steps.${index}.durationMs`] = '';
       unset[`steps.${index}.waitingFor`] = '';
       unset[`steps.${index}.retryAfter`] = '';
+      // Revoke the in-flight attempt, if any — its late writes must not land
+      // on the rewound step.
+      unset[`steps.${index}.attemptId`] = '';
       // Output + history: preserved by `rewindRun` for history-enabled steps,
       // dropped otherwise. Mirror that exactly with $set (present) / $unset.
       if (step.output !== undefined) set[`steps.${index}.output`] = step.output;
@@ -1846,6 +2045,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     const updates: Partial<WorkflowRun<TContext>> = {
       paused: true,
       updatedAt: new Date(),
+      // Durable, so an operator reading the run later sees why it is paused.
+      ...(options?.reason !== undefined ? { pauseReason: options.reason } : {}),
     };
     await this.container.repository.updateById(runId, updates, { bypassTenant: true });
     const pausedRun: WorkflowRun<TContext> = { ...run, ...updates };
@@ -2003,16 +2204,8 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
         this.definition.id,
       );
 
-      // Re-set callbacks
-      this.scheduler.setStaleRecoveryCallback(async (runId, thresholdMs) => {
-        return this.recoverStale(runId, thresholdMs);
-      });
-      this.scheduler.setRetryCallback(async (runId) => {
-        return this.executeRetry(runId);
-      });
-      this.scheduler.setCompensationRecoveryCallback(async (runId, thresholdMs) => {
-        return this.recoverCompensation(runId, thresholdMs);
-      });
+      // Same wiring as the constructor (this path used to drop the expiry callback).
+      this.wireScheduler();
 
       this.options.scheduler = currentConfig;
     }
@@ -2041,7 +2234,6 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
     // Remove the concurrency slot-release listeners (registered once in the
     // constructor; not tracked in `eventListeners`).
     this.removeSlotReleaseListeners?.();
-    this.releasedSlots.clear();
 
     // Remove from the global registry — without this, a v2 engine resuming
     // a v1 run would still route execution to a v1 engine the host has
@@ -2056,6 +2248,22 @@ export class WorkflowEngine<TContext = Record<string, unknown>> {
    */
   getSchedulerStats(): ReturnType<SmartScheduler['getStats']> {
     return this.scheduler.getStats();
+  }
+
+  /**
+   * Run one scheduler poll now (crash recovery, then fair admission of due
+   * work) instead of waiting for the next tick. By default it also waits for
+   * every run that poll dispatched — the deterministic "advance the world one
+   * step" a test needs, or an operator's kick after a deploy.
+   */
+  async pollScheduler(options: { wait?: boolean } = {}): Promise<void> {
+    await this.scheduler.pollOnce();
+    if (options.wait !== false) await this.scheduler.drain();
+  }
+
+  /** Await every run the scheduler is currently driving in this process. */
+  async drainScheduler(): Promise<void> {
+    await this.scheduler.drain();
   }
 
   /**

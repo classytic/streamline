@@ -24,19 +24,35 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import {
-  createContainer,
-  createWorkflow,
-  WorkflowRunModel,
-  type Workflow,
-} from '../../src/index.js';
-import { useTestDb } from '../helpers/lifecycle.js';
+import type { StreamlineContainer, Workflow } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
+
+const env = useStreamlineEnv();
 
 interface BurstInput {
   userId: string;
   /** monotonic counter so the persisted input is identifiably "the latest" */
   rev?: number;
 }
+
+/** Persisted runs of `wf` (optionally in one concurrency bucket). */
+const countRuns = (
+  wf: Workflow<{ userId: string; rev?: number }, BurstInput>,
+  concurrencyKey?: string,
+) =>
+  env.runModel.countDocuments({
+    workflowId: wf.engine.definition.id,
+    ...(concurrencyKey !== undefined ? { concurrencyKey } : {}),
+  });
+
+/**
+ * A strict multi-tenant container on the env's connection (the env's own
+ * container is single-tenant). Disposed by the env after each test.
+ */
+const strictTenantContainer = (): StreamlineContainer =>
+  env.createContainer({
+    repository: { tenant: { tenantField: 'context.tenantId', required: true } },
+  });
 
 /**
  * Make a throttle-configured workflow. Defaults to single-tenant; pass a
@@ -45,16 +61,15 @@ interface BurstInput {
  * not on scheduler-driven execution.
  */
 function makeThrottleWorkflow(
-  id: string,
+  name: string,
   overrides: Partial<{
     limit: number;
     windowMs: number;
-    container: ReturnType<typeof createContainer>;
+    container: StreamlineContainer;
   }> = {},
 ): Workflow<{ userId: string; rev?: number }, BurstInput> {
-  return createWorkflow<{ userId: string; rev?: number }, BurstInput>(id, {
+  return env.workflow<{ userId: string; rev?: number }, BurstInput>(name, {
     steps: { run: async () => 'ok' },
-    autoExecute: false,
     concurrency: {
       key: (input) => input.userId,
       throttle: {
@@ -67,15 +82,14 @@ function makeThrottleWorkflow(
 }
 
 function makeDebounceWorkflow(
-  id: string,
+  name: string,
   overrides: Partial<{
     windowMs: number;
-    container: ReturnType<typeof createContainer>;
+    container: StreamlineContainer;
   }> = {},
 ): Workflow<{ userId: string; rev?: number }, BurstInput> {
-  return createWorkflow<{ userId: string; rev?: number }, BurstInput>(id, {
+  return env.workflow<{ userId: string; rev?: number }, BurstInput>(name, {
     steps: { run: async () => 'ok' },
-    autoExecute: false,
     concurrency: {
       key: (input) => input.userId,
       debounce: { windowMs: overrides.windowMs ?? 30_000 },
@@ -85,8 +99,6 @@ function makeDebounceWorkflow(
 }
 
 describe('Throttle scenarios — staggered burst, no slot collision', () => {
-  useTestDb();
-
   it('5-start burst (limit=2/60s) produces 5 distinct fire slots', async () => {
     // Setup: throttle 2 per minute. Slot interval = 30s.
     const wf = makeThrottleWorkflow('throttle-deep-burst', {
@@ -137,11 +149,7 @@ describe('Throttle scenarios — staggered burst, no slot collision', () => {
     expect(fire5.getTime() - fire4.getTime()).toBeLessThanOrEqual(slotInterval + 100);
 
     // Assert (5): all 5 runs persisted, none lost or merged.
-    const total = await WorkflowRunModel.countDocuments({
-      workflowId: 'throttle-deep-burst',
-      concurrencyKey: 'u-1',
-    });
-    expect(total).toBe(5);
+    expect(await countRuns(wf, 'u-1')).toBe(5);
   });
 
   it('the first excess anchors at oldestInWindow + windowMs (not now + windowMs)', async () => {
@@ -151,12 +159,13 @@ describe('Throttle scenarios — staggered burst, no slot collision', () => {
     const wf = makeThrottleWorkflow('throttle-anchor', { limit: 1, windowMs: 5_000 });
 
     const first = await wf.start({ userId: 'u-1' });
-    // Wait briefly — if the algorithm anchored to `now`, the queued slot
-    // would shift by this delay; correct behavior anchors to `first.createdAt`.
+    // Let time pass (deliberate, not a wait for an outcome) — if the algorithm
+    // anchored to `now`, the queued slot would shift by this delay; correct
+    // behavior anchors to `first.createdAt`.
     await new Promise((r) => setTimeout(r, 120));
     const queued = await wf.start({ userId: 'u-1' });
 
-    const fireAt = (queued.scheduling?.executionTime as Date).getTime();
+    const fireAt = Number(queued.scheduling?.executionTime.getTime()); // NaN (fails) if unset
     const anchor = new Date(first.createdAt as Date).getTime();
     expect(Math.abs(fireAt - (anchor + 5_000))).toBeLessThanOrEqual(50);
   });
@@ -180,8 +189,6 @@ describe('Throttle scenarios — staggered burst, no slot collision', () => {
 });
 
 describe('Debounce scenarios — trailing-edge collapse with input refresh', () => {
-  useTestDb();
-
   it('rapid burst produces ONE persisted run carrying the latest input', async () => {
     const wf = makeDebounceWorkflow('debounce-burst-collapse', { windowMs: 30_000 });
 
@@ -196,15 +203,11 @@ describe('Debounce scenarios — trailing-edge collapse with input refresh', () 
     expect(new Set(ids).size).toBe(1);
 
     // Assert (2): exactly one persisted document for the bucket.
-    const count = await WorkflowRunModel.countDocuments({
-      workflowId: 'debounce-burst-collapse',
-      concurrencyKey: 'u-1',
-    });
-    expect(count).toBe(1);
+    expect(await countRuns(wf, 'u-1')).toBe(1);
 
     // Assert (3): the persisted input is the LATEST (rev: 5), not the first.
-    const persisted = await WorkflowRunModel.findById(ids[0]).lean();
-    expect((persisted?.input as { rev: number }).rev).toBe(5);
+    const persisted = await env.runs.get(ids[0] as string);
+    expect((persisted?.input as { rev: number } | undefined)?.rev).toBe(5);
   });
 
   it('different concurrency keys produce independent debounce drafts', async () => {
@@ -214,30 +217,17 @@ describe('Debounce scenarios — trailing-edge collapse with input refresh', () 
     await wf.start({ userId: 'u-1', rev: 2 });
     await wf.start({ userId: 'u-2', rev: 1 });
 
-    const u1Count = await WorkflowRunModel.countDocuments({
-      workflowId: 'debounce-key-isolation',
-      concurrencyKey: 'u-1',
-    });
-    const u2Count = await WorkflowRunModel.countDocuments({
-      workflowId: 'debounce-key-isolation',
-      concurrencyKey: 'u-2',
-    });
-    expect(u1Count).toBe(1);
-    expect(u2Count).toBe(1);
+    expect(await countRuns(wf, 'u-1')).toBe(1);
+    expect(await countRuns(wf, 'u-2')).toBe(1);
   });
 });
 
 describe('Tenant propagation — strict multi-tenant mode', () => {
-  useTestDb();
-
   it('throttle path forwards tenantId through count, nextSlot, and create probes', async () => {
-    const container = createContainer({
-      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
-    });
     const wf = makeThrottleWorkflow('throttle-tenant-prop', {
       limit: 1,
       windowMs: 60_000,
-      container,
+      container: strictTenantContainer(),
     });
 
     // Script: two starts past the limit with explicit tenantId on each.
@@ -250,17 +240,14 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
     expect(r2.meta?.streamlineGate).toBe('throttle');
     // Tenant scope was auto-injected on create (mongokit's tenant-filter
     // plugin reads it from the per-call options).
-    const persisted = await WorkflowRunModel.findById(r2._id).lean();
+    const persisted = await env.runs.get(r2._id);
     expect((persisted?.context as { tenantId?: string })?.tenantId).toBe('org-A');
   });
 
   it('debounce bump path forwards tenantId to the atomic findOneAndUpdate', async () => {
-    const container = createContainer({
-      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
-    });
     const wf = makeDebounceWorkflow('debounce-tenant-prop', {
       windowMs: 30_000,
-      container,
+      container: strictTenantContainer(),
     });
 
     // First start creates the debounce draft; second bumps it. Both must
@@ -270,24 +257,17 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
     const bumped = await wf.start({ userId: 'u-1', rev: 2 }, { tenantId: 'org-A' });
 
     expect(String(bumped._id)).toBe(String(first._id));
-    const persisted = await WorkflowRunModel.findById(first._id).lean();
-    expect((persisted?.input as { rev: number }).rev).toBe(2);
+    const persisted = await env.runs.get(first._id);
+    expect((persisted?.input as { rev: number } | undefined)?.rev).toBe(2);
     expect((persisted?.context as { tenantId?: string })?.tenantId).toBe('org-A');
   });
 
   it('concurrency.limit path forwards tenantId to countActiveByConcurrencyKey', async () => {
-    const container = createContainer({
-      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
+    const wf = env.workflow<{ userId: string }, { userId: string }>('concurrency-tenant-prop', {
+      steps: { run: async () => 'ok' },
+      concurrency: { key: (input) => input.userId, limit: 1 },
+      container: strictTenantContainer(),
     });
-    const wf = createWorkflow<{ userId: string }, { userId: string }>(
-      'concurrency-tenant-prop',
-      {
-        steps: { run: async () => 'ok' },
-        autoExecute: false,
-        concurrency: { key: (input) => input.userId, limit: 1 },
-        container,
-      },
-    );
 
     const r1 = await wf.start({ userId: 'u-1' }, { tenantId: 'org-A' });
     const r2 = await wf.start({ userId: 'u-1' }, { tenantId: 'org-A' });
@@ -304,18 +284,12 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
     // `getConcurrencyDraft` / `countActiveByConcurrencyKey` threw "Missing
     // tenantId" inside the engine's promoteConcurrencyDrafts and the
     // scheduler's poll loop, freezing queued drafts in strict-tenant mode.
-    const container = createContainer({
-      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
+    const container = strictTenantContainer();
+    const wf = env.workflow<{ userId: string }, { userId: string }>('concurrency-promote-strict', {
+      steps: { run: async () => 'ok' },
+      concurrency: { key: (input) => input.userId, limit: 1 },
+      container,
     });
-    const wf = createWorkflow<{ userId: string }, { userId: string }>(
-      'concurrency-promote-strict',
-      {
-        steps: { run: async () => 'ok' },
-        autoExecute: false,
-        concurrency: { key: (input) => input.userId, limit: 1 },
-        container,
-      },
-    );
 
     const first = await wf.start({ userId: 'u-1' }, { tenantId: 'org-A' });
     const queued = await wf.start({ userId: 'u-1' }, { tenantId: 'org-A' });
@@ -336,13 +310,10 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
   });
 
   it('throws cleanly when strict mode is missing tenantId (no silent cross-tenant write)', async () => {
-    const container = createContainer({
-      repository: { tenant: { tenantField: 'context.tenantId', required: true } },
-    });
     const wf = makeThrottleWorkflow('throttle-strict-fail', {
       limit: 1,
       windowMs: 60_000,
-      container,
+      container: strictTenantContainer(),
     });
 
     // Strict mode WITHOUT tenantId — must throw at the first probe, not
@@ -350,16 +321,11 @@ describe('Tenant propagation — strict multi-tenant mode', () => {
     await expect(wf.start({ userId: 'u-1' })).rejects.toThrow(/tenantId/i);
 
     // No run was persisted.
-    const count = await WorkflowRunModel.countDocuments({
-      workflowId: 'throttle-strict-fail',
-    });
-    expect(count).toBe(0);
+    expect(await countRuns(wf)).toBe(0);
   });
 });
 
 describe('Honest contract — best-effort smoothing, not strict rate limit', () => {
-  useTestDb();
-
   it('SEQUENTIAL bursts smooth correctly (the documented happy path)', async () => {
     const wf = makeThrottleWorkflow('throttle-sequential-honest', {
       limit: 2,
@@ -374,9 +340,8 @@ describe('Honest contract — best-effort smoothing, not strict rate limit', () 
     }
 
     const queuedRuns = runs.slice(2); // the 4 excess
-    const fireTimes = queuedRuns.map(
-      (r) => (r.scheduling?.executionTime as Date).getTime(),
-    );
+    // NaN (never unique, never greater) if a queued run has no fire time.
+    const fireTimes = queuedRuns.map((r) => Number(r.scheduling?.executionTime.getTime()));
 
     // Each queued slot is unique.
     expect(new Set(fireTimes).size).toBe(fireTimes.length);

@@ -10,39 +10,27 @@
  * - Large workflow loads
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
+import { describe, expect, it } from 'vitest';
 import {
-  createWorkflow,
-  createContainer,
-  createHook,
-  resumeHook,
-  WaitSignal,
-  WorkflowRunModel,
-  globalEventBus,
-  type Workflow,
-  type WorkflowRun,
-  type StepConfig,
-  type WorkflowConfig,
-  type WaitForOptions,
-  type HookResult,
-  type HookOptions,
-  type EventPayloadMap,
-  type StepCompletedPayload,
-  type StepFailedPayload,
-  type WorkflowFailedPayload,
-  type EngineErrorPayload,
   type BaseEventPayload,
+  type EngineErrorPayload,
+  type EventPayloadMap,
+  type HookOptions,
+  type HookResult,
+  type StepCompletedPayload,
+  type StepConfig,
+  type StepFailedPayload,
+  type WaitForOptions,
+  WaitSignal,
+  type Workflow,
+  type WorkflowConfig,
+  type WorkflowFailedPayload,
   type WorkflowResumedPayload,
+  type WorkflowRun,
 } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // Type Export Completeness
@@ -57,7 +45,7 @@ describe('Type export completeness', () => {
   });
 
   it('should export HookResult and HookOptions types', () => {
-    const result: HookResult = { token: 'test', path: '/hooks/test' };
+    const result: HookResult = { token: 'test', path: '/hooks/test', reason: 'test' };
     const options: HookOptions = { token: 'custom' };
     expect(result.token).toBe('test');
     expect(options.token).toBe('custom');
@@ -96,17 +84,12 @@ describe('Type export completeness', () => {
 // ============================================================================
 
 describe('Concurrent resume safety', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should safely handle two concurrent resume() calls on paused workflow', async () => {
-    const workflow = createWorkflow('concurrent-resume', {
+    const workflow = env.workflow('concurrent-resume', {
       steps: {
         waitStep: async (ctx) => ctx.wait('approval'),
         after: async () => 'done',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -128,22 +111,14 @@ describe('Concurrent resume safety', () => {
     expect(fulfilled.length).toBe(2);
 
     // Wait for completion
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
-
-    const final = await workflow.get(run._id);
-    expect(final?.status).toBe('done');
-    expect(final?.paused).toBeFalsy();
-
-    workflow.shutdown();
+    const final = await env.until(run._id, 'done');
+    expect(final.paused).toBeFalsy();
   });
 
   it('should handle concurrent execute() calls without duplicate step runs', async () => {
     let stepRunCount = 0;
 
-    const workflow = createWorkflow('concurrent-execute', {
+    const workflow = env.workflow('concurrent-execute', {
       steps: {
         counted: async () => {
           stepRunCount++;
@@ -151,22 +126,16 @@ describe('Concurrent resume safety', () => {
           return 'done';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
 
     // Two workers try to execute simultaneously
-    await Promise.allSettled([
-      workflow.execute(run._id),
-      workflow.execute(run._id),
-    ]);
+    await Promise.allSettled([workflow.execute(run._id), workflow.execute(run._id)]);
 
     // Atomic claiming should prevent double execution
     // Step should run exactly once (second worker sees it already running/done)
     expect(stepRunCount).toBe(1);
-
-    workflow.shutdown();
   });
 });
 
@@ -176,7 +145,7 @@ describe('Concurrent resume safety', () => {
 
 describe('Write concern durability', () => {
   it('should have majority write concern on the schema', () => {
-    const schema = WorkflowRunModel.schema;
+    const schema = env.runModel.schema;
     const wc = schema.options.writeConcern;
     expect(wc).toBeDefined();
     expect(wc?.w).toBe('majority');
@@ -189,66 +158,45 @@ describe('Write concern durability', () => {
 // ============================================================================
 
 describe('Stale recovery', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should recover a workflow with stale heartbeat', async () => {
-    const workflow = createWorkflow('stale-recovery-test', {
+    const workflow = env.workflow('stale-recovery-test', {
       steps: {
         step1: async () => 'done',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
 
     // Simulate a stale workflow: set lastHeartbeat to 10 minutes ago
     const staleTime = new Date(Date.now() - 10 * 60 * 1000);
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      { $set: { lastHeartbeat: staleTime } }
-    );
+    await env.runs.update(run._id, { lastHeartbeat: staleTime });
 
     // Attempt recovery
     const recovered = await workflow.engine.recoverStale(run._id, 5 * 60 * 1000);
     expect(recovered).not.toBeNull();
 
-    await waitUntil(async () => {
-      const r = await workflow.get(run._id);
-      return r?.status === 'done';
-    }, 5000);
-
-    const final = await workflow.get(run._id);
-    expect(final?.status).toBe('done');
-
-    workflow.shutdown();
+    const final = await env.until(run._id, 'done');
+    expect(final.status).toBe('done');
   });
 
   it('should NOT recover a workflow with fresh heartbeat', async () => {
-    const workflow = createWorkflow('fresh-heartbeat', {
+    const workflow = env.workflow('fresh-heartbeat', {
       steps: {
         step1: async () => {
           await new Promise((r) => setTimeout(r, 200));
           return 'done';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
 
     // Set fresh heartbeat
-    await WorkflowRunModel.updateOne(
-      { _id: run._id },
-      { $set: { lastHeartbeat: new Date() } }
-    );
+    await env.runs.update(run._id, { lastHeartbeat: new Date() });
 
     // Recovery should fail (heartbeat is fresh)
     const result = await workflow.engine.recoverStale(run._id, 5 * 60 * 1000);
     expect(result).toBeNull();
-
-    workflow.shutdown();
   });
 });
 
@@ -257,12 +205,10 @@ describe('Stale recovery', () => {
 // ============================================================================
 
 describe('Event payload type safety', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
+  // Each test listens on its OWN container (on the env's connection), so the
+  // asserted event streams contain only that test's workflow.
   it('should emit typed event payloads for step lifecycle', async () => {
-    const container = createContainer();
+    const container = env.createContainer();
     const events: string[] = [];
 
     container.eventBus.on('step:started', (payload) => {
@@ -272,37 +218,29 @@ describe('Event payload type safety', () => {
       events.push(`completed:${payload.stepId}`);
     });
 
-    const workflow = createWorkflow('event-payloads', {
+    const workflow = env.workflow('event-payloads', {
       steps: {
         s1: async () => 'ok',
         s2: async () => 'ok',
       },
       container,
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     await workflow.execute(run._id);
 
-    expect(events).toEqual([
-      'started:s1',
-      'completed:s1',
-      'started:s2',
-      'completed:s2',
-    ]);
-
-    workflow.shutdown();
+    expect(events).toEqual(['started:s1', 'completed:s1', 'started:s2', 'completed:s2']);
   });
 
   it('should emit step:failed with error details', async () => {
-    const container = createContainer();
-    let failPayload: StepFailedPayload | null = null;
+    const container = env.createContainer();
+    const failPayloads: StepFailedPayload[] = [];
 
     container.eventBus.on('step:failed', (payload) => {
-      failPayload = payload as StepFailedPayload;
+      failPayloads.push(payload);
     });
 
-    const workflow = createWorkflow('event-fail-payload', {
+    const workflow = env.workflow('event-fail-payload', {
       steps: {
         failing: async () => {
           throw new Error('intentional');
@@ -310,24 +248,22 @@ describe('Event payload type safety', () => {
       },
       container,
       defaults: { retries: 1 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     await workflow.execute(run._id);
 
-    expect(failPayload).not.toBeNull();
-    expect(failPayload!.stepId).toBe('failing');
-    expect(failPayload!.runId).toBe(run._id);
-
-    workflow.shutdown();
+    const failPayload = failPayloads.at(-1);
+    expect(failPayload).toBeDefined();
+    expect(failPayload?.stepId).toBe('failing');
+    expect(failPayload?.runId).toBe(run._id);
   });
 
   it('should emit heartbeat-warning on heartbeat failure', async () => {
     // This test verifies the heartbeat failure tracking fix.
     // We can't easily simulate a DB error during heartbeat in e2e,
     // but we verify the event bus emits engine:error events.
-    const container = createContainer();
+    const container = env.createContainer();
     const errors: string[] = [];
 
     container.eventBus.on('engine:error', (payload) => {
@@ -350,22 +286,15 @@ describe('Event payload type safety', () => {
 // ============================================================================
 
 describe('Load handling', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should handle 50 concurrent workflow starts', async () => {
-    const workflow = createWorkflow('load-test', {
+    const workflow = env.workflow('load-test', {
       steps: {
         quick: async () => 'done',
       },
-      autoExecute: false,
     });
 
     // Start 50 workflows concurrently
-    const starts = Array.from({ length: 50 }, (_, i) =>
-      workflow.start({ index: i })
-    );
+    const starts = Array.from({ length: 50 }, (_, i) => workflow.start({ index: i }));
     const runs = await Promise.all(starts);
 
     expect(runs).toHaveLength(50);
@@ -377,38 +306,44 @@ describe('Load handling', () => {
 
     const doneCount = results.filter((r) => r.status === 'done').length;
     expect(doneCount).toBe(50);
-
-    workflow.shutdown();
   });
 
   it('should handle 10 workflows with 5 steps each', async () => {
-    const workflow = createWorkflow<{ total: number }>('multi-step-load', {
+    const workflow = env.workflow<{ total: number }>('multi-step-load', {
       steps: {
-        s1: async (ctx) => { await ctx.set('total', 1); return 1; },
-        s2: async (ctx) => { await ctx.set('total', 2); return 2; },
-        s3: async (ctx) => { await ctx.set('total', 3); return 3; },
-        s4: async (ctx) => { await ctx.set('total', 4); return 4; },
-        s5: async (ctx) => { await ctx.set('total', 5); return 5; },
+        s1: async (ctx) => {
+          await ctx.set('total', 1);
+          return 1;
+        },
+        s2: async (ctx) => {
+          await ctx.set('total', 2);
+          return 2;
+        },
+        s3: async (ctx) => {
+          await ctx.set('total', 3);
+          return 3;
+        },
+        s4: async (ctx) => {
+          await ctx.set('total', 4);
+          return 4;
+        },
+        s5: async (ctx) => {
+          await ctx.set('total', 5);
+          return 5;
+        },
       },
       context: () => ({ total: 0 }),
-      autoExecute: false,
     });
 
-    const runs = await Promise.all(
-      Array.from({ length: 10 }, () => workflow.start({}))
-    );
+    const runs = await Promise.all(Array.from({ length: 10 }, () => workflow.start({})));
 
-    const results = await Promise.all(
-      runs.map((r) => workflow.execute(r._id))
-    );
+    const results = await Promise.all(runs.map((r) => workflow.execute(r._id)));
 
     for (const result of results) {
       expect(result.status).toBe('done');
       expect(result.context.total).toBe(5);
       expect(result.steps.every((s) => s.status === 'done')).toBe(true);
     }
-
-    workflow.shutdown();
   });
 });
 
@@ -417,30 +352,23 @@ describe('Load handling', () => {
 // ============================================================================
 
 describe('Edge cases', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should handle empty context gracefully', async () => {
-    const workflow = createWorkflow('empty-context', {
+    const workflow = env.workflow('empty-context', {
       steps: {
         check: async (ctx) => {
           expect(ctx.context).toBeDefined();
           return 'ok';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
-
-    workflow.shutdown();
   });
 
   it('should handle large context objects', async () => {
-    const workflow = createWorkflow<{ data: string[] }>('large-context', {
+    const workflow = env.workflow<{ data: string[] }>('large-context', {
       steps: {
         fill: async (ctx) => {
           // 10K items in context
@@ -454,38 +382,32 @@ describe('Edge cases', () => {
         },
       },
       context: () => ({ data: [] as string[] }),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
     expect(result.context.data.length).toBe(10000);
-
-    workflow.shutdown();
   });
 
   it('should handle special characters in workflow and step IDs', async () => {
-    // Workflow IDs with dashes and underscores
-    const workflow = createWorkflow('my-complex_workflow-v2', {
+    // Workflow IDs with dashes and underscores (the env appends `-N`)
+    const workflow = env.workflow('my-complex_workflow-v2', {
       steps: {
         'step-with-dashes': async () => 'ok',
         step_with_underscores: async () => 'ok',
         camelCaseStep: async () => 'ok',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
     expect(result.steps).toHaveLength(3);
-
-    workflow.shutdown();
   });
 
   it('should handle getOutput from non-existent step returning undefined', async () => {
-    const workflow = createWorkflow('getoutput-missing', {
+    const workflow = env.workflow('getoutput-missing', {
       steps: {
         check: async (ctx) => {
           const missing = ctx.getOutput('nonexistent');
@@ -493,44 +415,38 @@ describe('Edge cases', () => {
           return 'ok';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
-
-    workflow.shutdown();
   });
 
   it('should fail fast with zero steps', () => {
     expect(() =>
-      createWorkflow('no-steps', {
+      env.workflow('no-steps', {
         steps: {},
-      })
+      }),
     ).toThrow(/at least one step/);
   });
 
   it('should handle workflow with single step', async () => {
-    const workflow = createWorkflow('single-step', {
+    const workflow = env.workflow('single-step', {
       steps: {
         only: async () => ({ result: 42 }),
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
     const result = await workflow.execute(run._id);
     expect(result.status).toBe('done');
     expect(result.output).toEqual({ result: 42 });
-
-    workflow.shutdown();
   });
 
   it('should handle non-retriable errors (error.retriable = false)', async () => {
     let attempts = 0;
 
-    const workflow = createWorkflow('non-retriable', {
+    const workflow = env.workflow('non-retriable', {
       steps: {
         fatal: async () => {
           attempts++;
@@ -540,7 +456,6 @@ describe('Edge cases', () => {
         },
       },
       defaults: { retries: 5 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -548,7 +463,5 @@ describe('Edge cases', () => {
 
     expect(result.status).toBe('failed');
     expect(attempts).toBe(1); // No retries for non-retriable errors
-
-    workflow.shutdown();
   });
 });

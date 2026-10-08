@@ -7,35 +7,20 @@
  * - Combined patterns: goto + checkpoint + conditional
  */
 
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import { setupTestDB, teardownTestDB, cleanupTestDB, waitUntil } from '../utils/setup.js';
-import {
-  createWorkflow,
-  createContainer,
-  type WorkflowRun,
-} from '../../src/index.js';
+import { describe, expect, it } from 'vitest';
+import { useStreamlineEnv } from '../helpers/index.js';
 
-beforeAll(async () => {
-  await setupTestDB();
-});
-
-afterAll(async () => {
-  await teardownTestDB();
-});
+const env = useStreamlineEnv();
 
 // ============================================================================
 // ctx.goto() — Dynamic Flow Control
 // ============================================================================
 
 describe('ctx.goto() — dynamic branching', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should jump to a target step, skipping intermediate steps', async () => {
     const executed: string[] = [];
 
-    const workflow = createWorkflow('goto-skip', {
+    const workflow = env.workflow('goto-skip', {
       steps: {
         start: async (ctx) => {
           executed.push('start');
@@ -50,7 +35,6 @@ describe('ctx.goto() — dynamic branching', () => {
           return 'done';
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -58,8 +42,6 @@ describe('ctx.goto() — dynamic branching', () => {
 
     expect(result.status).toBe('done');
     expect(executed).toEqual(['start', 'finish']); // 'middle' skipped
-
-    workflow.shutdown();
   });
 
   it('should use goto for manual retry/loop with checkpoint pattern', async () => {
@@ -69,7 +51,7 @@ describe('ctx.goto() — dynamic branching', () => {
     let attempts = 0;
     const executed: string[] = [];
 
-    const workflow = createWorkflow<{ retryCount: number }>('goto-checkpoint-loop', {
+    const workflow = env.workflow<{ retryCount: number }>('goto-checkpoint-loop', {
       steps: {
         process: async (ctx) => {
           const lastAttempt = ctx.getCheckpoint<number>() ?? 0;
@@ -83,14 +65,13 @@ describe('ctx.goto() — dynamic branching', () => {
 
           return { attempts };
         },
-        done: async (ctx) => {
+        done: async () => {
           executed.push('done');
           return 'finished';
         },
       },
       context: () => ({ retryCount: 0 }),
       defaults: { retries: 5 },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -99,8 +80,6 @@ describe('ctx.goto() — dynamic branching', () => {
     expect(result.status).toBe('done');
     expect(attempts).toBe(3);
     expect(executed).toEqual(['process-1', 'process-2', 'process-3', 'done']);
-
-    workflow.shutdown();
   });
 
   it('should use goto for conditional branching (success vs failure path)', async () => {
@@ -109,7 +88,7 @@ describe('ctx.goto() — dynamic branching', () => {
     // Goto jumps to a step in the linear sequence. Steps after the goto target
     // still execute linearly. For mutually exclusive branches, put the error
     // path LAST and use goto to jump to it — after it runs, workflow completes.
-    const workflow = createWorkflow<{ paymentValid: boolean }>('goto-branch', {
+    const workflow = env.workflow<{ paymentValid: boolean }, { valid: boolean }>('goto-branch', {
       steps: {
         validate: async (ctx) => {
           executed.push('validate');
@@ -118,18 +97,17 @@ describe('ctx.goto() — dynamic branching', () => {
           }
           return { valid: true };
         },
-        processPayment: async (ctx) => {
+        processPayment: async () => {
           executed.push('processPayment');
           return { charged: true };
         },
-        handleFailure: async (ctx) => {
+        handleFailure: async () => {
           // Last step — only reached via goto (skipped via skipIf in normal path)
           executed.push('handleFailure');
           return 'payment failed';
         },
       },
-      context: (input: any) => ({ paymentValid: input.valid }),
-      autoExecute: false,
+      context: (input) => ({ paymentValid: input.valid }),
     });
 
     // Failed payment — should goto handleFailure (skipping processPayment)
@@ -146,19 +124,16 @@ describe('ctx.goto() — dynamic branching', () => {
     const result2 = await workflow.execute(run2._id);
     expect(result2.status).toBe('done');
     expect(executed).toEqual(['validate', 'processPayment', 'handleFailure']);
-
-    workflow.shutdown();
   });
 
   it('should fail workflow if goto target does not exist', async () => {
-    const workflow = createWorkflow('goto-invalid', {
+    const workflow = env.workflow('goto-invalid', {
       steps: {
         start: async (ctx) => {
           return ctx.goto('nonexistent');
         },
       },
       defaults: { retries: 1 }, // Don't retry — fail immediately
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -167,8 +142,6 @@ describe('ctx.goto() — dynamic branching', () => {
     expect(result.status).toBe('failed');
     const step = result.steps.find((s) => s.stepId === 'start');
     expect(step?.error?.message).toContain('nonexistent');
-
-    workflow.shutdown();
   });
 });
 
@@ -177,19 +150,14 @@ describe('ctx.goto() — dynamic branching', () => {
 // ============================================================================
 
 describe('ctx.startChildWorkflow() — child workflows', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should put parent step into waiting state with childWorkflow type', async () => {
-    const workflow = createWorkflow('parent-child', {
+    const workflow = env.workflow('parent-child', {
       steps: {
         triggerChild: async (ctx) => {
           return ctx.startChildWorkflow('child-pipeline', { data: 'test' });
         },
         afterChild: async () => 'done',
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -205,12 +173,10 @@ describe('ctx.startChildWorkflow() — child workflows', () => {
     const data = step?.waitingFor?.data as { childWorkflowId: string; childInput: unknown };
     expect(data?.childWorkflowId).toBe('child-pipeline');
     expect(data?.childInput).toEqual({ data: 'test' });
-
-    workflow.shutdown();
   });
 
   it('should resume parent when child completes (via manual resume)', async () => {
-    const workflow = createWorkflow<{ childResult?: unknown }>('parent-resume', {
+    const workflow = env.workflow<{ childResult?: unknown }>('parent-resume', {
       steps: {
         triggerChild: async (ctx) => {
           return ctx.startChildWorkflow('child-task', { value: 42 });
@@ -222,7 +188,6 @@ describe('ctx.startChildWorkflow() — child workflows', () => {
         },
       },
       context: () => ({}),
-      autoExecute: false,
     });
 
     const parentRun = await workflow.start({});
@@ -235,26 +200,17 @@ describe('ctx.startChildWorkflow() — child workflows', () => {
     // Simulate child completing and resuming parent
     await workflow.resume(parentRun._id, { result: 'child-done', value: 84 });
 
-    await waitUntil(async () => {
-      const r = await workflow.get(parentRun._id);
-      return r?.status === 'done';
-    }, 5000);
-
-    const completed = await workflow.get(parentRun._id);
-    expect(completed?.status).toBe('done');
-    expect(completed?.context.childResult).toEqual({ result: 'child-done', value: 84 });
-
-    workflow.shutdown();
+    const completed = await env.until(parentRun._id, 'done');
+    expect(completed.context.childResult).toEqual({ result: 'child-done', value: 84 });
   });
 
   it('should store parent/child relationship in waitingFor data', async () => {
-    const workflow = createWorkflow('parent-metadata', {
+    const workflow = env.workflow('parent-metadata', {
       steps: {
         launch: async (ctx) => {
           return ctx.startChildWorkflow('sub-pipeline', { x: 1 });
         },
       },
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -269,8 +225,6 @@ describe('ctx.startChildWorkflow() — child workflows', () => {
       parentRunId: run._id,
       parentStepId: 'launch',
     });
-
-    workflow.shutdown();
   });
 });
 
@@ -279,10 +233,6 @@ describe('ctx.startChildWorkflow() — child workflows', () => {
 // ============================================================================
 
 describe('Combined patterns', () => {
-  afterEach(async () => {
-    await cleanupTestDB();
-  });
-
   it('should combine goto + StepConfig conditional in a real pipeline', async () => {
     const log: string[] = [];
 
@@ -291,44 +241,46 @@ describe('Combined patterns', () => {
       approved: boolean;
     }
 
-    const workflow = createWorkflow<PipelineCtx>('deploy-pipeline', {
-      steps: {
-        build: async (ctx) => {
-          log.push('build');
-          return { artifact: 'v1.0.0' };
-        },
-        test: {
-          handler: async (ctx) => {
-            log.push('test');
-            return { passed: true };
+    const workflow = env.workflow<PipelineCtx, { env: 'staging' | 'production' }>(
+      'deploy-pipeline',
+      {
+        steps: {
+          build: async () => {
+            log.push('build');
+            return { artifact: 'v1.0.0' };
           },
-          timeout: 60_000,
-          retries: 2,
-        },
-        approvalGate: async (ctx) => {
-          log.push('approvalGate');
-          if (ctx.context.environment === 'staging') {
-            // Staging doesn't need approval — skip to deploy
-            await ctx.set('approved', true);
-            return ctx.goto('deploy');
-          }
-          // Production needs approval — wait
-          return ctx.wait('Needs production approval');
-        },
-        deploy: {
-          handler: async (ctx) => {
-            log.push(`deploy-${ctx.context.environment}`);
-            return { deployed: true };
+          test: {
+            handler: async () => {
+              log.push('test');
+              return { passed: true };
+            },
+            timeout: 60_000,
+            retries: 2,
           },
-          timeout: 120_000,
+          approvalGate: async (ctx) => {
+            log.push('approvalGate');
+            if (ctx.context.environment === 'staging') {
+              // Staging doesn't need approval — skip to deploy
+              await ctx.set('approved', true);
+              return ctx.goto('deploy');
+            }
+            // Production needs approval — wait
+            return ctx.wait('Needs production approval');
+          },
+          deploy: {
+            handler: async (ctx) => {
+              log.push(`deploy-${ctx.context.environment}`);
+              return { deployed: true };
+            },
+            timeout: 120_000,
+          },
         },
+        context: (input) => ({
+          environment: input.env,
+          approved: false,
+        }),
       },
-      context: (input: any) => ({
-        environment: input.env as 'staging' | 'production',
-        approved: false,
-      }),
-      autoExecute: false,
-    });
+    );
 
     // Staging: build → test → approvalGate → goto deploy (skip approval)
     const staging = await workflow.start({ env: 'staging' });
@@ -343,14 +295,12 @@ describe('Combined patterns', () => {
     const prodResult = await workflow.execute(prod._id);
     expect(prodResult.status).toBe('waiting');
     expect(log).toEqual(['build', 'test', 'approvalGate']);
-
-    workflow.shutdown();
   });
 
   it('should combine checkpoint + goto for complex batch processing', async () => {
     const processed: number[] = [];
 
-    const workflow = createWorkflow<{ phase: string }>('batch-goto', {
+    const workflow = env.workflow<{ phase: string }>('batch-goto', {
       steps: {
         phase1: async (ctx) => {
           const last = ctx.getCheckpoint<number>() ?? -1;
@@ -361,7 +311,7 @@ describe('Combined patterns', () => {
           await ctx.set('phase', 'phase1-done');
           return { batch1: processed.length };
         },
-        phase2: async (ctx) => {
+        phase2: async () => {
           for (let i = 10; i < 13; i++) {
             processed.push(i);
           }
@@ -369,7 +319,6 @@ describe('Combined patterns', () => {
         },
       },
       context: () => ({ phase: 'init' }),
-      autoExecute: false,
     });
 
     const run = await workflow.start({});
@@ -378,7 +327,5 @@ describe('Combined patterns', () => {
     expect(result.status).toBe('done');
     expect(processed).toEqual([0, 1, 2, 10, 11, 12]);
     expect(result.context.phase).toBe('phase1-done');
-
-    workflow.shutdown();
   });
 });

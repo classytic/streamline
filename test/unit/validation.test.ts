@@ -3,7 +3,7 @@
  * Pure functions — no DB required.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { validateId, validateRetryConfig } from '../../src/utils/validation.js';
 
 describe('validateId', () => {
@@ -19,7 +19,9 @@ describe('validateId', () => {
   });
 
   it('should reject dots', () => {
-    expect(() => validateId('bad.id', 'step')).toThrow('step ID "bad.id" contains invalid characters');
+    expect(() => validateId('bad.id', 'step')).toThrow(
+      'step ID "bad.id" contains invalid characters',
+    );
   });
 
   it('should reject spaces', () => {
@@ -68,7 +70,9 @@ describe('validateRetryConfig', () => {
   });
 
   it('should reject negative retryDelay', () => {
-    expect(() => validateRetryConfig(undefined, undefined, -10)).toThrow('retryDelay must be a non-negative integer');
+    expect(() => validateRetryConfig(undefined, undefined, -10)).toThrow(
+      'retryDelay must be a non-negative integer',
+    );
   });
 
   it('should reject zero retryBackoff (number must be positive)', () => {

@@ -1,6 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { setupTestDB } from '../../utils/setup.js';
+/**
+ * LEGACY SETUP (global connection) on purpose: the subject is the exported
+ * `sleepWorkflow` docs example, a module-level singleton created without a
+ * container — bound to the default mongoose connection by construction.
+ * The 2s `ctx.sleep` and the elapsed-time bounds ARE the feature under test.
+ */
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { sleepWorkflow } from '../../../docs/examples/sleep-workflow.js';
+import { setupTestDB } from '../../utils/setup.js';
 
 describe('Sleep Workflow', () => {
   beforeAll(setupTestDB);
@@ -23,8 +30,7 @@ describe('Sleep Workflow', () => {
     expect(result.context.startTime).toBeInstanceOf(Date);
     expect(result.context.endTime).toBeInstanceOf(Date);
 
-    const duration =
-      result.context.endTime!.getTime() - result.context.startTime!.getTime();
+    const duration = result.context.endTime!.getTime() - result.context.startTime!.getTime();
     expect(duration).toBeGreaterThanOrEqual(2000);
     expect(duration).toBeLessThan(3000);
 
