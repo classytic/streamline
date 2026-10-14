@@ -15,16 +15,23 @@
  *      reload intact.
  */
 
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import {
   type WorkflowDefinitionDoc,
-  WorkflowDefinitionModel,
   WorkflowDefinitionRepository,
   workflowDefinitionRepository,
 } from '../../src/index.js';
+import { useStreamlineEnv } from '../helpers/index.js';
 import { useTestDb } from '../helpers/lifecycle.js';
 
-const repo = new WorkflowDefinitionRepository();
+const env = useStreamlineEnv();
+
+// The class, on the env's own connection (the `{ connection }` option). Only
+// the deprecated singleton below is a default-connection API.
+let repo: WorkflowDefinitionRepository;
+beforeAll(() => {
+  repo = new WorkflowDefinitionRepository({ connection: env.connection });
+});
 
 function makeDef(overrides: Partial<WorkflowDefinitionDoc> = {}): Partial<WorkflowDefinitionDoc> {
   return {
@@ -41,7 +48,9 @@ function makeDef(overrides: Partial<WorkflowDefinitionDoc> = {}): Partial<Workfl
 }
 
 describe('WorkflowDefinitionRepository', () => {
-  useTestDb();
+  it('binds to the connection it is given', () => {
+    expect(repo.Model.db).toBe(env.connection);
+  });
 
   it('creates a definition and parses semver into numeric sort fields', async () => {
     const created = await repo.create(makeDef({ version: '2.5.7' }));
@@ -152,8 +161,6 @@ describe('workflowDefinitionRepository (deprecated delegating re-export)', () =>
 });
 
 describe('persistence after dropping the dead `condition` field', () => {
-  useTestDb();
-
   it('saves and reloads step metadata without the removed condition field', async () => {
     const created = await repo.create(
       makeDef({
@@ -165,7 +172,7 @@ describe('persistence after dropping the dead `condition` field', () => {
       }),
     );
 
-    const reloaded = await WorkflowDefinitionModel.findById(created._id).lean();
+    const reloaded = await repo.Model.findById(created._id).lean();
     expect(reloaded?.steps).toHaveLength(2);
     expect(reloaded?.steps[0]).toMatchObject({
       id: 'a',
@@ -186,7 +193,7 @@ describe('persistence after dropping the dead `condition` field', () => {
     // prove the hook still fires for direct raw-model `.save()` callers.
     await repo.create(makeDef({ workflowId: 'raw-path', version: '1.0.0' }));
 
-    const doc = await WorkflowDefinitionModel.findOne({ workflowId: 'raw-path' });
+    const doc = await repo.Model.findOne({ workflowId: 'raw-path' });
     if (!doc) throw new Error('seed doc missing');
     doc.version = '7.8.9';
     await doc.save();

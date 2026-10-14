@@ -53,11 +53,12 @@ import type {
   KeysetPaginationResult,
   OffsetPaginationResult,
 } from '@classytic/repo-core/pagination';
-import type { SortOrder } from 'mongoose';
+import type { Connection, SortOrder } from 'mongoose';
 import { SCHEDULING } from '../config/constants.js';
 import {
   type ContainerOptions,
   createContainer,
+  isStreamlineContainer,
   type StreamlineContainer,
 } from '../core/container.js';
 import type {
@@ -185,6 +186,13 @@ export interface SchedulingServiceConfig {
   autoExecute?: boolean;
 
   /**
+   * Mongoose connection to bind streamline's models on (with or without
+   * `tenant`). Default: the default mongoose connection. Ignored when
+   * `container` is given — a container carries its own connection.
+   */
+  connection?: Connection;
+
+  /**
    * Custom container or container options
    * If provided, tenant option is ignored (use container.repository instead)
    */
@@ -208,6 +216,8 @@ export class SchedulingService<TContext = Record<string, unknown>> {
   private readonly timezoneHandler: TimezoneHandler;
   /** Exposed for testing and advanced use cases */
   readonly container: StreamlineContainer;
+  /** Whether this service built `container` (and so disposes it on shutdown). */
+  private readonly ownsContainer: boolean;
 
   constructor(
     workflow: WorkflowDefinition<TContext>,
@@ -219,30 +229,39 @@ export class SchedulingService<TContext = Record<string, unknown>> {
 
     // Create unified container - same repository for scheduling and execution
     // Priority: explicit container > tenant config > default
-    if (config.container) {
-      // Check if it's already a StreamlineContainer or ContainerOptions
-      if (
-        'repository' in config.container &&
-        'eventBus' in config.container &&
-        'cache' in config.container
-      ) {
-        this.container = config.container as StreamlineContainer;
-      } else {
-        this.container = createContainer(config.container as ContainerOptions);
-      }
+    const connection = config.connection ? { connection: config.connection } : {};
+    if (config.container && isStreamlineContainer(config.container)) {
+      this.container = config.container;
+      this.ownsContainer = false;
+    } else if (config.container) {
+      this.container = createContainer(config.container as ContainerOptions);
+      this.ownsContainer = true;
     } else if (config.tenant) {
       // Create container with multi-tenant repository
       this.container = createContainer({
         repository: { tenant: config.tenant },
+        ...connection,
       });
+      this.ownsContainer = true;
     } else {
-      this.container = createContainer();
+      this.container = createContainer(connection);
+      this.ownsContainer = true;
     }
 
     // Engine uses the SAME container - ensuring consistent tenant isolation
     this.engine = new WorkflowEngine(workflow, handlers, this.container, {
       autoExecute: config.autoExecute !== false,
     });
+  }
+
+  /**
+   * Stop this service's engine (scheduler, timers, in-flight handlers) and,
+   * when the service built its container, dispose it. A container you passed
+   * in is yours to dispose — it may be shared. Idempotent.
+   */
+  shutdown(): void {
+    this.engine.shutdown();
+    if (this.ownsContainer) this.container.dispose();
   }
 
   /** Get the repository (uses container's repository) */

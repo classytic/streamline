@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## 2.11.0 — 2026-10-14
+
+### Fixed
+
+- **`cancel()` no longer leaves `execute()` waiting on the handler.** An attempt now ends
+  when its signal aborts (cancel, superseded by recovery, timeout, heartbeat
+  backpressure), not only when the handler returns — so a handler that ignores
+  `ctx.signal` no longer holds the caller for its full duration. It keeps running (JS
+  cannot stop it); its late writes are refused by the cancel/ownership guards.
+- **Scheduler health is precise.** `isSchedulerHealthy()` reported healthy until 2× the
+  ADAPTIVE poll interval passed since the last poll — after idle backoff to 5 min, a
+  hung scheduler read healthy for 10 — and reported every freshly started scheduler
+  unhealthy until its first poll finished. It now knows when the next poll is due
+  (`getSchedulerStats().nextPollAt`) and is unhealthy once that is overdue past a
+  1–30s grace: the loop died, or a poll is stuck.
+
+### Added
+
+- `SchedulingService` — `shutdown()` (stops its engine; disposes the container only if
+  the service built it), and `connection` for the `{ tenant }` shorthand / default.
+- `new WorkflowDefinitionRepository({ connection | model })` — was hard-wired to the
+  default mongoose connection.
+
+### Changed
+
+- Peer floors raised: mongokit `>=3.41.0`, primitives `>=0.32.0`, repo-core `>=0.31.0`, mongoose `>=9.11.0`.
+
 ## 2.10.0 - 2026-10-08
 
 ### Changed — peer floors raised to current

@@ -11,6 +11,11 @@ import { setupTestDB, waitUntil } from '../../utils/setup.js';
 const statusIs = (runId: string, status: string) => () =>
   approvalWorkflow.get(runId).then((r) => r?.status === status);
 
+// Generous: the full long tier runs this alongside heavy suites on one worker,
+// where a start→waiting hop has exceeded 5s. A timeout here is a slow machine,
+// not a regression — the assertions below still pin the behaviour.
+const SETTLE_MS = 15_000;
+
 describe('Wait Workflow', () => {
   beforeAll(setupTestDB);
 
@@ -20,7 +25,7 @@ describe('Wait Workflow', () => {
       requestedBy: 'Alice',
     });
 
-    await waitUntil(statusIs(run._id, 'waiting'), 5000, 20);
+    await waitUntil(statusIs(run._id, 'waiting'), SETTLE_MS, 20);
 
     const waiting = await approvalWorkflow.get(run._id);
     expect(waiting?.status).toBe('waiting');
@@ -33,14 +38,14 @@ describe('Wait Workflow', () => {
     };
 
     await approvalWorkflow.resume(run._id, approval);
-    await waitUntil(statusIs(run._id, 'done'), 5000, 20);
+    await waitUntil(statusIs(run._id, 'done'), SETTLE_MS, 20);
 
     const completed = await approvalWorkflow.get(run._id);
     expect(completed?.status).toBe('done');
     expect(completed?.context.approval).toEqual(approval);
 
     approvalWorkflow.shutdown();
-  }, 10000);
+  }, 40_000);
 
   it('should handle rejection', async () => {
     const run = await approvalWorkflow.start({
@@ -48,7 +53,7 @@ describe('Wait Workflow', () => {
       requestedBy: 'Mallory',
     });
 
-    await waitUntil(statusIs(run._id, 'waiting'), 5000, 20);
+    await waitUntil(statusIs(run._id, 'waiting'), SETTLE_MS, 20);
 
     const rejection = {
       approved: false,
@@ -57,12 +62,12 @@ describe('Wait Workflow', () => {
     };
 
     await approvalWorkflow.resume(run._id, rejection);
-    await waitUntil(statusIs(run._id, 'done'), 5000, 20);
+    await waitUntil(statusIs(run._id, 'done'), SETTLE_MS, 20);
 
     const completed = await approvalWorkflow.get(run._id);
     expect(completed?.status).toBe('done');
     expect(completed?.context.approval?.approved).toBe(false);
 
     approvalWorkflow.shutdown();
-  });
+  }, 40_000);
 });

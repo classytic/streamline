@@ -24,10 +24,9 @@ const env = useStreamlineEnv();
 
 type Ctx = { result?: string; signalReceived?: boolean };
 
-// Engines built directly (outside env.workflow — env.worker only wraps
-// createWorkflow) — each on its own env container, like a separate process, on
-// the env's database. The env disposes the containers; the engines are shut
-// down here after each test.
+// Engines (and SchedulingServices) built directly, outside env.workflow — each
+// on its own env container, like a separate process, on the env's database.
+// The env disposes the containers; these are shut down here after each test.
 const engines: Array<{ shutdown(): void }> = [];
 afterEach(() => {
   for (const engine of engines.splice(0)) engine.shutdown();
@@ -92,6 +91,7 @@ describe('Critical Engine Fixes', () => {
       const service = new SchedulingService(criticalWorkflow().definition, handlers, {
         container: env.container,
       });
+      engines.push(service);
       const futureTime = new Date(Date.now() + 60000);
 
       const run = await service.schedule({
@@ -130,6 +130,7 @@ describe('Critical Engine Fixes', () => {
         { step1: async () => 'done' },
         { container: env.container },
       );
+      engines.push(service);
 
       const run = await service.schedule({
         scheduledFor: new Date(Date.now() + 60000),
@@ -220,6 +221,7 @@ describe('Critical Engine Fixes', () => {
       const service = new SchedulingService(criticalWorkflow().definition, handlers, {
         container: env.container,
       });
+      engines.push(service);
 
       const result = await service.getScheduled({
         executionTimeRange: {
@@ -241,6 +243,7 @@ describe('Critical Engine Fixes', () => {
       const service = new SchedulingService(criticalWorkflow().definition, handlers, {
         container: env.container,
       });
+      engines.push(service);
 
       const result = await service.getScheduled({
         recurring: true,
@@ -255,6 +258,7 @@ describe('Critical Engine Fixes', () => {
       const service = new SchedulingService(criticalWorkflow().definition, handlers, {
         container: env.container,
       });
+      engines.push(service);
 
       const result = await service.getScheduled({
         recurring: false,

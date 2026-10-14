@@ -1,6 +1,6 @@
 {
   "name": "@classytic/streamline",
-  "version": "2.10.0",
+  "version": "2.11.0",
   "description": "MongoDB-native durable workflow orchestration engine. Like Temporal but simpler - supports sleep, wait, retry, parallel execution, human-in-the-loop, and crash recovery. Perfect for payment gateways, approval flows, and scheduled tasks.",
   "type": "module",
   "sideEffects": false,
@@ -96,11 +96,11 @@
     "url": "https://github.com/classytic/streamline/issues"
   },
   "peerDependencies": {
-    "@classytic/mongokit": ">=3.40.0",
-    "@classytic/primitives": ">=0.29.0",
-    "@classytic/repo-core": ">=0.30.0",
+    "@classytic/mongokit": ">=3.41.0",
+    "@classytic/primitives": ">=0.32.0",
+    "@classytic/repo-core": ">=0.31.0",
     "@opentelemetry/api": ">=1.0.0",
-    "mongoose": ">=9.4.1"
+    "mongoose": ">=9.11.0"
   },
   "peerDependenciesMeta": {
     "@opentelemetry/api": {
@@ -111,9 +111,9 @@
     "@arethetypeswrong/core": "^0.18.5",
     "@biomejs/biome": "^2.4.10",
     "@classytic/dev-tools": "^0.2.0",
-    "@classytic/mongokit": "^3.40.0",
-    "@classytic/primitives": "^0.29.0",
-    "@classytic/repo-core": "^0.30.0",
+    "@classytic/mongokit": "^3.41.0",
+    "@classytic/primitives": "^0.32.0",
+    "@classytic/repo-core": "^0.31.1",
     "@opentelemetry/api": "^1.9.0",
     "@types/luxon": "^3.7.1",
     "@types/node": "^25.0.0",
@@ -121,7 +121,7 @@
     "@vitest/coverage-v8": "^4.0.0",
     "luxon": "^3.7.2",
     "mongodb-memory-server": "^11.0.1",
-    "mongoose": "^9.4.1",
+    "mongoose": "^9.11.0",
     "publint": "^0.3.23",
     "semver": "^7.7.3",
     "tsdown": "^0.22.14",

@@ -121,7 +121,11 @@ describe('Telemetry and Scheduled Hooks Fixes', () => {
     // in-process registry (no container passed: the DB fallback would go to
     // the default-connection singleton, not the env's database — so only
     // the registry path can resume this run).
-    const result = await resumeHook(String(hookToken), { approved: true });
-    expect(result.run.status).toBe('done');
+    try {
+      const result = await resumeHook(String(hookToken), { approved: true });
+      expect(result.run.status).toBe('done');
+    } finally {
+      service.shutdown(); // its engine's scheduler + timers (env disposes the container)
+    }
   });
 });

@@ -821,15 +821,28 @@ export class StepExecutor<TContext = Record<string, unknown>> {
       }
     };
 
-    try {
-      if (!timeout) {
-        const result = await handler(ctx);
-        cleanup();
-        return result;
-      }
-
-      const result = await Promise.race([
-        handler(ctx),
+    // The attempt ends when the handler settles OR its signal aborts (cancel,
+    // superseded by recovery, timeout, heartbeat backpressure). A handler that
+    // ignores `ctx.signal` keeps running — JS cannot stop it — but nobody waits
+    // for it any more: before, `execute()` after `cancel()` blocked until such a
+    // handler returned on its own. Its late writes are refused by the cancel /
+    // ownership guards; its late rejection is swallowed here.
+    const running = Promise.resolve().then(() => handler(ctx));
+    running.catch(() => {});
+    const contenders: Promise<T>[] = [running];
+    let onAbort: (() => void) | undefined;
+    if (abortController) {
+      const { signal } = abortController;
+      contenders.push(
+        new Promise<T>((_, reject) => {
+          onAbort = () => reject(signal.reason ?? new Error('Step aborted'));
+          if (signal.aborted) onAbort();
+          else signal.addEventListener('abort', onAbort, { once: true });
+        }),
+      );
+    }
+    if (timeout) {
+      contenders.push(
         new Promise<T>((_, reject) => {
           timeoutHandle = setTimeout(() => {
             // Abort the signal to cancel any operations using it
@@ -839,11 +852,17 @@ export class StepExecutor<TContext = Record<string, unknown>> {
             reject(new Error(`Step timeout after ${timeout}ms`));
           }, timeout);
         }),
-      ]);
+      );
+    }
+
+    try {
+      const result = contenders.length === 1 ? await running : await Promise.race(contenders);
       cleanup();
+      if (onAbort) abortController?.signal.removeEventListener('abort', onAbort);
       return result;
     } catch (error) {
       cleanup();
+      if (onAbort) abortController?.signal.removeEventListener('abort', onAbort);
       // Abort if not already aborted (e.g., handler threw before timeout)
       if (abortController && !abortController.signal.aborted) {
         abortController.abort(error);

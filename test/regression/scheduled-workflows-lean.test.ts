@@ -145,11 +145,14 @@ describe('Scheduled Workflows Lean Query', () => {
 
   describe('Memory Efficiency', () => {
     it('should handle large result sets efficiently', async () => {
-      // Create 100 scheduled workflows
+      // Create 100 scheduled workflows, each due 1ms after the previous: the
+      // query orders by executionTime (ties by _id, which sorts as TEXT —
+      // "…-10" before "…-2"), so distinct times make position i = draft i.
       const workflows = [];
+      const firstDue = Date.now() - 1000;
       for (let i = 0; i < 100; i++) {
         workflows.push(
-          scheduledDraft(`scheduled-large-${i}`, new Date(Date.now() - 1000), {
+          scheduledDraft(`scheduled-large-${i}`, new Date(firstDue + i), {
             context: { index: i, data: `workflow-${i}` },
             input: { value: i },
           }),

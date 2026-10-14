@@ -82,7 +82,9 @@ describe('generalized APIs (2.7.0)', () => {
       expect(cancelledEvents).toContain(run._id);
 
       await exec;
-      expect(sawAbort).toBe(true);
+      // execute() returns as soon as the attempt aborts — it no longer waits
+      // for the handler; the handler still SEES the abort on its next check.
+      await env.eventually(() => expect(sawAbort).toBe(true), { timeout: 1_000 });
 
       const persisted = await wf.get(run._id);
       expect(persisted?.status).toBe('cancelled');

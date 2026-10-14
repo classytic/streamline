@@ -4,7 +4,7 @@
  * Tests timezone-aware workflow scheduling, rescheduling, and cancellation.
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WorkflowDefinition, WorkflowHandlers } from '../../src/core/types.js';
 import type { TenantFilterOptions } from '../../src/plugins/tenant-filter.plugin.js';
 import {
@@ -41,13 +41,17 @@ const testHandlers: WorkflowHandlers<TestContext> = {
 describe('SchedulingService', () => {
   let service: SchedulingService<TestContext>;
   let testWorkflow: { definition: WorkflowDefinition<TestContext> };
+  const services: SchedulingService<TestContext>[] = [];
+  afterEach(() => {
+    for (const s of services.splice(0)) s.shutdown();
+  });
 
-  /** A service bound to the env's connection, with the given tenant config. */
+  /** A service via the `{ tenant }` shorthand, on the env's connection. */
   const tenantService = (tenant: TenantFilterOptions) => {
-    const config: SchedulingServiceConfig = {
-      container: { connection: env.connection, repository: { tenant } },
-    };
-    return new SchedulingService(testWorkflow.definition, testHandlers, config);
+    const config: SchedulingServiceConfig = { tenant, connection: env.connection };
+    const s = new SchedulingService(testWorkflow.definition, testHandlers, config);
+    services.push(s);
+    return s;
   };
 
   beforeEach(() => {
@@ -67,6 +71,23 @@ describe('SchedulingService', () => {
     );
     service = new SchedulingService(testWorkflow.definition, testHandlers, {
       container: env.container,
+    });
+    services.push(service);
+  });
+
+  describe('lifecycle', () => {
+    it('shutdown() disposes a container the service built — never one passed in', async () => {
+      const own = tenantService({ tenantField: 'context.tenantId' });
+      const disposeOwn = vi.spyOn(own.container, 'dispose');
+      const disposeShared = vi.spyOn(env.container, 'dispose');
+
+      own.shutdown();
+      service.shutdown();
+
+      expect(disposeOwn).toHaveBeenCalledOnce();
+      expect(disposeShared).not.toHaveBeenCalled();
+      expect(own.container.repository.runModel.db).toBe(env.connection); // shorthand honours `connection`
+      disposeShared.mockRestore();
     });
   });
 

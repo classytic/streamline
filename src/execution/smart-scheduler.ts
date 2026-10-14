@@ -32,7 +32,18 @@ export interface SchedulerStats {
   missedResumes: number;
   isPolling: boolean;
   pollInterval: number;
+  /** When the next poll is due (while polling). A poll overdue past its grace = unhealthy. */
+  nextPollAt?: Date;
   uptime: number;
+}
+
+/**
+ * How late a poll may be before the scheduler reports unhealthy: half the
+ * interval, clamped to 1s–30s. A poll takes seconds at most, so the backed-off
+ * 5-min interval must not stretch the grace to minutes.
+ */
+function pollGraceMs(interval: number): number {
+  return Math.min(30_000, Math.max(1_000, interval / 2));
 }
 
 class SchedulerMetrics {
@@ -64,6 +75,12 @@ class SchedulerMetrics {
 
   stop(): void {
     this.stats.isPolling = false;
+    delete this.stats.nextPollAt;
+  }
+
+  /** The poll loop armed its next poll for `at`. */
+  scheduled(at: Date): void {
+    this.stats.nextPollAt = at;
   }
 
   recordPoll(duration: number, success: boolean, workflowsFound: number): void {
@@ -110,15 +127,14 @@ class SchedulerMetrics {
   isHealthy(): boolean {
     const stats = this.getStats();
 
-    if (stats.isPolling && !stats.lastPollAt) {
-      return false;
-    }
-
-    if (stats.lastPollAt) {
-      const timeSinceLastPoll = Date.now() - stats.lastPollAt.getTime();
-      if (timeSinceLastPoll > stats.pollInterval * 2) {
-        return false;
-      }
+    // Liveness: the loop knows exactly when its next poll is due. Overdue past
+    // the grace means the loop died or a poll is stuck (the next one is only
+    // armed when the current one ends). The old "2× the interval since the last
+    // poll" rule followed the ADAPTIVE interval — after idle backoff to 5 min, a
+    // hung scheduler still read healthy for 10.
+    if (stats.isPolling && stats.nextPollAt) {
+      const overdueMs = Date.now() - stats.nextPollAt.getTime();
+      if (overdueMs > pollGraceMs(stats.pollInterval)) return false;
     }
 
     if (stats.totalPolls > 10) {
@@ -675,6 +691,9 @@ export class SmartScheduler {
   private schedulePoll(delay: number = this.currentInterval): void {
     if (!this.isPolling) return;
 
+    // Stays at this time until the poll ENDS and re-arms — a hung poll shows up
+    // as overdue in `isHealthy()`.
+    this.metrics.scheduled(new Date(Date.now() + delay));
     this.pollInterval = setTimeout(async () => {
       await this.poll();
       this.schedulePoll(); // Schedule next poll

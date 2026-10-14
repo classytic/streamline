@@ -133,6 +133,56 @@ describe('scheduler — fair admission', () => {
   });
 });
 
+describe('scheduler — health', () => {
+  // Liveness keys on when the next poll is DUE (+ a 1s–30s grace), not on
+  // "2× the adaptive interval since the last poll" — which read a hung
+  // scheduler as healthy for 10 min after idle backoff, and read every freshly
+  // started one as unhealthy until its first poll finished.
+  it('healthy as soon as it starts; a hung poll turns it unhealthy within the grace', async () => {
+    const wf = 'health-hung';
+    const { s } = scheduler(wf, {
+      basePollInterval: 200,
+      minPollInterval: 200,
+      maxPollInterval: 5 * 60_000,
+      adaptivePolling: false,
+    });
+    // A database call that never answers: the poll in flight never finishes,
+    // so the loop never re-arms its next poll.
+    const repo = env.container.repository;
+    const original = repo.getReadyToResume;
+    repo.getReadyToResume = () => new Promise(() => {});
+    try {
+      s.start(); // first poll runs at once — and hangs
+      expect(s.isHealthy()).toBe(true);
+      await env.eventually(() => expect(s.isHealthy()).toBe(false), { timeout: 3_000 });
+      expect(s.getStats().isPolling).toBe(true); // it "runs" — it just does nothing
+    } finally {
+      repo.getReadyToResume = original;
+      s.stop();
+    }
+  });
+
+  it('an idle scheduler on its backed-off interval stays healthy between polls', async () => {
+    const wf = 'health-idle';
+    const { s } = scheduler(wf, {
+      basePollInterval: 100,
+      minPollInterval: 100,
+      maxPollInterval: 60_000, // nothing due → backs off to a minute
+      adaptivePolling: true,
+    });
+    try {
+      s.start();
+      await env.eventually(() => expect(s.getStats().totalPolls).toBeGreaterThanOrEqual(1));
+      await env.eventually(() => expect(s.getStats().pollInterval).toBe(60_000));
+      expect(s.getStats().nextPollAt?.getTime()).toBeGreaterThan(Date.now());
+      expect(s.isHealthy()).toBe(true);
+    } finally {
+      s.stop();
+    }
+    expect(s.getStats().nextPollAt).toBeUndefined();
+  });
+});
+
 describe('scheduler — dispatch pool', () => {
   /** `n` runs ready for retry. */
   async function retryReady(wf: string, n: number): Promise<string[]> {

@@ -18,9 +18,10 @@ import {
   type PluginType,
   Repository,
 } from '@classytic/mongokit';
+import type { Connection, Model } from 'mongoose';
 import semver from 'semver';
 import type { WorkflowDefinitionDoc } from './definition.model.js';
-import { WorkflowDefinitionModel } from './models.js';
+import { defineStreamlineModels, WorkflowDefinitionModel } from './models.js';
 
 /**
  * Filter type for deactivate queries
@@ -63,9 +64,20 @@ function applySemverFields(definition: Partial<WorkflowDefinitionDoc>): void {
  * comment in `definition.model.ts`.
  */
 export class WorkflowDefinitionRepository extends Repository<WorkflowDefinitionDoc> {
-  constructor() {
+  /**
+   * @param config.model — the definition model to use (wins over `connection`).
+   * @param config.connection — bind streamline's definition model on this
+   *   connection (the same blueprint the container uses; reuse-safe).
+   * Neither: the default-connection `WorkflowDefinitionModel`.
+   */
+  constructor(config: { model?: Model<WorkflowDefinitionDoc>; connection?: Connection } = {}) {
     const plugins: PluginType[] = [methodRegistryPlugin(), mongoOperationsPlugin()];
-    super(WorkflowDefinitionModel, plugins);
+    const model =
+      config.model ??
+      (config.connection
+        ? defineStreamlineModels().bind(config.connection).WorkflowDefinition
+        : WorkflowDefinitionModel);
+    super(model, plugins);
   }
 
   /**
